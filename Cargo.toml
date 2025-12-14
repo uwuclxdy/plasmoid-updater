@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/libplasmoid-updater",
+    "crates/plasmoid-updater",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/uwuclxdy/plasmoid-updater"
+
+[workspace.dependencies]
+libplasmoid-updater = { path = "crates/libplasmoid-updater" }
+reqwest = { version = "0.12.25", default-features = false, features = ["blocking", "rustls-tls"] }
+quick-xml = { version = "0.38.4", features = ["serialize"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+dirs = "6.0.0"
+thiserror = "2.0.17"
+log = "0.4"
+md5 = "0.8.0"
+rayon = "1.11.0"
+parking_lot = "0.12.5"
+clap = { version = "4.5.53", features = ["derive"] }
+toml = "0.9.8"
+atty = "0.2"
