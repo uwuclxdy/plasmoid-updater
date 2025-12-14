@@ -60,7 +60,7 @@ pub fn download_package(
     }
 
     let mut file = File::create(&dest)?;
-    let hasher = md5::Context::new();
+    let mut hasher = md5::Context::new();
 
     let mut reader = response;
     let mut buffer = [0u8; 8192];
@@ -74,7 +74,9 @@ pub fn download_package(
             break;
         }
 
-        file.write_all(&buffer[..bytes_read])?;
+        let chunk = &buffer[..bytes_read];
+        hasher.consume(chunk);
+        file.write_all(chunk)?;
     }
 
     // verify checksum if provided

@@ -190,6 +190,7 @@ pub fn registry_path(component_type: ComponentType) -> Option<PathBuf> {
 
 /// updates the kns registry after a successful component update.
 /// this ensures discover sees the correct installed version.
+/// if the entry doesn't exist, it creates a new one (discover-compatible).
 pub fn update_registry_after_install(update: &AvailableUpdate) -> Result<()> {
     let component = &update.installed;
 
@@ -201,15 +202,20 @@ pub fn update_registry_after_install(update: &AvailableUpdate) -> Result<()> {
         return Ok(());
     };
 
-    if !reg_path.exists() {
-        log::debug!("**registry:** file does not exist: {}", reg_path.display());
-        return Ok(());
-    }
-
     // extract just the date part from ISO timestamp (2024-03-07T09:39:52+00:00 -> 2024-03-07)
     let release_date = extract_date_from_iso(&update.release_date);
 
-    let content = fs::read_to_string(&reg_path)?;
+    // ensure parent directory exists
+    if let Some(parent) = reg_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let content = if reg_path.exists() {
+        fs::read_to_string(&reg_path)?
+    } else {
+        create_empty_registry()
+    };
+
     let updated = update_entry_in_registry(
         &content,
         &component.directory_name,
@@ -227,6 +233,24 @@ pub fn update_registry_after_install(update: &AvailableUpdate) -> Result<()> {
             reg_path.display(),
             component.name
         );
+    } else {
+        // entry not found - add new entry
+        let new_content = add_entry_to_registry(
+            &content,
+            &component.name,
+            component.component_type,
+            update.content_id,
+            &update.latest_version,
+            &update.download_url,
+            &component.path,
+            &release_date,
+        );
+        fs::write(&reg_path, new_content)?;
+        log::debug!(
+            "**registry:** added {} to {}",
+            component.name,
+            reg_path.display()
+        );
     }
 
     Ok(())
@@ -235,6 +259,84 @@ pub fn update_registry_after_install(update: &AvailableUpdate) -> Result<()> {
 /// extracts date part from ISO timestamp (YYYY-MM-DDTHH:MM:SS+00:00 -> YYYY-MM-DD)
 fn extract_date_from_iso(iso: &str) -> String {
     iso.split('T').next().unwrap_or(iso).to_string()
+}
+
+/// creates an empty registry file with the proper XML structure.
+fn create_empty_registry() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE khotnewstuff3>
+<hotnewstuffregistry>
+</hotnewstuffregistry>
+"#
+    .to_string()
+}
+
+/// escapes special characters for xml text content.
+fn escape_xml_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// adds a new entry to the registry xml.
+#[allow(clippy::too_many_arguments)]
+fn add_entry_to_registry(
+    xml: &str,
+    name: &str,
+    component_type: ComponentType,
+    content_id: u64,
+    version: &str,
+    download_url: &str,
+    installed_path: &std::path::Path,
+    release_date: &str,
+) -> String {
+    let category_id = component_type.category_id();
+    let store_url = format!("https://store.kde.org/p/{content_id}");
+    let installed_file = format!("{}/metadata.json", installed_path.to_string_lossy());
+
+    let new_entry = format!(
+        r#"  <stuff category="{category_id}">
+    <name>{name}</name>
+    <providerid>api.kde-look.org</providerid>
+    <author></author>
+    <homepage>{store_url}</homepage>
+    <licence></licence>
+    <version>{version}</version>
+    <rating>0</rating>
+    <downloads>0</downloads>
+    <installedfile>{installed_file}</installedfile>
+    <id>{content_id}</id>
+    <releasedate>{release_date}</releasedate>
+    <summary></summary>
+    <changelog></changelog>
+    <preview></preview>
+    <previewBig></previewBig>
+    <payload>{download_url}</payload>
+    <tags></tags>
+    <status>installed</status>
+  </stuff>
+"#,
+        name = escape_xml_text(name),
+        version = escape_xml_text(version),
+        download_url = escape_xml_text(download_url),
+    );
+
+    // insert before </hotnewstuffregistry>
+    if let Some(pos) = xml.rfind("</hotnewstuffregistry>") {
+        let mut result = xml[..pos].to_string();
+        result.push_str(&new_entry);
+        result.push_str("</hotnewstuffregistry>\n");
+        result
+    } else {
+        // malformed xml, create new registry with entry
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE khotnewstuff3>
+<hotnewstuffregistry>
+{new_entry}</hotnewstuffregistry>
+"#
+        )
+    }
 }
 
 /// updates an existing entry in the registry xml.
