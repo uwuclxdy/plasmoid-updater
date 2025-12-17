@@ -55,9 +55,8 @@ fn scan_directory(
 ) -> Result<Vec<InstalledComponent>> {
     let mut components = Vec::new();
 
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(components),
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(components);
     };
 
     for entry in entries.flatten() {
@@ -66,14 +65,16 @@ fn scan_directory(
             continue;
         }
 
-        let directory_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(name) => name.to_string(),
-            None => continue,
+        let Some(directory_name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
         };
 
-        let metadata = match read_package_metadata(&path) {
-            Some(m) => m,
-            None => continue,
+        let Some(metadata) = read_package_metadata(&path) else {
+            continue;
         };
 
         let name = metadata.name().unwrap_or(&directory_name).to_string();

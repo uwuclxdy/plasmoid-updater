@@ -369,12 +369,7 @@ fn cmd_update(
 }
 
 fn print_updates_table(updates: &[AvailableUpdate], verbosity: Verbosity) {
-    let name_width = updates
-        .iter()
-        .map(|u| u.installed.name.len())
-        .max()
-        .unwrap_or(10)
-        .max(10);
+    let name_width = name_width(updates, |u| &u.installed.name);
 
     if verbosity == Verbosity::Verbose {
         println!(
@@ -427,13 +422,17 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn print_components_table(components: &[InstalledComponent], verbosity: Verbosity) {
-    let name_width = components
+fn name_width<T>(items: &[T], name: impl Fn(&T) -> &str) -> usize {
+    items
         .iter()
-        .map(|c| c.name.len())
+        .map(|i| name(i).len())
         .max()
         .unwrap_or(10)
-        .max(10);
+        .max(10)
+}
+
+fn print_components_table(components: &[InstalledComponent], verbosity: Verbosity) {
+    let name_width = name_width(components, |c| &c.name);
 
     if verbosity == Verbosity::Verbose {
         println!("{:<name_width$}  {:>10}  TYPE", "NAME", "VERSION");

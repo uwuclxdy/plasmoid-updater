@@ -8,7 +8,7 @@ use std::{sync::Arc, thread, time::Duration};
 use parking_lot::Mutex;
 use quick_xml::de::from_str;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::{ComponentType, DownloadLink, Error, Result, StoreEntry};
 
@@ -49,11 +49,7 @@ impl ApiClient {
 
     /// fetches all content from specified categories with parallel page fetching.
     pub fn fetch_all_content(&self, categories: &[ComponentType]) -> Result<Vec<StoreEntry>> {
-        let category_str = categories
-            .iter()
-            .map(|c| c.category_id().to_string())
-            .collect::<Vec<_>>()
-            .join("x");
+        let category_str = build_category_string(categories);
 
         // first fetch to get total items
         let first_url = format!(
@@ -175,190 +171,139 @@ struct OcsData {
     content: Vec<ContentXml>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct ContentXml {
     id: u64,
     name: String,
-    #[serde(default)]
     version: String,
-    #[serde(default)]
     typeid: u16,
-    #[serde(default)]
     changed: String,
-    #[serde(default)]
-    downloadlink1: Option<String>,
-    #[serde(default, rename = "download_version1")]
-    downloadversion1: Option<String>,
-    #[serde(default)]
-    downloadmd5sum1: Option<String>,
-    #[serde(default)]
-    downloadsize1: Option<u64>,
-    #[serde(default)]
-    downloadlink2: Option<String>,
-    #[serde(default, rename = "download_version2")]
-    downloadversion2: Option<String>,
-    #[serde(default)]
-    downloadmd5sum2: Option<String>,
-    #[serde(default)]
-    downloadsize2: Option<u64>,
-    #[serde(default)]
-    downloadlink3: Option<String>,
-    #[serde(default, rename = "download_version3")]
-    downloadversion3: Option<String>,
-    #[serde(default)]
-    downloadmd5sum3: Option<String>,
-    #[serde(default)]
-    downloadsize3: Option<u64>,
-    #[serde(default)]
-    downloadlink4: Option<String>,
-    #[serde(default, rename = "download_version4")]
-    downloadversion4: Option<String>,
-    #[serde(default)]
-    downloadmd5sum4: Option<String>,
-    #[serde(default)]
-    downloadsize4: Option<u64>,
-    #[serde(default)]
-    downloadlink5: Option<String>,
-    #[serde(default, rename = "download_version5")]
-    downloadversion5: Option<String>,
-    #[serde(default)]
-    downloadmd5sum5: Option<String>,
-    #[serde(default)]
-    downloadsize5: Option<u64>,
-    #[serde(default)]
-    downloadlink6: Option<String>,
-    #[serde(default, rename = "download_version6")]
-    downloadversion6: Option<String>,
-    #[serde(default)]
-    downloadmd5sum6: Option<String>,
-    #[serde(default)]
-    downloadsize6: Option<u64>,
-    #[serde(default)]
-    downloadlink7: Option<String>,
-    #[serde(default, rename = "download_version7")]
-    downloadversion7: Option<String>,
-    #[serde(default)]
-    downloadmd5sum7: Option<String>,
-    #[serde(default)]
-    downloadsize7: Option<u64>,
-    #[serde(default)]
-    downloadlink8: Option<String>,
-    #[serde(default, rename = "download_version8")]
-    downloadversion8: Option<String>,
-    #[serde(default)]
-    downloadmd5sum8: Option<String>,
-    #[serde(default)]
-    downloadsize8: Option<u64>,
-    #[serde(default)]
-    downloadlink9: Option<String>,
-    #[serde(default, rename = "download_version9")]
-    downloadversion9: Option<String>,
-    #[serde(default)]
-    downloadmd5sum9: Option<String>,
-    #[serde(default)]
-    downloadsize9: Option<u64>,
-    #[serde(default)]
-    downloadlink10: Option<String>,
-    #[serde(default, rename = "download_version10")]
-    downloadversion10: Option<String>,
-    #[serde(default)]
-    downloadmd5sum10: Option<String>,
-    #[serde(default)]
-    downloadsize10: Option<u64>,
+    download_links: Vec<DownloadLink>,
+}
+
+#[derive(Default)]
+struct DownloadParts {
+    url: Option<String>,
+    version: Option<String>,
+    checksum: Option<String>,
+    size_kb: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ContentXml {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ContentXmlVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ContentXmlVisitor {
+            type Value = ContentXml;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("kde store content xml")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut id: Option<u64> = None;
+                let mut name: Option<String> = None;
+                let mut version: String = String::new();
+                let mut typeid: u16 = 0;
+                let mut changed: String = String::new();
+
+                let mut downloads: [DownloadParts; 10] =
+                    std::array::from_fn(|_| DownloadParts::default());
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => id = Some(map.next_value::<u64>()?),
+                        "name" => name = Some(map.next_value::<String>()?),
+                        "version" => version = map.next_value::<String>()?,
+                        "typeid" => typeid = map.next_value::<u16>()?,
+                        "changed" => changed = map.next_value::<String>()?,
+                        _ => {
+                            if let Some(index) = parse_download_index(&key, "downloadlink") {
+                                downloads[index].url = map.next_value::<Option<String>>()?;
+                                continue;
+                            }
+                            if let Some(index) = parse_download_index(&key, "download_version") {
+                                downloads[index].version = map.next_value::<Option<String>>()?;
+                                continue;
+                            }
+                            if let Some(index) = parse_download_index(&key, "downloadmd5sum") {
+                                downloads[index].checksum = map.next_value::<Option<String>>()?;
+                                continue;
+                            }
+                            if let Some(index) = parse_download_index(&key, "downloadsize") {
+                                downloads[index].size_kb = map.next_value::<Option<u64>>()?;
+                                continue;
+                            }
+
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                let id = id.ok_or_else(|| serde::de::Error::missing_field("id"))?;
+                let name = name.ok_or_else(|| serde::de::Error::missing_field("name"))?;
+
+                let mut download_links = Vec::new();
+                for part in downloads {
+                    let Some(url) = part.url else {
+                        continue;
+                    };
+                    if url.is_empty() {
+                        continue;
+                    }
+                    download_links.push(DownloadLink {
+                        url,
+                        version: part.version.unwrap_or_default(),
+                        checksum: part.checksum.filter(|s| !s.is_empty()),
+                        size_kb: part.size_kb,
+                    });
+                }
+
+                Ok(ContentXml {
+                    id,
+                    name,
+                    version,
+                    typeid,
+                    changed,
+                    download_links,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ContentXmlVisitor)
+    }
+}
+
+fn parse_download_index(key: &str, prefix: &str) -> Option<usize> {
+    if !key.starts_with(prefix) {
+        return None;
+    }
+
+    let suffix = &key[prefix.len()..];
+    let Ok(n) = suffix.parse::<usize>() else {
+        return None;
+    };
+    if (1..=10).contains(&n) {
+        Some(n - 1)
+    } else {
+        None
+    }
 }
 
 impl ContentXml {
     fn into_store_entry(self) -> StoreEntry {
-        type LinkRef<'a> = (
-            &'a Option<String>,
-            &'a Option<String>,
-            &'a Option<String>,
-            &'a Option<u64>,
-        );
-        let mut download_links = Vec::new();
-
-        let links: [LinkRef<'_>; 10] = [
-            (
-                &self.downloadlink1,
-                &self.downloadversion1,
-                &self.downloadmd5sum1,
-                &self.downloadsize1,
-            ),
-            (
-                &self.downloadlink2,
-                &self.downloadversion2,
-                &self.downloadmd5sum2,
-                &self.downloadsize2,
-            ),
-            (
-                &self.downloadlink3,
-                &self.downloadversion3,
-                &self.downloadmd5sum3,
-                &self.downloadsize3,
-            ),
-            (
-                &self.downloadlink4,
-                &self.downloadversion4,
-                &self.downloadmd5sum4,
-                &self.downloadsize4,
-            ),
-            (
-                &self.downloadlink5,
-                &self.downloadversion5,
-                &self.downloadmd5sum5,
-                &self.downloadsize5,
-            ),
-            (
-                &self.downloadlink6,
-                &self.downloadversion6,
-                &self.downloadmd5sum6,
-                &self.downloadsize6,
-            ),
-            (
-                &self.downloadlink7,
-                &self.downloadversion7,
-                &self.downloadmd5sum7,
-                &self.downloadsize7,
-            ),
-            (
-                &self.downloadlink8,
-                &self.downloadversion8,
-                &self.downloadmd5sum8,
-                &self.downloadsize8,
-            ),
-            (
-                &self.downloadlink9,
-                &self.downloadversion9,
-                &self.downloadmd5sum9,
-                &self.downloadsize9,
-            ),
-            (
-                &self.downloadlink10,
-                &self.downloadversion10,
-                &self.downloadmd5sum10,
-                &self.downloadsize10,
-            ),
-        ];
-
-        for (link, version, checksum, size) in links {
-            if let Some(url) = link
-                && !url.is_empty()
-            {
-                download_links.push(DownloadLink {
-                    url: url.clone(),
-                    version: version.clone().unwrap_or_default(),
-                    checksum: checksum.clone().filter(|s| !s.is_empty()),
-                    size_kb: *size,
-                });
-            }
-        }
-
         StoreEntry {
             id: self.id,
             name: self.name,
             version: self.version,
             type_id: self.typeid,
-            download_links,
+            download_links: self.download_links,
             changed_date: self.changed,
         }
     }
