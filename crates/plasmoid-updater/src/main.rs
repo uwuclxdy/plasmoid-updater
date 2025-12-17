@@ -46,8 +46,22 @@ fn is_root() -> bool {
 fn escalate_with_sudo() -> Result<i32, libplasmoid_updater::Error> {
     let args: Vec<String> = std::env::args().collect();
 
-    let status = std::process::Command::new("sudo")
-        .args(&args)
+    // preserve user's environment variables so paths resolve correctly
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.args(&args);
+
+    // preserve XDG_DATA_HOME and HOME for the actual user
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        cmd.env("XDG_DATA_HOME", data_home);
+    }
+    if let Ok(cache_home) = std::env::var("XDG_CACHE_HOME") {
+        cmd.env("XDG_CACHE_HOME", cache_home);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("SUDO_USER_HOME", home);
+    }
+
+    let status = cmd
         .status()
         .map_err(|e| libplasmoid_updater::Error::other(format!("failed to run sudo: {e}")))?;
 
