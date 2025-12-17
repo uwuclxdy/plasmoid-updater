@@ -13,10 +13,7 @@ use crate::{AvailableUpdate, ComponentType, Error, InstalledComponent, Result};
 
 /// returns the path to the knewstuff3 directory.
 pub fn knewstuff_dir() -> PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/share"))
-        .join("knewstuff3")
+    crate::paths::knewstuff_dir()
 }
 
 /// entry from a knsregistry file.
@@ -186,6 +183,59 @@ pub fn registry_path(component_type: ComponentType) -> Option<PathBuf> {
     component_type
         .registry_file()
         .map(|f| knewstuff_dir().join(f))
+}
+
+pub(crate) fn find_id_in_registry(xml: &str, directory_name: &str) -> Option<u64> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut current_element = String::new();
+    let mut in_entry = false;
+    let mut current_id: Option<u64> = None;
+    let mut current_path: Option<String> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                current_element = name.clone();
+
+                if name == "stuff" {
+                    in_entry = true;
+                    current_id = None;
+                    current_path = None;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "stuff" && in_entry {
+                    if let (Some(id), Some(path)) = (current_id, &current_path)
+                        && path_matches_directory(path, directory_name)
+                    {
+                        return Some(id);
+                    }
+                    in_entry = false;
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if !in_entry {
+                    continue;
+                }
+
+                let text = String::from_utf8_lossy(e.as_ref()).to_string();
+                match current_element.as_str() {
+                    "id" => current_id = text.parse().ok(),
+                    "installedfile" | "uninstalledfile" => current_path = Some(text),
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// updates the kns registry after a successful component update.
@@ -480,6 +530,6 @@ fn find_target_entry_index(xml: &str, directory_name: &str) -> Option<usize> {
     None
 }
 
-fn path_matches_directory(path: &str, directory_name: &str) -> bool {
+pub(crate) fn path_matches_directory(path: &str, directory_name: &str) -> bool {
     path.split('/').any(|segment| segment == directory_name)
 }

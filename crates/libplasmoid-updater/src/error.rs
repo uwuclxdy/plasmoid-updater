@@ -62,43 +62,32 @@ pub enum Error {
     SudoWithoutSystem,
 }
 
+macro_rules! error_ctor {
+    ($($name:ident => $variant:ident),* $(,)?) => {
+        $(
+            pub fn $name(msg: impl Into<String>) -> Self {
+                Self::$variant(msg.into())
+            }
+        )*
+    };
+}
+
 impl Error {
-    pub fn xml_parse(msg: impl Into<String>) -> Self {
-        Self::XmlParse(msg.into())
-    }
-
-    pub fn extraction(msg: impl Into<String>) -> Self {
-        Self::ExtractionFailed(msg.into())
-    }
-
-    pub fn install(msg: impl Into<String>) -> Self {
-        Self::InstallFailed(msg.into())
-    }
-
-    pub fn id_resolution(name: impl Into<String>) -> Self {
-        Self::IdResolutionFailed(name.into())
-    }
-
-    pub fn config(msg: impl Into<String>) -> Self {
-        Self::Config(msg.into())
-    }
-
-    pub fn download(msg: impl Into<String>) -> Self {
-        Self::DownloadFailed(msg.into())
-    }
+    error_ctor!(
+        xml_parse => XmlParse,
+        extraction => ExtractionFailed,
+        install => InstallFailed,
+        id_resolution => IdResolutionFailed,
+        config => Config,
+        download => DownloadFailed,
+        backup => BackupFailed,
+        other => Other,
+    );
 
     pub fn checksum(expected: impl Into<String>, actual: impl Into<String>) -> Self {
         Self::ChecksumMismatch {
             expected: expected.into(),
             actual: actual.into(),
         }
-    }
-
-    pub fn backup(msg: impl Into<String>) -> Self {
-        Self::BackupFailed(msg.into())
-    }
-
-    pub fn other(msg: impl Into<String>) -> Self {
-        Self::Other(msg.into())
     }
 }

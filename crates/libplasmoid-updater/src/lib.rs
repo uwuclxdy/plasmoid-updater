@@ -14,6 +14,7 @@ pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod installer;
+pub(crate) mod paths;
 pub mod registry;
 pub mod resolver;
 pub mod types;
@@ -102,8 +103,7 @@ fn check_updates_detailed(config: &Config, system: bool) -> Result<CheckResult> 
     let result = Arc::new(Mutex::new(CheckResult::new()));
 
     regular_components.par_iter().for_each(|component| {
-        let update_result =
-            process_component_check(component, &store_entries, widgets_id_table, None);
+        let update_result = process_component_check(component, &store_entries, widgets_id_table);
 
         let mut result = result.lock();
         match update_result {
@@ -138,7 +138,9 @@ fn check_updates_detailed(config: &Config, system: bool) -> Result<CheckResult> 
                     continue;
                 }
 
-                let Some(download_info) = select_download_with_info(&entry, &entry.version) else {
+                let Some(download_info) =
+                    resolver::select_download_with_info(&entry, &entry.version)
+                else {
                     result.add_check_failure(
                         component.name.clone(),
                         "no download url available".to_string(),
@@ -193,7 +195,6 @@ fn process_component_check(
     component: &InstalledComponent,
     store_entries: &[StoreEntry],
     widgets_id_table: &std::collections::HashMap<String, u64>,
-    _client: Option<&ApiClient>,
 ) -> ComponentCheckResult {
     let content_id = match resolve_content_id(component, store_entries, widgets_id_table) {
         Some(id) => id,
@@ -233,7 +234,7 @@ fn process_component_check(
         return ComponentCheckResult::NoUpdate;
     }
 
-    let Some(download_info) = select_download_with_info(entry, &entry.version) else {
+    let Some(download_info) = resolver::select_download_with_info(entry, &entry.version) else {
         log::warn!(
             "**resolver:** no download url for '{}' (id: {})",
             component.name,
@@ -256,34 +257,6 @@ fn process_component_check(
     update.download_size = download_info.size_kb.map(|kb| kb * 1024);
 
     ComponentCheckResult::Update(Box::new(update))
-}
-
-struct DownloadInfo {
-    url: String,
-    checksum: Option<String>,
-    size_kb: Option<u64>,
-}
-
-fn select_download_with_info(entry: &StoreEntry, target_version: &str) -> Option<DownloadInfo> {
-    if entry.download_links.is_empty() {
-        return None;
-    }
-
-    let link = if entry.download_links.len() == 1 {
-        &entry.download_links[0]
-    } else {
-        entry
-            .download_links
-            .iter()
-            .find(|l| l.version == target_version)
-            .or_else(|| entry.download_links.first())?
-    };
-
-    Some(DownloadInfo {
-        url: link.url.clone(),
-        checksum: link.checksum.clone(),
-        size_kb: link.size_kb,
-    })
 }
 
 /// updates all user-installed components that have available updates.

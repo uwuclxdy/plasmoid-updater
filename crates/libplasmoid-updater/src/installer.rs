@@ -19,6 +19,25 @@ use crate::{
 const COLOR_SCHEME_EXTENSIONS: &[&str] = &[".colors", ".colorscheme"];
 const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 
+fn replace_destination<F>(dest: &Path, action: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    if dest.exists() {
+        if dest.is_dir() {
+            fs::remove_dir_all(dest)?;
+        } else {
+            fs::remove_file(dest)?;
+        }
+    }
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    action()
+}
+
 pub(crate) fn temp_dir() -> PathBuf {
     std::env::var("TMPDIR")
         .map(PathBuf::from)
@@ -293,21 +312,14 @@ fn install_color_scheme(extract_dir: &Path, dest_path: &Path) -> Result<()> {
     let color_file = find_color_scheme_file(extract_dir)
         .ok_or_else(|| Error::install("no color scheme file found in archive"))?;
 
-    if dest_path.exists() {
-        fs::remove_file(dest_path)?;
-    }
-
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::copy(&color_file, dest_path)?;
-    log::debug!(
-        "**install:** copied color scheme to {}",
-        dest_path.display()
-    );
-
-    Ok(())
+    replace_destination(dest_path, || {
+        fs::copy(&color_file, dest_path)?;
+        log::debug!(
+            "**install:** copied color scheme to {}",
+            dest_path.display()
+        );
+        Ok(())
+    })
 }
 
 fn find_icon_theme_dir(extract_dir: &Path) -> Option<PathBuf> {
@@ -330,16 +342,12 @@ fn install_icon_theme(extract_dir: &Path, dest_dir: &Path) -> Result<()> {
     let source_dir = find_icon_theme_dir(extract_dir)
         .ok_or_else(|| Error::install("no icon theme (index.theme) found in archive"))?;
 
-    if dest_dir.exists() {
-        fs::remove_dir_all(dest_dir)?;
-    }
-
-    fs::create_dir_all(dest_dir)?;
-    copy_dir_recursive(&source_dir, dest_dir)?;
-
-    log::debug!("**install:** copied icon theme to {}", dest_dir.display());
-
-    Ok(())
+    replace_destination(dest_dir, || {
+        fs::create_dir_all(dest_dir)?;
+        copy_dir_recursive(&source_dir, dest_dir)?;
+        log::debug!("**install:** copied icon theme to {}", dest_dir.display());
+        Ok(())
+    })
 }
 
 fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
@@ -383,24 +391,19 @@ fn install_wallpaper(extract_dir: &Path, component: &InstalledComponent) -> Resu
     let dest = &component.path;
 
     if source.is_file() {
-        if dest.exists() {
-            fs::remove_file(dest)?;
-        }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&source, dest)?;
-        log::debug!("**install:** copied wallpaper to {}", dest.display());
+        replace_destination(dest, || {
+            fs::copy(&source, dest)?;
+            log::debug!("**install:** copied wallpaper to {}", dest.display());
+            Ok(())
+        })
     } else {
-        if dest.exists() {
-            fs::remove_dir_all(dest)?;
-        }
-        fs::create_dir_all(dest)?;
-        copy_dir_recursive(&source, dest)?;
-        log::debug!("**install:** copied wallpaper dir to {}", dest.display());
+        replace_destination(dest, || {
+            fs::create_dir_all(dest)?;
+            copy_dir_recursive(&source, dest)?;
+            log::debug!("**install:** copied wallpaper dir to {}", dest.display());
+            Ok(())
+        })
     }
-
-    Ok(())
 }
 
 fn install_theme_dir(
@@ -414,20 +417,16 @@ fn install_theme_dir(
         ))
     })?;
 
-    if dest_dir.exists() {
-        fs::remove_dir_all(dest_dir)?;
-    }
-
-    fs::create_dir_all(dest_dir)?;
-    copy_dir_recursive(&source_dir, dest_dir)?;
-
-    log::debug!(
-        "**install:** copied {} to {}",
-        component_type,
-        dest_dir.display()
-    );
-
-    Ok(())
+    replace_destination(dest_dir, || {
+        fs::create_dir_all(dest_dir)?;
+        copy_dir_recursive(&source_dir, dest_dir)?;
+        log::debug!(
+            "**install:** copied {} to {}",
+            component_type,
+            dest_dir.display()
+        );
+        Ok(())
+    })
 }
 
 fn is_raw_installable_file(path: &Path, component_type: ComponentType) -> bool {
@@ -451,22 +450,11 @@ fn is_raw_installable_file(path: &Path, component_type: ComponentType) -> bool {
 fn install_raw_file(downloaded: &Path, component: &InstalledComponent) -> Result<()> {
     let dest = &component.path;
 
-    if dest.exists() {
-        if dest.is_dir() {
-            fs::remove_dir_all(dest)?;
-        } else {
-            fs::remove_file(dest)?;
-        }
-    }
-
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::copy(downloaded, dest)?;
-    log::debug!("**install:** copied raw file to {}", dest.display());
-
-    Ok(())
+    replace_destination(dest, || {
+        fs::copy(downloaded, dest)?;
+        log::debug!("**install:** copied raw file to {}", dest.display());
+        Ok(())
+    })
 }
 
 /// updates a single component using provided HTTP client.

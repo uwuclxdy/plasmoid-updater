@@ -9,29 +9,12 @@ use crate::{Error, InstalledComponent, Result};
 
 /// returns the base backup directory.
 fn backup_base_dir() -> PathBuf {
-    std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".cache"))
-        .join("plasmoid-updater/backups")
+    crate::paths::cache_home().join("plasmoid-updater/backups")
 }
 
 /// returns a subdirectory name based on component type for organization.
 pub(crate) fn type_subdir(component: &InstalledComponent) -> &'static str {
-    match component.component_type {
-        crate::ComponentType::PlasmaWidget => "plasma-plasmoids",
-        crate::ComponentType::WallpaperPlugin => "plasma-wallpapers",
-        crate::ComponentType::KWinEffect => "kwin-effects",
-        crate::ComponentType::KWinScript => "kwin-scripts",
-        crate::ComponentType::KWinSwitcher => "kwin-tabbox",
-        crate::ComponentType::GlobalTheme => "plasma-look-and-feel",
-        crate::ComponentType::PlasmaStyle => "plasma-desktoptheme",
-        crate::ComponentType::AuroraeDecoration => "aurorae-themes",
-        crate::ComponentType::ColorScheme => "color-schemes",
-        crate::ComponentType::SplashScreen => "plasma-splash",
-        crate::ComponentType::SddmTheme => "sddm-themes",
-        crate::ComponentType::IconTheme => "icons",
-        crate::ComponentType::Wallpaper => "wallpapers",
-    }
+    component.component_type.backup_subdir()
 }
 
 /// generates a timestamp string for backup directories.
@@ -162,9 +145,8 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let file_name = entry.file_name();
         let dst_path = dst.join(&file_name);
 
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue, // skip entries we can't read
+        let Ok(metadata) = entry.metadata() else {
+            continue;
         };
 
         if metadata.is_dir() {

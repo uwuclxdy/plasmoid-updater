@@ -73,42 +73,69 @@ impl ComponentType {
     }
 
     pub fn user_path(self) -> PathBuf {
-        let data_home = std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/share"));
+        let data_home = crate::paths::data_home();
 
-        match self {
-            Self::PlasmaWidget => data_home.join("plasma/plasmoids"),
-            Self::WallpaperPlugin => data_home.join("plasma/wallpapers"),
-            Self::KWinEffect => data_home.join("kwin/effects"),
-            Self::KWinScript => data_home.join("kwin/scripts"),
-            Self::KWinSwitcher => data_home.join("kwin/tabbox"),
-            Self::GlobalTheme => data_home.join("plasma/look-and-feel"),
-            Self::PlasmaStyle => data_home.join("plasma/desktoptheme"),
-            Self::AuroraeDecoration => data_home.join("aurorae/themes"),
-            Self::ColorScheme => data_home.join("color-schemes"),
-            Self::SplashScreen => data_home.join("plasma/look-and-feel"),
-            Self::SddmTheme => PathBuf::new(),
-            Self::IconTheme => data_home.join("icons"),
-            Self::Wallpaper => data_home.join("wallpapers"),
+        match self.user_suffix() {
+            Some(suffix) => data_home.join(suffix),
+            None => PathBuf::new(),
         }
     }
 
     pub fn system_path(self) -> PathBuf {
+        PathBuf::from(self.system_path_str())
+    }
+
+    const fn user_suffix(self) -> Option<&'static str> {
         match self {
-            Self::PlasmaWidget => PathBuf::from("/usr/share/plasma/plasmoids"),
-            Self::WallpaperPlugin => PathBuf::from("/usr/share/plasma/wallpapers"),
-            Self::KWinEffect => PathBuf::from("/usr/share/kwin/effects"),
-            Self::KWinScript => PathBuf::from("/usr/share/kwin/scripts"),
-            Self::KWinSwitcher => PathBuf::from("/usr/share/kwin/tabbox"),
-            Self::GlobalTheme => PathBuf::from("/usr/share/plasma/look-and-feel"),
-            Self::PlasmaStyle => PathBuf::from("/usr/share/plasma/desktoptheme"),
-            Self::AuroraeDecoration => PathBuf::from("/usr/share/aurorae/themes"),
-            Self::ColorScheme => PathBuf::from("/usr/share/color-schemes"),
-            Self::SplashScreen => PathBuf::from("/usr/share/plasma/look-and-feel"),
-            Self::SddmTheme => PathBuf::from("/usr/share/sddm/themes"),
-            Self::IconTheme => PathBuf::from("/usr/share/icons"),
-            Self::Wallpaper => PathBuf::from("/usr/share/wallpapers"),
+            Self::PlasmaWidget => Some("plasma/plasmoids"),
+            Self::WallpaperPlugin => Some("plasma/wallpapers"),
+            Self::KWinEffect => Some("kwin/effects"),
+            Self::KWinScript => Some("kwin/scripts"),
+            Self::KWinSwitcher => Some("kwin/tabbox"),
+            Self::GlobalTheme => Some("plasma/look-and-feel"),
+            Self::PlasmaStyle => Some("plasma/desktoptheme"),
+            Self::AuroraeDecoration => Some("aurorae/themes"),
+            Self::ColorScheme => Some("color-schemes"),
+            Self::SplashScreen => Some("plasma/look-and-feel"),
+            Self::SddmTheme => None,
+            Self::IconTheme => Some("icons"),
+            Self::Wallpaper => Some("wallpapers"),
+        }
+    }
+
+    const fn system_path_str(self) -> &'static str {
+        match self {
+            Self::PlasmaWidget => "/usr/share/plasma/plasmoids",
+            Self::WallpaperPlugin => "/usr/share/plasma/wallpapers",
+            Self::KWinEffect => "/usr/share/kwin/effects",
+            Self::KWinScript => "/usr/share/kwin/scripts",
+            Self::KWinSwitcher => "/usr/share/kwin/tabbox",
+            Self::GlobalTheme => "/usr/share/plasma/look-and-feel",
+            Self::PlasmaStyle => "/usr/share/plasma/desktoptheme",
+            Self::AuroraeDecoration => "/usr/share/aurorae/themes",
+            Self::ColorScheme => "/usr/share/color-schemes",
+            Self::SplashScreen => "/usr/share/plasma/look-and-feel",
+            Self::SddmTheme => "/usr/share/sddm/themes",
+            Self::IconTheme => "/usr/share/icons",
+            Self::Wallpaper => "/usr/share/wallpapers",
+        }
+    }
+
+    pub(crate) const fn backup_subdir(self) -> &'static str {
+        match self {
+            Self::PlasmaWidget => "plasma-plasmoids",
+            Self::WallpaperPlugin => "plasma-wallpapers",
+            Self::KWinEffect => "kwin-effects",
+            Self::KWinScript => "kwin-scripts",
+            Self::KWinSwitcher => "kwin-tabbox",
+            Self::GlobalTheme => "plasma-look-and-feel",
+            Self::PlasmaStyle => "plasma-desktoptheme",
+            Self::AuroraeDecoration => "aurorae-themes",
+            Self::ColorScheme => "color-schemes",
+            Self::SplashScreen => "plasma-splash",
+            Self::SddmTheme => "sddm-themes",
+            Self::IconTheme => "icons",
+            Self::Wallpaper => "wallpapers",
         }
     }
 
@@ -212,7 +239,61 @@ pub struct AvailableUpdate {
     pub download_size: Option<u64>,
 }
 
+pub struct AvailableUpdateBuilder {
+    installed: InstalledComponent,
+    content_id: u64,
+    latest_version: String,
+    download_url: String,
+    release_date: String,
+    checksum: Option<String>,
+    download_size: Option<u64>,
+}
+
+impl AvailableUpdateBuilder {
+    pub fn checksum(mut self, checksum: Option<String>) -> Self {
+        self.checksum = checksum;
+        self
+    }
+
+    pub fn download_size(mut self, size: Option<u64>) -> Self {
+        self.download_size = size;
+        self
+    }
+
+    pub fn build(self) -> AvailableUpdate {
+        let store_url = format!("https://store.kde.org/p/{}", self.content_id);
+        AvailableUpdate {
+            installed: self.installed,
+            content_id: self.content_id,
+            latest_version: self.latest_version,
+            download_url: self.download_url,
+            store_url,
+            release_date: self.release_date,
+            checksum: self.checksum,
+            download_size: self.download_size,
+        }
+    }
+}
+
 impl AvailableUpdate {
+    pub fn builder(
+        installed: InstalledComponent,
+        content_id: u64,
+        latest_version: String,
+        download_url: String,
+        release_date: String,
+    ) -> AvailableUpdateBuilder {
+        AvailableUpdateBuilder {
+            installed,
+            content_id,
+            latest_version,
+            download_url,
+            release_date,
+            checksum: None,
+            download_size: None,
+        }
+    }
+
     pub fn new(
         installed: InstalledComponent,
         content_id: u64,
@@ -220,17 +301,14 @@ impl AvailableUpdate {
         download_url: String,
         release_date: String,
     ) -> Self {
-        let store_url = format!("https://store.kde.org/p/{content_id}");
-        Self {
+        Self::builder(
             installed,
             content_id,
             latest_version,
             download_url,
-            store_url,
             release_date,
-            checksum: None,
-            download_size: None,
-        }
+        )
+        .build()
     }
 
     pub fn with_checksum(mut self, checksum: Option<String>) -> Self {

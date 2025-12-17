@@ -2,11 +2,15 @@
 //
 // ID resolution approach based on Apdatifier (https://github.com/exequtic/apdatifier) - MIT License
 
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{collections::HashMap, fs};
 
-use quick_xml::{Reader, events::Event};
+use crate::{InstalledComponent, StoreEntry, registry};
 
-use crate::{InstalledComponent, StoreEntry};
+pub(crate) struct DownloadInfo {
+    pub(crate) url: String,
+    pub(crate) checksum: Option<String>,
+    pub(crate) size_kb: Option<u64>,
+}
 
 /// resolves the kde store content id for an installed component.
 /// priority order:
@@ -32,14 +36,14 @@ fn resolve_by_name(component: &InstalledComponent, store_entries: &[StoreEntry])
 
 fn resolve_by_registry(component: &InstalledComponent) -> Option<u64> {
     let registry_file = component.component_type.registry_file()?;
-    let registry_path = get_knewstuff_dir().join(registry_file);
+    let registry_path = crate::paths::knewstuff_dir().join(registry_file);
 
     if !registry_path.exists() {
         return None;
     }
 
     let content = fs::read_to_string(&registry_path).ok()?;
-    find_id_in_registry(&content, &component.directory_name)
+    registry::find_id_in_registry(&content, &component.directory_name)
 }
 
 fn resolve_by_table(
@@ -49,87 +53,33 @@ fn resolve_by_table(
     widgets_id_table.get(&component.directory_name).copied()
 }
 
-fn get_knewstuff_dir() -> PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/share"))
-        .join("knewstuff3")
-}
-
-pub(crate) fn find_id_in_registry(xml: &str, directory_name: &str) -> Option<u64> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut current_element = String::new();
-    let mut in_entry = false;
-    let mut current_id: Option<u64> = None;
-    let mut current_path: Option<String> = None;
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                current_element = name.clone();
-
-                if name == "stuff" {
-                    in_entry = true;
-                    current_id = None;
-                    current_path = None;
-                }
-            }
-            Ok(Event::End(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-
-                if name == "stuff" && in_entry {
-                    if let (Some(id), Some(path)) = (current_id, &current_path)
-                        && path_matches_directory(path, directory_name)
-                    {
-                        return Some(id);
-                    }
-                    in_entry = false;
-                }
-            }
-            Ok(Event::Text(e)) => {
-                if !in_entry {
-                    continue;
-                }
-
-                let text = String::from_utf8_lossy(e.as_ref()).to_string();
-
-                match current_element.as_str() {
-                    "id" => current_id = text.parse().ok(),
-                    "installedfile" | "uninstalledfile" => current_path = Some(text),
-                    _ => {}
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-    }
-
-    None
-}
-
-pub(crate) fn path_matches_directory(path: &str, directory_name: &str) -> bool {
-    path.split('/').any(|segment| segment == directory_name)
-}
-
 pub fn select_download_url(entry: &StoreEntry, target_version: &str) -> Option<String> {
+    select_download_with_info(entry, target_version).map(|i| i.url)
+}
+
+pub(crate) fn select_download_with_info(
+    entry: &StoreEntry,
+    target_version: &str,
+) -> Option<DownloadInfo> {
     if entry.download_links.is_empty() {
         return None;
     }
 
-    if entry.download_links.len() == 1 {
-        return Some(entry.download_links[0].url.clone());
-    }
+    let link = if entry.download_links.len() == 1 {
+        &entry.download_links[0]
+    } else {
+        entry
+            .download_links
+            .iter()
+            .find(|l| l.version == target_version)
+            .or_else(|| entry.download_links.first())?
+    };
 
-    entry
-        .download_links
-        .iter()
-        .find(|link| link.version == target_version)
-        .or_else(|| entry.download_links.first())
-        .map(|link| link.url.clone())
+    Some(DownloadInfo {
+        url: link.url.clone(),
+        checksum: link.checksum.clone(),
+        size_kb: link.size_kb,
+    })
 }
 
 pub fn find_store_entry(entries: &[StoreEntry], content_id: u64) -> Option<&StoreEntry> {
