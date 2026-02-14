@@ -1,0 +1,30 @@
+[package]
+name = "plasmoid-updater"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI tool for updating KDE Plasma 6 components from the KDE Store"
+keywords = ["kde", "plasma", "widgets", "updater", "cli"]
+categories = ["command-line-utilities"]
+readme = "../README.md"
+homepage = "https://github.com/uwuclxdy/plasmoid-updater"
+documentation = "https://docs.rs/plasmoid-updater"
+
+[[bin]]
+name = "plasmoid-updater"
+path = "src/main.rs"
+
+[dependencies]
+libplasmoid-updater = { workspace = true }
+clap = { version = "4.5.57", features = ["derive"] }
+indicatif = "0.18.3"
+comfy-table = "7.2.2"
+owo-colors = "4.2.3"
+bytesize = "2.3.1"
+inquire = "0.9.3"
+is-terminal = "0.4.17"
+toml = "0.9.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+dirs = "6.0.0"

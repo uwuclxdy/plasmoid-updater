@@ -2,11 +2,6 @@
 
 Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier's and KDE Discover's logic.
 
-## Requirements
-
-- bsdtar
-- kpackagetool6
-
 ## Supported Components
 
 | Component Type             | KDE Store Category |
@@ -22,15 +17,20 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 | Splash Screens             | 708                |
 | SDDM Themes                | 101                |
 
+## Requirements
+
+- bsdtar
+- kpackagetool6
+- [Rust Toolchain](https://rust-lang.org/tools/install/)
+
 ## Installation
 
+**Using Cargo** (Rust package manager) – **recommended**:
 ```bash
 cargo install plasmoid-updater
 ```
 
-Precompiled binaries available on [Releases](https://github.com/uwuclxdy/plasmoid-updater/releases/latest) page.
-
-Build from source:
+**From source:**
 
 ```bash
 git clone https://github.com/uwuclxdy/plasmoid-updater
@@ -38,21 +38,48 @@ cd plasmoid-updater
 cargo build --release
 ```
 
+Precompiled binaries also available on [Releases](https://github.com/uwuclxdy/plasmoid-updater/releases/latest) page.
+
 ## Usage
 
 ```bash
-# List installed components
-plasmoid-updater list-installed
+$ plasmoid-updater --help
+Usage: plasmoid-updater [OPTIONS] [COMMAND]
 
-# Update all user components
-plasmoid-updater update --all
+Commands:
+  check           check for available updates
+  list-installed  list all installed components
+  update          update components
 
-# Update all system components
-plasmoid-updater update --all --system
+Options:
+      --system       operate on system-wide components (requires sudo)
+  -v, --verbose      enable verbose output
+      --json         output results as json
+      --edit-config  open configuration file in editor
+  -h, --help         Print help
+  -V, --version      Print version
 
-# Update a specific component
-plasmoid-updater update <component-name>
+$ plasmoid-updater update --help
+Usage: plasmoid-updater update [OPTIONS] [COMPONENT]
+
+Arguments:
+  [COMPONENT]  component name or directory to update
+
+Options:
+      --restart-plasma     automatically restart plasmashell after updates
+      --no-restart-plasma  do not restart plasmashell after updates
+  -y, --yes                automatically confirm all updates without prompting
+      --system             operate on system-wide components (requires sudo)
+  -v, --verbose            enable verbose output
+      --json               output results as json
+  -h, --help               Print help
 ```
+
+## Reporting Bugs
+
+This program is in its early stages, please open a GitHub issue for any bugs that you may find.
+
+---
 
 ## License
 

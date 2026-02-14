@@ -2,48 +2,41 @@
 //
 // ID resolution approach based on Apdatifier (https://github.com/exequtic/apdatifier) - MIT License
 
-use std::{collections::HashMap, fs};
+use std::collections::HashMap;
 
-use crate::{InstalledComponent, StoreEntry, registry};
+use crate::{InstalledComponent, StoreEntry};
 
-pub(crate) struct DownloadInfo {
-    pub(crate) url: String,
-    pub(crate) checksum: Option<String>,
-    pub(crate) size_kb: Option<u64>,
+pub struct DownloadInfo {
+    pub url: String,
+    pub checksum: Option<String>,
+    pub size_kb: Option<u64>,
 }
 
-/// resolves the kde store content id for an installed component.
-/// priority order:
-/// 1. knewstuff registry (most reliable - already contains the id from discovery)
-/// 2. exact name match from store api
-/// 3. fallback widgets-id table
+/// Resolves the KDE Store content ID for an installed component.
+///
+/// Uses a three-tier resolution strategy:
+/// 1. KNewStuff registry lookup via pre-built cache (most reliable)
+/// 2. Exact name match from store API results
+/// 3. Fallback widgets-id table
 pub fn resolve_content_id(
     component: &InstalledComponent,
     store_entries: &[StoreEntry],
     widgets_id_table: &HashMap<String, u64>,
+    registry_id_cache: &HashMap<String, u64>,
 ) -> Option<u64> {
-    resolve_by_registry(component)
+    registry_id_cache
+        .get(&component.directory_name)
+        .copied()
         .or_else(|| resolve_by_name(component, store_entries))
         .or_else(|| resolve_by_table(component, widgets_id_table))
 }
 
 fn resolve_by_name(component: &InstalledComponent, store_entries: &[StoreEntry]) -> Option<u64> {
+    let category = component.component_type.category_id();
     store_entries
         .iter()
-        .find(|e| e.name == component.name)
+        .find(|e| e.name == component.name && e.type_id == category)
         .map(|e| e.id)
-}
-
-fn resolve_by_registry(component: &InstalledComponent) -> Option<u64> {
-    let registry_file = component.component_type.registry_file()?;
-    let registry_path = crate::paths::knewstuff_dir().join(registry_file);
-
-    if !registry_path.exists() {
-        return None;
-    }
-
-    let content = fs::read_to_string(&registry_path).ok()?;
-    registry::find_id_in_registry(&content, &component.directory_name)
 }
 
 fn resolve_by_table(
@@ -53,14 +46,7 @@ fn resolve_by_table(
     widgets_id_table.get(&component.directory_name).copied()
 }
 
-pub fn select_download_url(entry: &StoreEntry, target_version: &str) -> Option<String> {
-    select_download_with_info(entry, target_version).map(|i| i.url)
-}
-
-pub(crate) fn select_download_with_info(
-    entry: &StoreEntry,
-    target_version: &str,
-) -> Option<DownloadInfo> {
+pub fn select_download_with_info(entry: &StoreEntry, target_version: &str) -> Option<DownloadInfo> {
     if entry.download_links.is_empty() {
         return None;
     }
@@ -84,4 +70,8 @@ pub(crate) fn select_download_with_info(
 
 pub fn find_store_entry(entries: &[StoreEntry], content_id: u64) -> Option<&StoreEntry> {
     entries.iter().find(|e| e.id == content_id)
+}
+
+pub fn select_download_url(entry: &StoreEntry, target_version: &str) -> Option<String> {
+    select_download_with_info(entry, target_version).map(|info| info.url)
 }

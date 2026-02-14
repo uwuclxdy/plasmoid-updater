@@ -4,7 +4,11 @@ use std::{collections::HashSet, fs, path::Path};
 
 use crate::{ComponentType, InstalledComponent, PackageMetadata, Result, registry};
 
-pub fn scan_installed_components(system: bool) -> Result<Vec<InstalledComponent>> {
+/// Discovers all installed Plasmoids.
+///
+/// When `system` is `true`, scans system-wide directories (`/usr/share/...`);
+/// otherwise scans user directories (`~/.local/share/...`).
+pub fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
     let types = if system {
         ComponentType::all()
     } else {
@@ -15,7 +19,6 @@ pub fn scan_installed_components(system: bool) -> Result<Vec<InstalledComponent>
     let mut scanned_dirs = HashSet::new();
 
     for &component_type in types {
-        // use registry-based discovery for types without metadata files
         if component_type.registry_only() {
             let registry_components = registry::scan_registry_components(component_type)?;
             components.extend(registry_components);
@@ -32,13 +35,10 @@ pub fn scan_installed_components(system: bool) -> Result<Vec<InstalledComponent>
             continue;
         }
 
-        // skip already-scanned directories to avoid duplicates
-        // (e.g., GlobalTheme and SplashScreen share the same path)
         if !scanned_dirs.insert(path.clone()) {
             continue;
         }
 
-        // load registry to get release dates
         let registry_map = registry::load_registry_map(component_type);
         let discovered = scan_directory(&path, component_type, system, &registry_map)?;
         components.extend(discovered);
@@ -73,14 +73,14 @@ fn scan_directory(
             continue;
         };
 
-        let Some(metadata) = read_package_metadata(&path) else {
+        let Some(metadata) = read_metadata_json(&path).or_else(|| read_metadata_desktop(&path))
+        else {
             continue;
         };
 
         let name = metadata.name().unwrap_or(&directory_name).to_string();
         let version = metadata.version().unwrap_or("0.0.0").to_string();
 
-        // look up release date from registry
         let release_date = registry_map
             .get(&directory_name)
             .map(|e| e.release_date.clone())
@@ -100,10 +100,6 @@ fn scan_directory(
     Ok(components)
 }
 
-fn read_package_metadata(package_dir: &Path) -> Option<PackageMetadata> {
-    read_metadata_json(package_dir).or_else(|| read_metadata_desktop(package_dir))
-}
-
 fn read_metadata_json(package_dir: &Path) -> Option<PackageMetadata> {
     let path = package_dir.join("metadata.json");
     let content = fs::read_to_string(&path).ok()?;
@@ -112,37 +108,18 @@ fn read_metadata_json(package_dir: &Path) -> Option<PackageMetadata> {
 
 fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
     let path = package_dir.join("metadata.desktop");
-    let content = fs::read_to_string(&path).ok()?;
+    let entry = freedesktop_entry_parser::parse_entry(&path).ok()?;
+    let section = entry.section("Desktop Entry")?;
 
-    let mut name = None;
-    let mut version = None;
-    let mut icon = None;
-    let mut description = None;
-    let mut kpackage_structure = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-
-        if let Some(val) = line.strip_prefix("Name=") {
-            name = Some(val.to_string());
-        } else if let Some(val) = line.strip_prefix("X-KDE-PluginInfo-Version=") {
-            version = Some(val.to_string());
-        } else if let Some(val) = line.strip_prefix("Icon=") {
-            icon = Some(val.to_string());
-        } else if let Some(val) = line.strip_prefix("Comment=") {
-            description = Some(val.to_string());
-        } else if let Some(val) = line.strip_prefix("X-KDE-ServiceTypes=") {
-            kpackage_structure = Some(val.to_string());
-        }
-    }
+    let attr = |key: &str| section.attr(key).first().map(|s| s.to_string());
 
     Some(PackageMetadata {
         kplugin: Some(crate::types::KPluginInfo {
-            name,
-            version,
-            icon,
-            description,
+            name: attr("Name"),
+            version: attr("X-KDE-PluginInfo-Version"),
+            icon: attr("Icon"),
+            description: attr("Comment"),
         }),
-        kpackage_structure,
+        kpackage_structure: attr("X-KDE-ServiceTypes"),
     })
 }
