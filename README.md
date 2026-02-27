@@ -25,6 +25,10 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 
 ## Installation
 
+**Binary release**
+
+Precompiled binary available on [GitHub Releases](https://github.com/uwuclxdy/plasmoid-updater/releases/latest).
+
 **From source:**
 
 ```bash
