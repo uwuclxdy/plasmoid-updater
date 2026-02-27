@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 
-use crate::{InstalledComponent, StoreEntry};
+use crate::types::{InstalledComponent, StoreEntry};
 
-pub struct DownloadInfo {
-    pub url: String,
-    pub checksum: Option<String>,
-    pub size_kb: Option<u64>,
+pub(crate) struct DownloadInfo {
+    pub(crate) url: String,
+    pub(crate) checksum: Option<String>,
+    pub(crate) size_kb: Option<u64>,
 }
 
 /// Resolves the KDE Store content ID for an installed component.
@@ -18,7 +18,7 @@ pub struct DownloadInfo {
 /// 1. KNewStuff registry lookup via pre-built cache (most reliable)
 /// 2. Exact name match from store API results
 /// 3. Fallback widgets-id table
-pub fn resolve_content_id(
+pub(crate) fn resolve_content_id(
     component: &InstalledComponent,
     store_entries: &[StoreEntry],
     widgets_id_table: &HashMap<String, u64>,
@@ -32,10 +32,9 @@ pub fn resolve_content_id(
 }
 
 fn resolve_by_name(component: &InstalledComponent, store_entries: &[StoreEntry]) -> Option<u64> {
-    let category = component.component_type.category_id();
     store_entries
         .iter()
-        .find(|e| e.name == component.name && e.type_id == category)
+        .find(|e| e.name == component.name && component.component_type.matches_type_id(e.type_id))
         .map(|e| e.id)
 }
 
@@ -46,7 +45,10 @@ fn resolve_by_table(
     widgets_id_table.get(&component.directory_name).copied()
 }
 
-pub fn select_download_with_info(entry: &StoreEntry, target_version: &str) -> Option<DownloadInfo> {
+pub(crate) fn select_download_with_info(
+    entry: &StoreEntry,
+    target_version: &str,
+) -> Option<DownloadInfo> {
     if entry.download_links.is_empty() {
         return None;
     }
@@ -68,10 +70,6 @@ pub fn select_download_with_info(entry: &StoreEntry, target_version: &str) -> Op
     })
 }
 
-pub fn find_store_entry(entries: &[StoreEntry], content_id: u64) -> Option<&StoreEntry> {
+pub(crate) fn find_store_entry(entries: &[StoreEntry], content_id: u64) -> Option<&StoreEntry> {
     entries.iter().find(|e| e.id == content_id)
-}
-
-pub fn select_download_url(entry: &StoreEntry, target_version: &str) -> Option<String> {
-    select_download_with_info(entry, target_version).map(|info| info.url)
 }

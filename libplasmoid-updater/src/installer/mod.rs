@@ -3,9 +3,11 @@
 // Installation logic based on Apdatifier (https://github.com/exequtic/apdatifier) - MIT License
 // and KDE Discover (https://invent.kde.org/plasma/discover) - GPL-2.0+/LGPL-2.0+
 
+mod backup;
 mod download;
 mod install;
 mod plasmashell;
+pub(crate) mod privilege;
 
 use std::{
     fs,
@@ -13,19 +15,16 @@ use std::{
 };
 
 use crate::{
-    AvailableUpdate, Error, InstalledComponent, Result, UpdateSummary, backup_component, registry,
-    restore_component,
+    registry,
+    types::{AvailableUpdate, InstalledComponent},
+    {Error, Result},
 };
+use backup::{backup_component, restore_component};
 
-pub use download::{download_package, extract_archive};
-pub use install::{
-    find_metadata_json, install_direct, install_via_kpackagetool, is_single_file_component,
-    patch_metadata,
-};
-pub use plasmashell::{any_requires_restart, requires_plasmashell_restart, restart_plasmashell};
+pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
 
 /// Updates a single component using provided HTTP client.
-pub fn update_component(
+pub(crate) fn update_component(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
 ) -> Result<()> {
@@ -47,35 +46,6 @@ pub fn update_component(
     }
 }
 
-/// Updates multiple components sequentially with a provided HTTP client.
-///
-/// Components in the `excluded` list are skipped and recorded in the summary.
-pub fn update_components(
-    updates: &[AvailableUpdate],
-    excluded: &[String],
-    client: &reqwest::blocking::Client,
-) -> UpdateSummary {
-    let mut summary = UpdateSummary::default();
-
-    for update in updates {
-        let name = update.installed.name.clone();
-        let dir_name = &update.installed.directory_name;
-
-        if excluded.iter().any(|e| e == dir_name || e == &name) {
-            log::debug!(target: "update", "skipping {} (excluded)", name);
-            summary.add_skipped(name);
-            continue;
-        }
-
-        match update_component(update, client) {
-            Ok(()) => summary.add_success(name),
-            Err(e) => summary.add_failure(name, e.to_string()),
-        }
-    }
-
-    summary
-}
-
 fn create_backup(component: &InstalledComponent) -> Result<PathBuf> {
     let backup_path = backup_component(component)?;
     log::debug!(target: "backup", "created at {}", backup_path.display());
@@ -94,11 +64,7 @@ fn perform_installation(
         &component.name,
     )?;
 
-    execute_installation(
-        &downloaded_path,
-        component,
-        &update.latest_version,
-    )
+    execute_installation(&downloaded_path, component, &update.latest_version)
 }
 
 fn download_with_error_handling(
@@ -159,15 +125,21 @@ fn install_from_archive(
 fn post_install_tasks(update: &AvailableUpdate) -> Result<()> {
     let component = &update.installed;
 
-    let installed_metadata = component.path.join("metadata.json");
-    if installed_metadata.exists()
-        && let Err(e) = install::patch_metadata(
-            &installed_metadata,
+    let installed_json = component.path.join("metadata.json");
+    let installed_desktop = component.path.join("metadata.desktop");
+
+    if installed_json.exists() {
+        if let Err(e) = install::patch_metadata(
+            &installed_json,
             component.component_type,
             &update.latest_version,
-        )
+        ) {
+            log::warn!(target: "patch", "failed to update installed metadata: {e}");
+        }
+    } else if installed_desktop.exists()
+        && let Err(e) = install::patch_metadata_desktop(&installed_desktop, &update.latest_version)
     {
-        log::warn!(target: "patch", "failed to update installed metadata: {e}");
+        log::warn!(target: "patch", "failed to update installed metadata.desktop: {e}");
     }
 
     if let Err(e) = registry::update_registry_after_install(update) {

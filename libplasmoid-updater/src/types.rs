@@ -42,7 +42,7 @@ pub enum ComponentType {
 }
 
 impl ComponentType {
-    pub const fn category_id(self) -> u16 {
+    pub(crate) const fn category_id(self) -> u16 {
         match self {
             Self::PlasmaWidget => CATEGORY_PLASMA_WIDGET,
             Self::WallpaperPlugin => CATEGORY_WALLPAPER_PLUGIN,
@@ -60,7 +60,21 @@ impl ComponentType {
         }
     }
 
-    pub const fn kpackage_type(self) -> Option<&'static str> {
+    /// Returns true if the given store `type_id` belongs to this component type.
+    ///
+    /// The OCS API returns subcategory IDs in the `typeid` field. For example,
+    /// PlasmaWidget queries with parent category 705 but store entries have
+    /// specific subcategory IDs (706 "Applets", 708 "Clocks", 710 "Monitoring",
+    /// etc.). This method accounts for those parent-child relationships.
+    pub(crate) const fn matches_type_id(self, type_id: u16) -> bool {
+        if self.category_id() == type_id {
+            return true;
+        }
+        // PlasmaWidget (705) is the parent of subcategories 706-713, 723
+        matches!((self, type_id), (Self::PlasmaWidget, 706..=713 | 723))
+    }
+
+    pub(crate) const fn kpackage_type(self) -> Option<&'static str> {
         match self {
             Self::PlasmaWidget => Some("Plasma/Applet"),
             Self::WallpaperPlugin => Some("Plasma/Wallpaper"),
@@ -73,7 +87,7 @@ impl ComponentType {
 
     /// Returns true if this type uses registry-based discovery only
     /// (no metadata files on disk).
-    pub const fn registry_only(self) -> bool {
+    pub(crate) const fn registry_only(self) -> bool {
         matches!(self, Self::IconTheme | Self::Wallpaper | Self::ColorScheme)
     }
 
@@ -105,9 +119,9 @@ impl ComponentType {
         }
     }
 
-    /// Returns the system-wide installation path string for this component type.
-    pub const fn system_path_str(self) -> &'static str {
-        match self {
+    /// Returns the system-wide installation path for this component type.
+    pub fn system_path(self) -> PathBuf {
+        PathBuf::from(match self {
             Self::PlasmaWidget => "/usr/share/plasma/plasmoids",
             Self::WallpaperPlugin => "/usr/share/plasma/wallpapers",
             Self::KWinEffect => "/usr/share/kwin/effects",
@@ -120,12 +134,7 @@ impl ComponentType {
             Self::SddmTheme => "/usr/share/sddm/themes",
             Self::IconTheme => "/usr/share/icons",
             Self::Wallpaper => "/usr/share/wallpapers",
-        }
-    }
-
-    /// Returns the system-wide installation path for this component type.
-    pub fn system_path(self) -> PathBuf {
-        PathBuf::from(self.system_path_str())
+        })
     }
 
     /// Returns the backup subdirectory name for this component type.
@@ -149,7 +158,7 @@ impl ComponentType {
 
     // -- Registry --
 
-    pub const fn registry_file(self) -> Option<&'static str> {
+    pub(crate) const fn registry_file(self) -> Option<&'static str> {
         match self {
             Self::PlasmaWidget => Some("plasmoids.knsregistry"),
             Self::KWinEffect => Some("kwineffect.knsregistry"),
@@ -225,6 +234,8 @@ impl std::fmt::Display for ComponentType {
     }
 }
 
+// -- Internal types --
+
 /// A KDE component installed on the local system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledComponent {
@@ -254,7 +265,7 @@ pub struct AvailableUpdate {
 }
 
 /// Builder for constructing [`AvailableUpdate`] instances with optional fields.
-pub struct AvailableUpdateBuilder {
+pub(crate) struct AvailableUpdateBuilder {
     installed: InstalledComponent,
     content_id: u64,
     latest_version: String,
@@ -265,17 +276,17 @@ pub struct AvailableUpdateBuilder {
 }
 
 impl AvailableUpdateBuilder {
-    pub fn checksum(mut self, checksum: Option<String>) -> Self {
+    pub(crate) fn checksum(mut self, checksum: Option<String>) -> Self {
         self.checksum = checksum;
         self
     }
 
-    pub fn download_size(mut self, size: Option<u64>) -> Self {
+    pub(crate) fn download_size(mut self, size: Option<u64>) -> Self {
         self.download_size = size;
         self
     }
 
-    pub fn build(self) -> AvailableUpdate {
+    pub(crate) fn build(self) -> AvailableUpdate {
         let store_url = format!("https://store.kde.org/p/{}", self.content_id);
         AvailableUpdate {
             installed: self.installed,
@@ -291,7 +302,7 @@ impl AvailableUpdateBuilder {
 }
 
 impl AvailableUpdate {
-    pub fn builder(
+    pub(crate) fn builder(
         installed: InstalledComponent,
         content_id: u64,
         latest_version: String,
@@ -312,7 +323,7 @@ impl AvailableUpdate {
 
 /// An entry from the KDE Store API representing a published component.
 #[derive(Debug, Clone)]
-pub struct StoreEntry {
+pub(crate) struct StoreEntry {
     pub id: u64,
     pub name: String,
     pub version: String,
@@ -323,7 +334,7 @@ pub struct StoreEntry {
 
 /// A download link for a store entry, with optional checksum and size.
 #[derive(Debug, Clone)]
-pub struct DownloadLink {
+pub(crate) struct DownloadLink {
     pub url: String,
     pub version: String,
     pub checksum: Option<String>,
@@ -332,16 +343,14 @@ pub struct DownloadLink {
 
 /// Metadata parsed from a component's `metadata.json` or `metadata.desktop` file.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct PackageMetadata {
+pub(crate) struct PackageMetadata {
     #[serde(rename = "KPlugin")]
     pub kplugin: Option<KPluginInfo>,
-    #[serde(rename = "KPackageStructure")]
-    pub kpackage_structure: Option<String>,
 }
 
 /// Plugin metadata from the `KPlugin` section of `metadata.json`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct KPluginInfo {
+pub(crate) struct KPluginInfo {
     #[serde(rename = "Name")]
     pub name: Option<String>,
     #[serde(rename = "Version")]
@@ -353,48 +362,18 @@ pub struct KPluginInfo {
 }
 
 impl PackageMetadata {
-    pub fn name(&self) -> Option<&str> {
+    pub(crate) fn name(&self) -> Option<&str> {
         self.kplugin.as_ref()?.name.as_deref()
     }
 
-    pub fn version(&self) -> Option<&str> {
+    pub(crate) fn version(&self) -> Option<&str> {
         self.kplugin.as_ref()?.version.as_deref()
-    }
-}
-
-/// Summary of a batch update operation, tracking successes, failures, and skips.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct UpdateSummary {
-    pub succeeded: Vec<String>,
-    pub failed: Vec<(String, String)>,
-    pub skipped: Vec<String>,
-}
-
-impl UpdateSummary {
-    pub fn add_success(&mut self, name: String) {
-        self.succeeded.push(name);
-    }
-
-    pub fn add_failure(&mut self, name: String, reason: String) {
-        self.failed.push((name, reason));
-    }
-
-    pub fn add_skipped(&mut self, name: String) {
-        self.skipped.push(name);
-    }
-
-    pub fn has_failures(&self) -> bool {
-        !self.failed.is_empty()
-    }
-
-    pub fn exit_code(&self) -> i32 {
-        if self.has_failures() { 1 } else { 0 }
     }
 }
 
 /// Detailed diagnostic information about component check status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComponentDiagnostic {
+pub(crate) struct ComponentDiagnostic {
     pub name: String,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,7 +385,7 @@ pub struct ComponentDiagnostic {
 }
 
 impl ComponentDiagnostic {
-    pub fn new(name: String, reason: String) -> Self {
+    pub(crate) fn new(name: String, reason: String) -> Self {
         Self {
             name,
             reason,
@@ -416,33 +395,31 @@ impl ComponentDiagnostic {
         }
     }
 
-    pub fn with_versions(mut self, installed: Option<String>, available: Option<String>) -> Self {
+    pub(crate) fn with_versions(
+        mut self,
+        installed: Option<String>,
+        available: Option<String>,
+    ) -> Self {
         self.installed_version = installed;
         self.available_version = available;
         self
     }
 
-    pub fn with_content_id(mut self, id: u64) -> Self {
+    pub(crate) fn with_content_id(mut self, id: u64) -> Self {
         self.content_id = Some(id);
         self
     }
 }
 
-/// Result of checking for available updates, including diagnostics.
+/// Internal result of checking for available updates, including diagnostics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct UpdateCheckResult {
+pub(crate) struct UpdateCheckResult {
     pub updates: Vec<AvailableUpdate>,
-    /// Components that couldn't be matched to KDE Store entries.
     pub unresolved: Vec<ComponentDiagnostic>,
-    /// Components that were matched but failed during update check.
     pub check_failures: Vec<ComponentDiagnostic>,
 }
 
 impl UpdateCheckResult {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn add_update(&mut self, update: AvailableUpdate) {
         self.updates.push(update);
     }
@@ -453,10 +430,6 @@ impl UpdateCheckResult {
 
     pub fn add_check_failure(&mut self, diagnostic: ComponentDiagnostic) {
         self.check_failures.push(diagnostic);
-    }
-
-    pub fn has_issues(&self) -> bool {
-        !self.unresolved.is_empty() || !self.check_failures.is_empty()
     }
 }
 

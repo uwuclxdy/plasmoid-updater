@@ -5,7 +5,7 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 ## Supported Components
 
 | Component Type             | KDE Store Category |
-|----------------------------|--------------------|
+| -------------------------- | ------------------ |
 | Plasma Widgets (Plasmoids) | 705                |
 | Wallpaper Plugins          | 715                |
 | KWin Effects               | 719                |
@@ -25,25 +25,20 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 
 ## Installation
 
-**Using Cargo** (Rust package manager) – **recommended**:
-```bash
-cargo install plasmoid-updater
-```
-
 **From source:**
 
 ```bash
 git clone https://github.com/uwuclxdy/plasmoid-updater
 cd plasmoid-updater
-cargo build --release
+cargo install --path .
 ```
-
-Precompiled binaries also available on [Releases](https://github.com/uwuclxdy/plasmoid-updater/releases/latest) page.
 
 ## Usage
 
 ```bash
 $ plasmoid-updater --help
+update kde plasma components from the kde store
+
 Usage: plasmoid-updater [OPTIONS] [COMMAND]
 
 Commands:
@@ -52,26 +47,26 @@ Commands:
   update          update components
 
 Options:
-      --system       operate on system-wide components (requires sudo)
-  -v, --verbose      enable verbose output
-      --json         output results as json
+      --system       operate on system-wide components (needs sudo)
       --edit-config  open configuration file in editor
   -h, --help         Print help
   -V, --version      Print version
+```
 
+```bash
 $ plasmoid-updater update --help
+update components
+
 Usage: plasmoid-updater update [OPTIONS] [COMPONENT]
 
 Arguments:
   [COMPONENT]  component name or directory to update
 
 Options:
-      --restart-plasma     automatically restart plasmashell after updates
-      --no-restart-plasma  do not restart plasmashell after updates
-  -y, --yes                automatically confirm all updates without prompting
-      --system             operate on system-wide components (requires sudo)
-  -v, --verbose            enable verbose output
-      --json               output results as json
+      --restart-plasma     automatically restart plasmashell
+      --no-restart-plasma  do not restart plasmashell
+  -y, --yes                automatically confirm all updates
+      --system             operate on system-wide components (needs sudo)
   -h, --help               Print help
 ```
 

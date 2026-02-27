@@ -1,196 +1,3 @@
-//! # libplasmoid-updater
-//!
-//! A library for managing KDE Plasma components (plasmoids, themes, effects, etc.) from the KDE Store.
-//!
-//! ## Features
-//!
-//! - **Component Discovery**: Automatically discover installed KDE components
-//! - **Update Detection**: Check for available updates from the KDE Store
-//! - **Safe Installation**: Install updates with automatic backup and rollback
-//! - **Registry Integration**: Maintain KNewStuff registry compatibility with KDE Discover
-//! - **Parallel Processing**: Efficient parallel checking and updating
-//!
-//! ## Supported Component Types
-//!
-//! - Plasma Widgets (plasmoids)
-//! - Wallpaper Plugins
-//! - KWin Effects, Scripts, and Switchers
-//! - Global Themes and Plasma Styles
-//! - Color Schemes and Icon Themes
-//! - Splash Screens and SDDM Themes
-//! - Aurorae Decorations
-//!
-//! ## Quick Start
-//!
-//! ```rust,no_run
-//! use libplasmoid_updater::{Config, run};
-//!
-//! # fn main() -> libplasmoid_updater::Result<()> {
-//! let config = Config::new();
-//! let summary = run(&config, false)?;
-//! println!("Updated: {}, Failed: {}", summary.succeeded.len(), summary.failed.len());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Topgrade Integration
-//!
-//! This library is designed for easy integration into [topgrade](https://github.com/topgrade-rs/topgrade).
-//! Here's the recommended pattern matching topgrade's conventions:
-//!
-//! ```rust,no_run
-//! use libplasmoid_updater::{has_installed_components, run_default, Error};
-//!
-//! # struct ExecutionContext;
-//! # impl ExecutionContext {
-//! #     fn run_type(&self) -> RunType { RunType }
-//! # }
-//! # struct RunType;
-//! # impl RunType {
-//! #     fn dry(&self) -> bool { false }
-//! # }
-//! # #[derive(Debug)]
-//! # enum TopgradeError { SkipStep(String), StepFailed }
-//! # impl From<TopgradeError> for Box<dyn std::error::Error> {
-//! #     fn from(_: TopgradeError) -> Self { todo!() }
-//! # }
-//! # fn print_separator(_: &str) {}
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! # let ctx = ExecutionContext;
-//! pub fn run_plasmoid_updater(ctx: &ExecutionContext) -> Result<(), Box<dyn std::error::Error>> {
-//!     // Check if any components are installed
-//!     match has_installed_components(false) {
-//!         Err(e) => {
-//!             eprintln!("Error checking for installed components: {e:?}");
-//!             return Err(TopgradeError::StepFailed.into());
-//!         }
-//!         Ok(false) => {
-//!             return Err(TopgradeError::SkipStep("No KDE components installed".to_string()).into());
-//!         }
-//!         Ok(true) => {}
-//!     }
-//!
-//!     print_separator("KDE Plasmoids");
-//!
-//!     // Topgrade handles dry run externally
-//!     if ctx.run_type().dry() {
-//!         println!("Dry running plasmoid-updater");
-//!         return Ok(());
-//!     }
-//!
-//!     // Run the updater
-//!     match run_default(false) {
-//!         Ok(summary) => {
-//!             println!("Updated {} components", summary.succeeded.len());
-//!             if !summary.failed.is_empty() {
-//!                 println!("Failed to update {} components", summary.failed.len());
-//!                 for (name, reason) in &summary.failed {
-//!                     println!("  - {}: {}", name, reason);
-//!                 }
-//!                 return Err(TopgradeError::StepFailed.into());
-//!             }
-//!             Ok(())
-//!         }
-//!         Err(e) if e.is_skippable() => {
-//!             Err(TopgradeError::SkipStep(e.to_string()).into())
-//!         }
-//!         Err(e) => {
-//!             eprintln!("plasmoid-updater error: {e:?}");
-//!             Err(TopgradeError::StepFailed.into())
-//!         }
-//!     }
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ### Error Handling
-//!
-//! The library provides helper methods for error categorization:
-//! - [`Error::is_skippable()`] - Expected conditions (no updates, no components)
-//! - [`Error::is_transient()`] - Temporary failures (network issues, rate limits)
-//! - [`Error::is_fatal()`] - Permanent failures (permissions, IO errors)
-//!
-//! ### Configuration
-//!
-//! For custom exclusions or other settings, use the [`Config`] builder:
-//!
-//! ```rust,no_run
-//! use libplasmoid_updater::{Config, run};
-//!
-//! # fn main() -> libplasmoid_updater::Result<()> {
-//! let config = Config::new()
-//!     .with_excluded_packages(vec!["problematic-widget".to_string()]);
-//! let summary = run(&config, false)?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Detailed Usage
-//!
-//! ```rust,no_run
-//! use libplasmoid_updater::{ApiClient, Config, check_updates, update_components};
-//!
-//! # fn main() -> libplasmoid_updater::Result<()> {
-//! let config = Config::new();
-//! let api_client = ApiClient::new();
-//!
-//! // Check for available updates (user components)
-//! let result = check_updates(&config, false, &api_client)?;
-//! println!("Found {} updates", result.updates.len());
-//!
-//! // Update all components (excluding those in config.excluded_packages)
-//! let summary = update_components(
-//!     &result.updates, &config.excluded_packages, api_client.http_client(),
-//! );
-//! println!("Updated: {}, Failed: {}", summary.succeeded.len(), summary.failed.len());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Diagnostic Results
-//!
-//! ```rust,no_run
-//! use libplasmoid_updater::{ApiClient, Config, check_updates};
-//!
-//! # fn main() -> libplasmoid_updater::Result<()> {
-//! let config = Config::new();
-//! let api_client = ApiClient::new();
-//!
-//! let result = check_updates(&config, false, &api_client)?;
-//!
-//! println!("Updates available: {}", result.updates.len());
-//! println!("Unresolved components: {}", result.unresolved.len());
-//! println!("Check failures: {}", result.check_failures.len());
-//!
-//! for diagnostic in &result.unresolved {
-//!     println!("- {} ({})", diagnostic.name, diagnostic.reason);
-//!     if let Some(version) = &diagnostic.installed_version {
-//!         println!("  Installed version: {}", version);
-//!     }
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## System vs User Components
-//!
-//! The library supports both user-installed components (in ~/.local/share) and
-//! system-wide components (in /usr/share). System operations require root privileges.
-//!
-//! ```rust,no_run
-//! use libplasmoid_updater::{ApiClient, Config, check_updates};
-//!
-//! # fn main() -> libplasmoid_updater::Result<()> {
-//! let config = Config::new();
-//! let api_client = ApiClient::new();
-//!
-//! // Check system-wide components (requires sudo)
-//! let result = check_updates(&config, true, &api_client)?;
-//! # Ok(())
-//! # }
-//! ```
-
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // This implementation is based on:
@@ -201,216 +8,323 @@
 // approach are derived from Apdatifier's shell scripts. The KNewStuff registry format
 // and installation process knowledge comes from KDE Discover's source code.
 
-pub mod api;
-pub mod backup;
-pub mod checker;
-pub mod config;
-pub mod error;
-pub mod installer;
+pub(crate) mod api;
+pub(crate) mod checker;
+pub(crate) mod config;
+pub(crate) mod error;
+pub(crate) mod installer;
 pub(crate) mod paths;
-pub mod registry;
-pub mod types;
-pub mod version;
+pub(crate) mod registry;
+pub(crate) mod types;
+pub(crate) mod utils;
+pub(crate) mod version;
 
-pub use api::{ApiClient, ApiConfig, StatusCode, USER_AGENT};
-pub use backup::{backup_component, restore_component};
-pub use checker::find_installed;
-pub use checker::{find_store_entry, select_download_url};
-pub use config::Config;
-pub use error::{Error, Result};
-pub use installer::{
-    any_requires_restart, restart_plasmashell, update_component, update_components,
-};
-pub use registry::{scan_registry_components, update_registry_after_install};
-pub use types::{
-    AvailableUpdate, ComponentDiagnostic, ComponentType, DownloadLink, InstalledComponent,
-    KPluginInfo, PackageMetadata, StoreEntry, UpdateCheckResult, UpdateSummary,
-};
-pub use version::{compare as compare_versions, is_update_available};
+#[cfg(feature = "cli")]
+pub mod cli;
 
-/// Checks for available updates, returning full diagnostic results.
-///
-/// Scans installed KDE components (user or system), queries the KDE Store API,
-/// and returns an [`UpdateCheckResult`] containing:
-/// - `updates`: Components with available updates
-/// - `unresolved`: Components that couldn't be matched to KDE Store entries
-/// - `check_failures`: Components that matched but failed during update checking
-///
-/// # Arguments
-///
-/// * `config` - Configuration containing widgets-id table and excluded packages
-/// * `system` - If `true`, checks system-wide components (requires root); if `false`, checks user components
-/// * `api_client` - The API client to use for KDE Store queries
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use libplasmoid_updater::{ApiClient, Config, check_updates};
-///
-/// # fn main() -> libplasmoid_updater::Result<()> {
-/// let config = Config::new();
-/// let api_client = ApiClient::new();
-/// let result = check_updates(&config, false, &api_client)?;
-///
-/// for update in &result.updates {
-///     println!("{}: {} -> {}",
-///         update.installed.name,
-///         update.installed.version,
-///         update.latest_version
-///     );
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub fn check_updates(
-    config: &Config,
-    system: bool,
-    api_client: &ApiClient,
-) -> Result<UpdateCheckResult> {
-    checker::check(config, system, api_client)
-}
+use api::ApiClient;
+use types::UpdateCheckResult;
 
-/// Checks for updates and installs them in one step.
+pub use config::{Config, RestartBehavior};
+pub use error::Error;
+pub use types::{AvailableUpdate, ComponentType, InstalledComponent};
+
+/// A specialized `Result` type for libplasmoid-updater operations.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Checks for available updates to installed KDE Plasma components.
 ///
-/// This is the primary entry point for automation tools like topgrade.
-/// It combines [`check_updates`] and [`update_components`], respecting the
-/// excluded packages list and dry_run setting from the configuration.
+/// Scans the local filesystem for installed KDE components and queries the KDE Store API
+/// for newer versions. Returns an empty [`CheckResult`] when no updates are found — not an error.
 ///
-/// Returns [`Error::NoUpdatesAvailable`] if no updates are found.
+/// With the `cli` feature enabled, displays a spinner during fetch and a summary table of updates.
 ///
-/// # Arguments
+/// # Errors
 ///
-/// * `config` - Configuration with excluded packages list and dry_run flag
-/// * `system` - If `true`, operates on system-wide components; if `false`, user components
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use libplasmoid_updater::{Config, run};
-///
-/// # fn main() -> libplasmoid_updater::Result<()> {
-/// let config = Config::new()
-///     .with_excluded_packages(vec!["problematic-widget".to_string()]);
-///
-/// let summary = run(&config, false)?;
-/// println!("Updated: {}", summary.succeeded.len());
-/// println!("Failed: {}", summary.failed.len());
-/// println!("Skipped: {}", summary.skipped.len());
-/// # Ok(())
-/// # }
-/// ```
-pub fn run(config: &Config, system: bool) -> Result<UpdateSummary> {
+/// - [`CheckError::UnsupportedOS`] — not running on Linux
+/// - [`CheckError::NotKDE`] — KDE Plasma not detected
+/// - [`CheckError::Other`] — unexpected failure
+pub fn check(config: &Config) -> std::result::Result<CheckResult, CheckError> {
+    crate::utils::validate_environment()?;
+
     let api_client = ApiClient::new();
-    let result = check_updates(config, system, &api_client)?;
+    let result = crate::utils::fetch_updates(&api_client, config)?;
 
-    if result.updates.is_empty() {
-        return Err(Error::NoUpdatesAvailable);
-    }
+    #[cfg(feature = "cli")]
+    crate::utils::display_check_results(&result);
 
-    if config.dry_run {
-        let mut summary = UpdateSummary::default();
-        for update in &result.updates {
-            summary.add_skipped(update.installed.name.clone());
+    Ok(CheckResult::from_internal(&result))
+}
+
+/// Result of checking for available updates.
+///
+/// Returned by [`check()`](crate::check). Summarizes available updates and lists any
+/// components that could not be checked, along with the reason for each failure.
+#[derive(Debug, Clone)]
+pub struct CheckResult {
+    /// Available updates found during the check.
+    pub available_updates: Vec<AvailableUpdateInfo>,
+    /// Components that could not be checked (name, reason).
+    pub diagnostics: Vec<(String, String)>,
+}
+
+impl CheckResult {
+    pub(crate) fn from_internal(result: &UpdateCheckResult) -> Self {
+        let available_updates = result
+            .updates
+            .iter()
+            .map(AvailableUpdateInfo::from_internal)
+            .collect();
+
+        let diagnostics = result
+            .unresolved
+            .iter()
+            .chain(&result.check_failures)
+            .map(|d| (d.name.clone(), d.reason.clone()))
+            .collect();
+
+        Self {
+            available_updates,
+            diagnostics,
         }
-        return Ok(summary);
     }
 
-    Ok(update_components(
-        &result.updates,
-        &config.excluded_packages,
-        api_client.http_client(),
-    ))
+    /// Returns `true` if at least one update is available.
+    pub fn has_updates(&self) -> bool {
+        !self.available_updates.is_empty()
+    }
+
+    /// Returns the number of available updates.
+    pub fn update_count(&self) -> usize {
+        self.available_updates.len()
+    }
 }
 
-/// Runs the updater with default configuration (topgrade integration).
+/// Describes a single installed component that has an available update.
 ///
-/// This is a simplified entry point for automation tools that don't need
-/// custom configuration. It uses default settings (no exclusions, no dry run).
-///
-/// Returns [`Error::NoUpdatesAvailable`] if no updates are found, which
-/// can be converted to a `SkipStep` in topgrade using [`Error::is_skippable()`].
-///
-/// # Arguments
-///
-/// * `system` - If `true`, operates on system-wide components; if `false`, user components
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use libplasmoid_updater::run_default;
-///
-/// # fn main() -> libplasmoid_updater::Result<()> {
-/// match run_default(false) {
-///     Ok(summary) => {
-///         println!("Updated: {}", summary.succeeded.len());
-///         Ok(())
-///     }
-///     Err(e) if e.is_skippable() => {
-///         println!("Skipping: {}", e);
-///         Ok(())
-///     }
-///     Err(e) => Err(e),
-/// }
-/// # }
-/// ```
-pub fn run_default(system: bool) -> Result<UpdateSummary> {
-    run(&Config::new(), system)
+/// Returned as part of [`CheckResult::available_updates`]. Contains version
+/// info and metadata needed to identify and display the pending update.
+#[derive(Debug, Clone)]
+pub struct AvailableUpdateInfo {
+    pub name: String,
+    pub directory_name: String,
+    pub current_version: String,
+    pub available_version: String,
+    pub component_type: String,
+    pub content_id: u64,
+    pub download_size: Option<u64>,
 }
 
-/// Checks if any KDE components are installed.
-///
-/// This is useful for early detection in automation tools - if no components
-/// are found, the tool can skip the update step entirely.
-///
-/// # Arguments
-///
-/// * `system` - If `true`, checks system-wide components; if `false`, user components
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use libplasmoid_updater::has_installed_components;
-///
-/// # fn main() -> libplasmoid_updater::Result<()> {
-/// if has_installed_components(false)? {
-///     println!("Found installed components, proceeding with update check...");
-/// } else {
-///     println!("No installed components found, skipping.");
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub fn has_installed_components(system: bool) -> Result<bool> {
-    Ok(!find_installed(system)?.is_empty())
+impl AvailableUpdateInfo {
+    fn from_internal(update: &AvailableUpdate) -> Self {
+        Self {
+            name: update.installed.name.clone(),
+            directory_name: update.installed.directory_name.clone(),
+            current_version: update.installed.version.clone(),
+            available_version: update.latest_version.clone(),
+            component_type: update.installed.component_type.to_string(),
+            content_id: update.content_id,
+            download_size: update.download_size,
+        }
+    }
 }
 
-/// Lists all installed KDE components.
+/// Error returned by [`check()`](crate::check) during the detection phase.
+#[derive(Debug)]
+pub enum CheckError {
+    /// The current operating system is not supported.
+    UnsupportedOS(String),
+    /// The desktop environment is not KDE Plasma.
+    NotKDE,
+    /// An unexpected error occurred during detection.
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedOS(os) => write!(f, "unsupported operating system: {os}"),
+            Self::NotKDE => write!(f, "KDE Plasma desktop environment not detected"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CheckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Other(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<Error> for CheckError {
+    fn from(e: Error) -> Self {
+        Self::Other(Box::new(e))
+    }
+}
+
+/// Downloads and installs all available updates for installed KDE Plasma components.
 ///
-/// Scans the filesystem and KNewStuff registry to discover all installed components,
-/// including their versions, types, and installation paths.
+/// Runs the full update pipeline: scan installed components, check for updates, select
+/// which to apply, then download and install. Handles plasmashell restart based on
+/// [`Config::restart`]. Components in [`Config::excluded_packages`] are always skipped.
 ///
-/// # Arguments
+/// With the `cli` feature enabled and [`Config::yes`] unset, shows an interactive
+/// multi-select menu. Otherwise, all available updates are applied automatically.
 ///
-/// * `system` - If `true`, lists system-wide components; if `false`, lists user components
+/// # Errors
 ///
-/// # Example
+/// - [`UpdateError::Check`] — detection or fetch phase failed
+/// - [`UpdateError::Other`] — one or more components failed to update
+pub fn update(config: &Config) -> std::result::Result<UpdateResult, UpdateError> {
+    crate::utils::validate_environment().map_err(UpdateError::Check)?;
+
+    let api_client = ApiClient::new();
+    let check_result =
+        crate::utils::fetch_updates(&api_client, config).map_err(UpdateError::Check)?;
+
+    if check_result.updates.is_empty() {
+        #[cfg(feature = "cli")]
+        println!("no updates available");
+
+        return Ok(UpdateResult::default());
+    }
+
+    let selected = crate::utils::select_updates(&check_result.updates, config)?;
+
+    if selected.is_empty() {
+        #[cfg(feature = "cli")]
+        println!("nothing to update");
+
+        return Ok(UpdateResult::default());
+    }
+
+    let result = crate::utils::install_selected_updates(&selected, &api_client)?;
+    crate::utils::handle_restart(config, &check_result.updates, &result);
+
+    Ok(result)
+}
+
+/// Result of performing updates.
 ///
-/// ```rust,no_run
-/// use libplasmoid_updater::list_installed;
+/// Returned by [`update()`](crate::update). Tracks which components succeeded,
+/// failed, or were skipped during the update run.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateResult {
+    pub succeeded: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub skipped: Vec<String>,
+}
+
+impl UpdateResult {
+    /// Returns `true` if any component failed to update.
+    pub fn has_failures(&self) -> bool {
+        !self.failed.is_empty()
+    }
+
+    /// Returns `true` if no update actions were attempted.
+    pub fn is_empty(&self) -> bool {
+        self.succeeded.is_empty() && self.failed.is_empty() && self.skipped.is_empty()
+    }
+
+    /// Prints a formatted table of failed updates to stdout.
+    #[cfg(feature = "cli")]
+    pub fn print_error_table(&self) {
+        crate::cli::output::print_error_table(self.clone());
+    }
+
+    /// Prints a one-line summary of the update outcome to stdout.
+    #[cfg(feature = "cli")]
+    pub fn print_summary(&self) {
+        crate::cli::output::print_summary(self.clone());
+    }
+}
+
+/// Error returned by [`update()`](crate::update) during the update phase.
+#[derive(Debug)]
+pub enum UpdateError {
+    /// The check phase failed before updates could be attempted.
+    Check(CheckError),
+    /// An error occurred during the update process.
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Check(e) => write!(f, "{e}"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for UpdateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Check(e) => Some(e),
+            Self::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+impl From<Error> for UpdateError {
+    fn from(e: Error) -> Self {
+        Self::Other(Box::new(e))
+    }
+}
+
+impl From<CheckError> for UpdateError {
+    fn from(e: CheckError) -> Self {
+        Self::Check(e)
+    }
+}
+
+/// Returns all installed KDE Plasma components without making network requests.
 ///
-/// # fn main() -> libplasmoid_updater::Result<()> {
-/// let components = list_installed(false)?;
+/// Scans the filesystem and KNewStuff registry to discover locally installed components.
+/// Useful for building custom UIs or auditing what is installed.
 ///
-/// for component in components {
-///     println!("{} ({}): version {}",
-///         component.name,
-///         component.component_type,
-///         component.version
-///     );
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub fn list_installed(system: bool) -> Result<Vec<InstalledComponent>> {
-    find_installed(system)
+/// # Errors
+///
+/// Returns an error if the filesystem scan fails.
+pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
+    checker::find_installed(config.system)
+}
+
+/// Downloads and installs a single component update with automatic backup and rollback.
+///
+/// On failure, the original component is restored from backup. Does not handle
+/// plasmashell restart — the caller is responsible for restarting if needed.
+///
+/// # Errors
+///
+/// Returns an error if download, installation, or backup operations fail.
+pub fn install_update(update: &AvailableUpdate) -> Result<()> {
+    let api_client = ApiClient::new();
+    installer::update_component(update, api_client.http_client())
+}
+
+/// Discovers and prints all installed KDE components as a formatted table.
+///
+/// Scans the filesystem and KNewStuff registry without making network requests.
+/// Prints a count header followed by a table of all discovered components.
+///
+/// # Errors
+///
+/// Returns an error if the filesystem scan fails.
+#[cfg(feature = "cli")]
+pub fn show_installed(config: &Config) -> Result<()> {
+    let components = checker::find_installed(config.system)?;
+
+    if components.is_empty() {
+        println!("no components installed");
+        return Ok(());
+    }
+
+    cli::output::print_count_message(components.len(), "installed component");
+    cli::output::print_components_table(&components);
+
+    Ok(())
 }

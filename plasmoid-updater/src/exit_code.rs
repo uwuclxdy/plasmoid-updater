@@ -12,9 +12,3 @@ impl From<ExitCode> for i32 {
         code as i32
     }
 }
-
-impl ExitCode {
-    pub fn as_i32(self) -> i32 {
-        self as i32
-    }
-}

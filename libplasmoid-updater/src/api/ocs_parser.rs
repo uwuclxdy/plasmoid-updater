@@ -5,7 +5,10 @@
 use quick_xml::de::from_str;
 use serde::{Deserialize, Deserializer};
 
-use crate::{ComponentType, DownloadLink, Error, Result, StoreEntry};
+use crate::{
+    types::{ComponentType, DownloadLink, StoreEntry},
+    {Error, Result},
+};
 
 use super::config::MAX_DOWNLOAD_LINKS;
 
@@ -29,15 +32,15 @@ impl From<u16> for StatusCode {
 }
 
 impl StatusCode {
-    pub fn is_success(self) -> bool {
+    pub(super) fn is_success(self) -> bool {
         matches!(self, Self::Ok | Self::OkLegacy)
     }
 
-    pub fn is_rate_limited(self) -> bool {
+    pub(super) fn is_rate_limited(self) -> bool {
         matches!(self, Self::RateLimited)
     }
 
-    pub fn as_u16(self) -> u16 {
+    pub(super) fn as_u16(self) -> u16 {
         match self {
             Self::Ok => 100,
             Self::OkLegacy => 0,

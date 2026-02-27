@@ -5,7 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{Error, InstalledComponent, Result};
+use crate::{
+    types::InstalledComponent,
+    {Error, Result},
+};
 
 /// Returns the base backup directory.
 fn backup_base_dir() -> PathBuf {
@@ -19,7 +22,7 @@ fn timestamp() -> String {
 
 /// Creates a backup of the component before updating.
 /// Returns the path to the backup directory or file.
-pub fn backup_component(component: &InstalledComponent) -> Result<PathBuf> {
+pub(crate) fn backup_component(component: &InstalledComponent) -> Result<PathBuf> {
     let timestamp = timestamp();
     let base = backup_base_dir();
     let type_dir = component.component_type.backup_subdir();
@@ -49,35 +52,39 @@ pub fn backup_component(component: &InstalledComponent) -> Result<PathBuf> {
 }
 
 /// Restores a component from backup.
-pub fn restore_component(backup_path: &Path, original_path: &Path) -> Result<()> {
+pub(crate) fn restore_component(backup_path: &Path, original_path: &Path) -> Result<()> {
+    use super::privilege;
+
     // handle single files
     if backup_path.is_file() {
         if let Some(parent) = original_path.parent() {
-            fs::create_dir_all(parent)
+            privilege::create_dir_all(parent)
                 .map_err(|e| Error::backup(format!("create parent dir: {e}")))?;
         }
 
-        fs::copy(backup_path, original_path)
+        privilege::copy_file(backup_path, original_path)
             .map_err(|e| Error::backup(format!("restore file: {e}")))?;
 
         return Ok(());
     }
 
     if original_path.exists() {
-        fs::remove_dir_all(original_path)
+        privilege::remove_dir_all(original_path)
             .map_err(|e| Error::backup(format!("remove failed install: {e}")))?;
     }
 
     if let Some(parent) = original_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| Error::backup(format!("create parent dir: {e}")))?;
+        privilege::create_dir_all(parent)
+            .map_err(|e| Error::backup(format!("create parent dir: {e}")))?;
     }
 
-    copy_dir_recursive(backup_path, original_path)?;
+    privilege::copy_dir(backup_path, original_path)
+        .map_err(|e| Error::backup(format!("copy dir: {e}")))?;
 
     Ok(())
 }
 
-pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Err(Error::backup(format!(
             "source is not a directory: {}",

@@ -21,7 +21,7 @@ pub(crate) fn temp_dir() -> PathBuf {
 }
 
 /// Downloads a package with optional checksum verification.
-pub fn download_package(
+pub(crate) fn download_package(
     client: &reqwest::blocking::Client,
     url: &str,
     expected_checksum: Option<&str>,
@@ -84,10 +84,7 @@ pub fn download_package(
 }
 
 /// Extracts a package archive to the destination directory using `bsdtar`.
-pub fn extract_archive(
-    archive_path: &Path,
-    dest: &Path,
-) -> Result<()> {
+pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)?;
 
     let status = Command::new("bsdtar")

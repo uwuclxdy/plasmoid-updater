@@ -2,13 +2,16 @@
 
 use std::{collections::HashSet, fs, path::Path};
 
-use crate::{ComponentType, InstalledComponent, PackageMetadata, Result, registry};
+use crate::{
+    Result, registry,
+    types::{ComponentType, InstalledComponent, PackageMetadata},
+};
 
 /// Discovers all installed Plasmoids.
 ///
 /// When `system` is `true`, scans system-wide directories (`/usr/share/...`);
 /// otherwise scans user directories (`~/.local/share/...`).
-pub fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
+pub(crate) fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
     let types = if system {
         ComponentType::all()
     } else {
@@ -120,6 +123,5 @@ fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
             icon: attr("Icon"),
             description: attr("Comment"),
         }),
-        kpackage_structure: attr("X-KDE-ServiceTypes"),
     })
 }

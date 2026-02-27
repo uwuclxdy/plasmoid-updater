@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 
 use quick_xml::{Reader, Writer, events::Event};
 
-use crate::{ComponentType, Error, Result};
+use crate::{
+    types::ComponentType,
+    {Error, Result},
+};
 
 use super::{manager::RegistryEntry, utils};
 
@@ -130,11 +133,9 @@ pub(super) fn parse_registry_entries(xml: &str) -> Vec<RegistryEntry> {
             if raw.name.is_empty() || installed_path.as_os_str().is_empty() {
                 return None;
             }
-            let content_id = raw.content_id().unwrap_or(0);
             Some(RegistryEntry {
                 name: raw.name,
                 version: raw.version,
-                content_id,
                 installed_path,
                 release_date: raw.release_date,
             })

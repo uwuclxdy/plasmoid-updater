@@ -6,10 +6,13 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
-use crate::{ComponentType, Error, InstalledComponent, Result, backup::copy_dir_recursive};
+use crate::installer::privilege;
+use crate::{
+    types::{ComponentType, InstalledComponent},
+    {Error, Result},
+};
 
 const COLOR_SCHEME_EXTENSIONS: &[&str] = &[".colors", ".colorscheme"];
 const IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp", ".svg"];
@@ -122,25 +125,20 @@ where
 {
     if dest.exists() {
         if dest.is_dir() {
-            fs::remove_dir_all(dest)?;
+            privilege::remove_dir_all(dest)?;
         } else {
-            fs::remove_file(dest)?;
+            privilege::remove_file(dest)?;
         }
     }
 
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        privilege::create_dir_all(parent)?;
     }
 
     action()
 }
 
 // --- Metadata ---
-
-/// Searches for a `metadata.json` file within an extracted archive directory tree.
-pub fn find_metadata_json(dir: &Path) -> Option<PathBuf> {
-    find_in_dir(dir, |d| d.join("metadata.json").exists()).map(|d| d.join("metadata.json"))
-}
 
 pub(super) fn find_package_dir(extract_dir: &Path) -> Option<PathBuf> {
     if let Some(dir) = find_in_dir(extract_dir, |d| d.join("metadata.json").exists()) {
@@ -151,7 +149,7 @@ pub(super) fn find_package_dir(extract_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Patches a `metadata.json` file to update the version and KPackageStructure fields.
-pub fn patch_metadata(
+pub(super) fn patch_metadata(
     metadata_path: &Path,
     component_type: ComponentType,
     new_version: &str,
@@ -169,21 +167,70 @@ pub fn patch_metadata(
     }
 
     let patched = serde_json::to_string_pretty(&json)?;
-    fs::write(metadata_path, patched)?;
+    privilege::write_file(metadata_path, patched.as_bytes())?;
 
+    Ok(())
+}
+
+/// Patches a `metadata.desktop` file to update the `X-KDE-PluginInfo-Version` field.
+pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) -> Result<()> {
+    let content = fs::read_to_string(metadata_path)?;
+    let mut found = false;
+    let patched: String = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("X-KDE-PluginInfo-Version=") {
+                found = true;
+                format!("X-KDE-PluginInfo-Version={new_version}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Preserve trailing newline if original had one
+    let patched = if content.ends_with('\n') && !patched.ends_with('\n') {
+        patched + "\n"
+    } else {
+        patched
+    };
+
+    if !found {
+        log::debug!(target: "patch", "no X-KDE-PluginInfo-Version field in {}", metadata_path.display());
+        return Ok(());
+    }
+
+    privilege::write_file(metadata_path, patched.as_bytes())?;
     Ok(())
 }
 
 // --- kpackagetool Installation ---
 
 /// Installs or updates a component package using `kpackagetool6`.
-pub fn install_via_kpackagetool(package_dir: &Path, component_type: ComponentType) -> Result<()> {
+fn install_via_kpackagetool(
+    package_dir: &Path,
+    component_type: ComponentType,
+    global: bool,
+) -> Result<()> {
     let kpackage_type = component_type
         .kpackage_type()
         .ok_or_else(|| Error::install(format!("{component_type} has no kpackage type")))?;
 
-    let output = Command::new("kpackagetool6")
-        .args(["-t", kpackage_type, "-u", &package_dir.to_string_lossy()])
+    let mut cmd = if global {
+        privilege::sudo_command("kpackagetool6")
+    } else {
+        std::process::Command::new("kpackagetool6")
+    };
+    cmd.args(["-t", kpackage_type]);
+
+    if global {
+        cmd.arg("--global");
+    }
+
+    cmd.args(["-u", &package_dir.to_string_lossy()]);
+
+    let output = cmd
         .output()
         .map_err(|e| Error::install(format!("failed to run kpackagetool6: {e}")))?;
 
@@ -207,13 +254,22 @@ pub(super) fn install_via_kpackage(
     let package_dir = find_package_dir(extract_dir).ok_or(Error::MetadataNotFound)?;
 
     let metadata_json = package_dir.join("metadata.json");
+    let metadata_desktop = package_dir.join("metadata.desktop");
+
     if metadata_json.exists()
         && let Err(e) = patch_metadata(&metadata_json, component.component_type, new_version)
     {
         log::warn!(target: "patch", "failed for {}: {e}", component.name);
     }
 
-    install_via_kpackagetool(&package_dir, component.component_type)
+    if metadata_desktop.exists()
+        && let Err(e) = patch_metadata_desktop(&metadata_desktop, new_version)
+    {
+        log::warn!(target: "patch", "failed to patch metadata.desktop for {}: {e}", component.name);
+    }
+
+    let is_global = privilege::is_system_path(&component.path);
+    install_via_kpackagetool(&package_dir, component.component_type, is_global)
 }
 
 // --- Component Locators ---
@@ -311,7 +367,7 @@ fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
 ///
 /// Uses the strategy pattern to select the appropriate installation method
 /// based on the component type.
-pub fn install_direct(extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
+pub(super) fn install_direct(extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
     let strategy = get_install_strategy(component.component_type).ok_or_else(|| {
         Error::install(format!(
             "{} should use kpackagetool",
@@ -327,7 +383,7 @@ fn install_color_scheme(extract_dir: &Path, dest_path: &Path) -> Result<()> {
         .ok_or_else(|| Error::install("no color scheme file found in archive"))?;
 
     replace_destination(dest_path, || {
-        fs::copy(&color_file, dest_path)?;
+        privilege::copy_file(&color_file, dest_path)?;
         log::debug!(target: "install", "copied color scheme to {}", dest_path.display());
         Ok(())
     })
@@ -338,8 +394,8 @@ fn install_icon_theme(extract_dir: &Path, dest_dir: &Path) -> Result<()> {
         .ok_or_else(|| Error::install("no icon theme (index.theme) found in archive"))?;
 
     replace_destination(dest_dir, || {
-        fs::create_dir_all(dest_dir)?;
-        copy_dir_recursive(&source_dir, dest_dir)?;
+        privilege::create_dir_all(dest_dir)?;
+        privilege::copy_dir(&source_dir, dest_dir)?;
         log::debug!(target: "install", "copied icon theme to {}", dest_dir.display());
         Ok(())
     })
@@ -353,14 +409,14 @@ fn install_wallpaper(extract_dir: &Path, component: &InstalledComponent) -> Resu
 
     if source.is_file() {
         replace_destination(dest, || {
-            fs::copy(&source, dest)?;
+            privilege::copy_file(&source, dest)?;
             log::debug!(target: "install", "copied wallpaper to {}", dest.display());
             Ok(())
         })
     } else {
         replace_destination(dest, || {
-            fs::create_dir_all(dest)?;
-            copy_dir_recursive(&source, dest)?;
+            privilege::create_dir_all(dest)?;
+            privilege::copy_dir(&source, dest)?;
             log::debug!(target: "install", "copied wallpaper dir to {}", dest.display());
             Ok(())
         })
@@ -380,15 +436,15 @@ fn install_theme_dir(
         })?;
 
     replace_destination(dest_dir, || {
-        fs::create_dir_all(dest_dir)?;
-        copy_dir_recursive(&source_dir, dest_dir)?;
+        privilege::create_dir_all(dest_dir)?;
+        privilege::copy_dir(&source_dir, dest_dir)?;
         log::debug!(target: "install", "copied {} to {}", component_type, dest_dir.display());
         Ok(())
     })
 }
 
 /// Returns `true` if the path is a single-file component (e.g., color scheme file, image).
-pub fn is_single_file_component(path: &Path, component_type: ComponentType) -> bool {
+pub(super) fn is_single_file_component(path: &Path, component_type: ComponentType) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
@@ -407,7 +463,7 @@ pub(super) fn install_raw_file(downloaded: &Path, component: &InstalledComponent
     let dest = &component.path;
 
     replace_destination(dest, || {
-        fs::copy(downloaded, dest)?;
+        privilege::copy_file(downloaded, dest)?;
         log::debug!(target: "install", "copied raw file to {}", dest.display());
         Ok(())
     })

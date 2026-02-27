@@ -6,20 +6,20 @@ mod manager;
 mod utils;
 mod xml;
 
-pub use manager::{RegistryEntry, RegistryManager};
+pub(crate) use manager::{RegistryEntry, RegistryManager};
 
 use std::{collections::HashMap, fs, path::PathBuf};
 
-use crate::{AvailableUpdate, ComponentType, InstalledComponent, Result};
-
-/// Returns the path to the knewstuff3 directory.
-pub fn knewstuff_dir() -> PathBuf {
-    crate::paths::knewstuff_dir()
-}
+use crate::{
+    Result,
+    types::{AvailableUpdate, ComponentType, InstalledComponent},
+};
 
 /// Scans registry files to discover installed components.
 /// Used for types that don't have metadata files.
-pub fn scan_registry_components(component_type: ComponentType) -> Result<Vec<InstalledComponent>> {
+pub(crate) fn scan_registry_components(
+    component_type: ComponentType,
+) -> Result<Vec<InstalledComponent>> {
     let Some(manager) = RegistryManager::for_component_type(component_type) else {
         return Ok(Vec::new());
     };
@@ -47,17 +47,17 @@ pub fn scan_registry_components(component_type: ComponentType) -> Result<Vec<Ins
 
 /// Loads registry entries into a map keyed by directory name.
 /// Used to look up release dates for installed components.
-pub fn load_registry_map(component_type: ComponentType) -> HashMap<String, RegistryEntry> {
+pub(crate) fn load_registry_map(component_type: ComponentType) -> HashMap<String, RegistryEntry> {
     RegistryManager::for_component_type(component_type)
         .map(|m| m.load_entry_map())
         .unwrap_or_default()
 }
 
 /// Returns the filesystem path to the KNewStuff registry file for a component type.
-pub fn registry_path(component_type: ComponentType) -> Option<PathBuf> {
+pub(crate) fn registry_path(component_type: ComponentType) -> Option<PathBuf> {
     component_type
         .registry_file()
-        .map(|f| knewstuff_dir().join(f))
+        .map(|f| crate::paths::knewstuff_dir().join(f))
 }
 
 /// Builds a directory_name → content_id lookup cache from all registry files.
@@ -66,7 +66,7 @@ pub fn registry_path(component_type: ComponentType) -> Option<PathBuf> {
 /// eliminating the need for per-component file I/O during resolution.
 pub(crate) fn build_id_cache() -> HashMap<String, u64> {
     let mut cache = HashMap::new();
-    let knewstuff = knewstuff_dir();
+    let knewstuff = crate::paths::knewstuff_dir();
 
     for &ct in ComponentType::all() {
         let Some(file) = ct.registry_file() else {
@@ -95,7 +95,7 @@ pub(crate) fn build_id_cache() -> HashMap<String, u64> {
 /// Updates the KNS registry after a successful component update.
 /// This ensures Discover sees the correct installed version.
 /// If the entry doesn't exist, it creates a new one.
-pub fn update_registry_after_install(update: &AvailableUpdate) -> Result<()> {
+pub(crate) fn update_registry_after_install(update: &AvailableUpdate) -> Result<()> {
     let component = &update.installed;
 
     let Some(reg_path) = registry_path(component.component_type) else {

@@ -8,7 +8,10 @@ use std::{sync::Arc, thread, time::Duration};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 
-use crate::{ComponentType, Error, Result, StoreEntry};
+use crate::{
+    types::{ComponentType, StoreEntry},
+    {Error, Result},
+};
 
 use super::config::{ApiConfig, CONNECT_TIMEOUT, DEFAULT_API_CONFIG, REQUEST_TIMEOUT, USER_AGENT};
 use super::ocs_parser::Meta;
@@ -16,7 +19,7 @@ use super::ocs_parser::{build_category_string, parse_ocs_response};
 
 /// Thread-safe API client for KDE Store interactions.
 #[derive(Clone)]
-pub struct ApiClient {
+pub(crate) struct ApiClient {
     client: reqwest::blocking::Client,
     config: &'static ApiConfig,
 }
@@ -39,7 +42,7 @@ impl ApiClient {
     }
 
     /// Creates a new API client with the given configuration.
-    pub fn with_config(config: &'static ApiConfig) -> Result<Self> {
+    pub(super) fn with_config(config: &'static ApiConfig) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)

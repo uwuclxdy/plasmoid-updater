@@ -10,29 +10,26 @@ use rayon::prelude::*;
 
 use crate::{Result, api::ApiClient, config::Config, types::UpdateCheckResult};
 
-pub use discovery::find_installed;
-pub use resolution::{find_store_entry, select_download_url, select_download_with_info};
+pub(crate) use discovery::find_installed;
 
-/// Checks for updates for all installed Plasmoids.
-pub(crate) fn check(
+/// Checks for updates using pre-discovered components.
+pub(crate) fn check_with_components(
     config: &Config,
-    system: bool,
     api_client: &ApiClient,
+    components: Vec<crate::types::InstalledComponent>,
 ) -> Result<UpdateCheckResult> {
-    let components = find_installed(system)?;
-
     if components.is_empty() {
-        return Ok(UpdateCheckResult::new());
+        return Ok(UpdateCheckResult::default());
     }
 
     let (registry_components, regular_components) = store::partition_components(components);
-    let regular_types = store::scannable_types(system);
+    let regular_types = store::scannable_types(config.system);
 
     let store_entries =
         store::fetch_store_entries(api_client, &regular_types, &regular_components)?;
     let registry_id_cache = crate::registry::build_id_cache();
 
-    let mut result = UpdateCheckResult::new();
+    let mut result = UpdateCheckResult::default();
 
     let regular_results: Vec<evaluation::ComponentCheckResult> = regular_components
         .par_iter()

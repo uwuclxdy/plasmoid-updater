@@ -2,7 +2,10 @@
 
 use std::process::Command;
 
-use crate::{AvailableUpdate, ComponentType, Error, InstalledComponent, Result};
+use crate::{
+    types::{AvailableUpdate, ComponentType, InstalledComponent},
+    {Error, Result},
+};
 
 fn get_user_id() -> Option<String> {
     std::env::var("UID").ok().or_else(|| {
@@ -16,7 +19,7 @@ fn get_user_id() -> Option<String> {
 }
 
 /// Restarts the plasmashell service via systemd.
-pub fn restart_plasmashell() -> Result<()> {
+pub(crate) fn restart_plasmashell() -> Result<()> {
     let mut cmd = Command::new("systemctl");
     cmd.args(["--user", "restart", "plasma-plasmashell.service"]);
 
@@ -51,7 +54,7 @@ pub fn restart_plasmashell() -> Result<()> {
 }
 
 /// Returns `true` if the component type requires a plasmashell restart after updating.
-pub fn requires_plasmashell_restart(component: &InstalledComponent) -> bool {
+fn requires_plasmashell_restart(component: &InstalledComponent) -> bool {
     matches!(
         component.component_type,
         ComponentType::PlasmaWidget
@@ -63,7 +66,7 @@ pub fn requires_plasmashell_restart(component: &InstalledComponent) -> bool {
 }
 
 /// Returns `true` if any of the updates require a plasmashell restart.
-pub fn any_requires_restart(updates: &[AvailableUpdate]) -> bool {
+pub(crate) fn any_requires_restart(updates: &[AvailableUpdate]) -> bool {
     updates
         .iter()
         .any(|u| requires_plasmashell_restart(&u.installed))

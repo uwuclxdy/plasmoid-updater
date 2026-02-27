@@ -1,15 +1,12 @@
 [workspace]
 resolver = "3"
-members = [
-    "libplasmoid-updater",
-    "plasmoid-updater",
-]
+members = ["libplasmoid-updater", "plasmoid-updater"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/uwuclxdy/plasmoid-updater"
 
 [workspace.dependencies]
-libplasmoid-updater = { path = "libplasmoid-updater" }
+libplasmoid-updater = { path = "libplasmoid-updater", features = ["cli"] }

@@ -21,6 +21,11 @@ pub(crate) fn knewstuff_dir() -> PathBuf {
     data_home().join("knewstuff3")
 }
 
+/// Returns true if KDE Plasma desktop environment is detected.
+pub(crate) fn is_kde() -> bool {
+    std::env::var("KDE_SESSION_VERSION").is_ok()
+}
+
 /// Gets the user's home directory, even when running with sudo.
 fn user_home() -> PathBuf {
     if let Ok(sudo_home) = std::env::var("SUDO_USER_HOME") {
