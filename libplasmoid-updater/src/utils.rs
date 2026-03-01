@@ -50,6 +50,7 @@ pub(crate) fn select_updates<'a>(
 
     Ok(filter_excluded(updates, &config.excluded_packages))
 }
+
 pub(crate) fn filter_excluded<'a>(
     updates: &'a [AvailableUpdate],
     excluded: &[String],
@@ -151,17 +152,21 @@ pub(crate) fn install_selected_updates(
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .build()
-        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+        .unwrap_or_else(|_| {
+            rayon::ThreadPoolBuilder::new()
+                .build()
+                .expect("failed to build default thread pool")
+        });
 
     let counter = api_client.request_counter();
 
     pool.install(|| {
         use rayon::prelude::*;
-        updates.par_iter().enumerate().for_each(|(_i, update)| {
+        updates.par_iter().enumerate().for_each(|(index, update)| {
             let name = update.installed.name.clone();
 
             #[cfg(feature = "cli")]
-            let reporter = ui.reporter(_i);
+            let reporter = ui.reporter(index);
             #[cfg(not(feature = "cli"))]
             let reporter = |_: u8| {};
 
@@ -169,12 +174,12 @@ pub(crate) fn install_selected_updates(
             {
                 Ok(()) => {
                     #[cfg(feature = "cli")]
-                    ui.complete_task(_i, true);
+                    ui.complete_task(index, true);
                     result.lock().succeeded.push(name);
                 }
                 Err(e) => {
                     #[cfg(feature = "cli")]
-                    ui.complete_task(_i, false);
+                    ui.complete_task(index, false);
                     result.lock().failed.push((name, e.to_string()));
                 }
             }

@@ -45,20 +45,18 @@ pub(crate) fn check_components(
             .or_else(|| fetched.get(content_id));
 
         match entry {
-            Some(entry) => {
-                match evaluation::evaluate_store_entry(component, entry, *content_id) {
-                    evaluation::ComponentCheckResult::Update(update) => {
-                        result.add_update(*update);
-                    }
-                    evaluation::ComponentCheckResult::CheckFailed(diagnostic) => {
-                        result.add_check_failure(diagnostic);
-                    }
-                    evaluation::ComponentCheckResult::UpToDate => {}
-                    evaluation::ComponentCheckResult::Unresolved(_) => {
-                        unreachable!("evaluate_store_entry never returns Unresolved")
-                    }
+            Some(entry) => match evaluation::evaluate_store_entry(component, entry, *content_id) {
+                evaluation::ComponentCheckResult::Update(update) => {
+                    result.add_update(*update);
                 }
-            }
+                evaluation::ComponentCheckResult::CheckFailed(diagnostic) => {
+                    result.add_check_failure(diagnostic);
+                }
+                evaluation::ComponentCheckResult::UpToDate => {}
+                evaluation::ComponentCheckResult::Unresolved(_) => {
+                    unreachable!("evaluate_store_entry never returns Unresolved")
+                }
+            },
             None => {
                 let diagnostic = ComponentDiagnostic::new(
                     component.name.clone(),

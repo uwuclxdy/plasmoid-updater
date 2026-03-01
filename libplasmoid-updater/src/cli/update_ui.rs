@@ -66,13 +66,18 @@ fn terminal_width() -> usize {
         .unwrap_or(80)
 }
 
-// ── TaskState ─────────────────────────────────────────────────────────────────
+// ── Status ────────────────────────────────────────────────────────────────────
+
+enum TaskStatus {
+    InProgress,
+    Succeeded,
+    Failed,
+}
 
 struct TaskState {
     name: String,
     stage: u8,
-    complete: bool,
-    succeeded: bool,
+    status: TaskStatus,
     start: Instant,
 }
 
@@ -81,14 +86,17 @@ impl TaskState {
         Self {
             name,
             stage: 0,
-            complete: false,
-            succeeded: false,
+            status: TaskStatus::InProgress,
             start: Instant::now(),
         }
     }
 
     fn elapsed(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.status, TaskStatus::Succeeded | TaskStatus::Failed)
     }
 }
 
@@ -98,7 +106,7 @@ fn render_row(state: &TaskState, width: usize) -> String {
     let elapsed = state.elapsed();
     let time_str = format!("{:.1}s", elapsed.as_secs_f64());
 
-    if state.complete {
+    if state.is_complete() {
         render_complete_row(state, &time_str, width)
     } else {
         render_progress_row(state, elapsed, &time_str, width)
@@ -106,14 +114,13 @@ fn render_row(state: &TaskState, width: usize) -> String {
 }
 
 fn render_complete_row(state: &TaskState, time_str: &str, width: usize) -> String {
-    let (icon_color, icon, status_color, status_label) = if state.succeeded {
-        (GREEN, '✓', GREEN, "Updated")
-    } else {
-        (RED, '✗', RED, "Failed")
+    let (icon_color, icon, status_color, status_label) = match state.status {
+        TaskStatus::Succeeded => (GREEN, '✓', GREEN, "Updated"),
+        _ => (RED, '✗', RED, "Failed"),
     };
 
-    // Visible text: "✓ {name} {status}"
-    let visible_left = format!("✓ {} {}", state.name, status_label);
+    // Visible text: "{icon} {name} {status}"
+    let visible_left = format!("{icon} {} {}", state.name, status_label);
     let padding = padding_between(visible_left.len(), time_str.len(), width);
 
     format!(
@@ -251,8 +258,11 @@ impl UpdateUi {
         if self.is_tty {
             let mut locked = self.states.lock();
             if let Some(task) = locked.get_mut(index) {
-                task.complete = true;
-                task.succeeded = succeeded;
+                task.status = if succeeded {
+                    TaskStatus::Succeeded
+                } else {
+                    TaskStatus::Failed
+                };
             }
         } else {
             let locked = self.states.lock();
