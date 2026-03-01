@@ -76,7 +76,7 @@ Options:
 
 ## Reporting Bugs
 
-This program is in its early stages, please open a GitHub issue for any bugs that you may find.
+Please open a GitHub issue for any bugs that you may find.
 
 ---
 

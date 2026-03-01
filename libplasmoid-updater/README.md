@@ -15,8 +15,8 @@ Runtime dependencies:
 ## Features
 
 - **Component Discovery** – Detects installed Plasmoids and other Plasma components
-- **Update Check** – Via KDE Store API (OCS)
-- **Safe Installation** – Installs updates with automatic backup and rollback on failure
+- **Multithreaded** update check and installation
+- **Automatic Backups** and rollback
 - **Registry Integration** – Maintains KNewStuff registry compatibility
 - **Plasma 6 Support** – Compatible with Plasma 6.0 and later
 
