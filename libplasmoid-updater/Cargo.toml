@@ -1,6 +1,6 @@
 [package]
 name = "libplasmoid-updater"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Library for updating KDE Plasma 6 components from the KDE Store. Meant for use in topgrade."
