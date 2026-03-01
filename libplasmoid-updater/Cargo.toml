@@ -13,7 +13,7 @@ documentation = "https://docs.rs/libplasmoid-updater"
 
 [features]
 default = ["cli"]
-cli = ["indicatif", "comfy-table", "bytesize", "inquire", "is-terminal"]
+cli = ["indicatif", "comfy-table", "bytesize", "inquire", "is-terminal", "terminal_size"]
 
 [dependencies]
 reqwest = { version = "0.13.2", default-features = false, features = [
@@ -41,6 +41,7 @@ comfy-table = { version = "7.2.2", optional = true }
 bytesize = { version = "2.3.1", optional = true }
 inquire = { version = "0.9.4", optional = true }
 is-terminal = { version = "0.4.17", optional = true }
+terminal_size = { version = "0.4.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.19.1"

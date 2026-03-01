@@ -23,16 +23,23 @@ use backup::{backup_component, restore_component};
 
 pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
 
-/// Updates a single component using provided HTTP client.
+/// Updates a single component using the provided HTTP client.
+///
+/// `reporter` is called with a stage number as each phase completes:
+/// - `1` — backup done, download starting
+/// - `2` — download done, extraction starting
+/// - `3` — extraction done, install starting
 pub(crate) fn update_component(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
+    reporter: impl Fn(u8),
 ) -> Result<()> {
     let component = &update.installed;
 
     let backup_path = create_backup(component)?;
+    reporter(1);
 
-    match perform_installation(update, client) {
+    match perform_installation(update, client, &reporter) {
         Ok(()) => {
             post_install_tasks(update)?;
             log::info!(target: "update", "updated {}", component.name);
@@ -55,6 +62,7 @@ fn create_backup(component: &InstalledComponent) -> Result<PathBuf> {
 fn perform_installation(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
+    reporter: &dyn Fn(u8),
 ) -> Result<()> {
     let component = &update.installed;
     let downloaded_path = download_with_error_handling(
@@ -63,8 +71,9 @@ fn perform_installation(
         update.checksum.as_deref(),
         &component.name,
     )?;
+    reporter(2);
 
-    execute_installation(&downloaded_path, component, &update.latest_version)
+    execute_installation(&downloaded_path, component, &update.latest_version, reporter)
 }
 
 fn download_with_error_handling(
@@ -83,13 +92,15 @@ fn execute_installation(
     downloaded_path: &Path,
     component: &InstalledComponent,
     new_version: &str,
+    reporter: &dyn Fn(u8),
 ) -> Result<()> {
     if install::is_single_file_component(downloaded_path, component.component_type) {
         let result = install::install_raw_file(downloaded_path, component);
         let _ = fs::remove_file(downloaded_path);
+        reporter(3);
         result
     } else {
-        install_from_archive(downloaded_path, component, new_version)
+        install_from_archive(downloaded_path, component, new_version, reporter)
     }
 }
 
@@ -97,6 +108,7 @@ fn install_from_archive(
     downloaded_path: &Path,
     component: &InstalledComponent,
     new_version: &str,
+    reporter: &dyn Fn(u8),
 ) -> Result<()> {
     let extract_dir = download::temp_dir().join(format!("extract-{}", component.directory_name));
 
@@ -111,6 +123,7 @@ fn install_from_archive(
     }
 
     let _ = fs::remove_file(downloaded_path);
+    reporter(3);
 
     let result = if component.component_type.kpackage_type().is_some() {
         install::install_via_kpackage(&extract_dir, component, new_version)

@@ -21,7 +21,3 @@ pub fn create_fetch_spinner() -> ProgressBar {
     create_spinner("Fetching component data")
 }
 
-/// Creates a spinner for updating a specific component.
-pub fn create_component_spinner(name: &str) -> ProgressBar {
-    create_spinner(format!("Updating {name}"))
-}

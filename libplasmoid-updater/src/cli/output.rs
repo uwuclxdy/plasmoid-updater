@@ -16,22 +16,6 @@ pub fn format_version(version: &str) -> &str {
     }
 }
 
-/// Prints a success status line for a component update.
-pub fn print_update_success(name: &str, old_version: &str, new_version: &str) {
-    // {} ({} -> {})
-    println!(
-        "  \u{2713} {} ({} \u{2192} {})",
-        name,
-        format_version(old_version),
-        format_version(new_version)
-    );
-}
-
-/// Prints a failure status line for a component update.
-pub fn print_update_failure(name: &str) {
-    println!("  \u{2717} {} (failed)", name);
-}
-
 fn header(name: &str) -> Cell {
     Cell::new(name).add_attribute(Attribute::Bold)
 }

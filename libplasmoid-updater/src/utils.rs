@@ -3,6 +3,8 @@ use crate::cli::{self, progress::create_fetch_spinner};
 #[cfg(feature = "cli")]
 use inquire::InquireError;
 
+use std::sync::Arc;
+
 use crate::{
     CheckError, Config, RestartBehavior, UpdateResult,
     api::ApiClient,
@@ -101,14 +103,8 @@ pub(crate) fn prompt_update_selection<'a>(
                 .map(|opt| &updates[opt.index])
                 .collect();
 
-            // Replace inquire's padded confirmation line with a compact one.
-            let compact = result
-                .iter()
-                .map(|u| u.installed.name.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
             use std::io::Write;
-            print!("\x1b[1A\r\x1b[2K> {prompt} {compact}\n");
+            print!("{}", cli::CLEAR_LINE_SEQUENCE);
             std::io::stdout().flush().ok();
 
             Ok(result)
@@ -143,48 +139,49 @@ pub(crate) fn format_menu_options(updates: &[AvailableUpdate]) -> Vec<String> {
 pub(crate) fn install_selected_updates(
     updates: &[&AvailableUpdate],
     api_client: &ApiClient,
+    config: &Config,
 ) -> crate::Result<UpdateResult> {
-    let mut result = UpdateResult::default();
+    let result = Arc::new(parking_lot::Mutex::new(UpdateResult::default()));
 
-    for update in updates {
-        let name = update.installed.name.clone();
-        install_single_update(update, api_client, &name, &mut result);
-    }
-
-    Ok(result)
-}
-
-pub(crate) fn install_single_update(
-    update: &AvailableUpdate,
-    api_client: &ApiClient,
-    name: &str,
-    result: &mut UpdateResult,
-) {
     #[cfg(feature = "cli")]
-    let spinner = cli::progress::create_component_spinner(name);
+    let ui = cli::update_ui::UpdateUi::new(updates);
 
-    match crate::installer::update_component(update, api_client.http_client()) {
-        Ok(()) => {
+    // 0 = rayon default = number of logical CPUs
+    let thread_count = config.threads.unwrap_or(0);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+    pool.install(|| {
+        use rayon::prelude::*;
+        updates.par_iter().enumerate().for_each(|(_i, update)| {
+            let name = update.installed.name.clone();
+
             #[cfg(feature = "cli")]
-            {
-                spinner.finish_and_clear();
-                cli::output::print_update_success(
-                    name,
-                    &update.installed.version,
-                    &update.latest_version,
-                );
+            let reporter = ui.reporter(_i);
+            #[cfg(not(feature = "cli"))]
+            let reporter = |_: u8| {};
+
+            match installer::update_component(update, api_client.http_client(), reporter) {
+                Ok(()) => {
+                    #[cfg(feature = "cli")]
+                    ui.complete_task(_i, true);
+                    result.lock().succeeded.push(name);
+                }
+                Err(e) => {
+                    #[cfg(feature = "cli")]
+                    ui.complete_task(_i, false);
+                    result.lock().failed.push((name, e.to_string()));
+                }
             }
-            result.succeeded.push(name.to_owned());
-        }
-        Err(e) => {
-            #[cfg(feature = "cli")]
-            {
-                spinner.finish_and_clear();
-                cli::output::print_update_failure(name);
-            }
-            result.failed.push((name.to_owned(), e.to_string()));
-        }
-    }
+        });
+    });
+
+    #[cfg(feature = "cli")]
+    ui.finish();
+
+    Ok(Arc::try_unwrap(result).unwrap().into_inner())
 }
 
 pub(crate) fn handle_restart(config: &Config, updates: &[AvailableUpdate], result: &UpdateResult) {

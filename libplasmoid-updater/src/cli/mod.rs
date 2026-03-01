@@ -10,3 +10,6 @@
 
 pub(crate) mod output;
 pub(crate) mod progress;
+pub(crate) mod update_ui;
+
+pub(crate) const CLEAR_LINE_SEQUENCE: &str = "\x1b[1A\r\x1b[2K";

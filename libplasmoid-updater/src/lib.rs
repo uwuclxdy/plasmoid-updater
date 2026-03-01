@@ -201,7 +201,7 @@ pub fn update(config: &Config) -> std::result::Result<UpdateResult, UpdateError>
         return Ok(UpdateResult::default());
     }
 
-    let result = crate::utils::install_selected_updates(&selected, &api_client)?;
+    let result = crate::utils::install_selected_updates(&selected, &api_client, config)?;
     crate::utils::handle_restart(config, &check_result.updates, &result);
 
     Ok(result)
@@ -303,7 +303,7 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 /// Returns an error if download, installation, or backup operations fail.
 pub fn install_update(update: &AvailableUpdate) -> Result<()> {
     let api_client = ApiClient::new();
-    installer::update_component(update, api_client.http_client())
+    installer::update_component(update, api_client.http_client(), |_| {})
 }
 
 /// Discovers and prints all installed KDE components as a formatted table.

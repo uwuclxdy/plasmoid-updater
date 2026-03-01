@@ -88,6 +88,12 @@ pub struct Config {
     pub restart: RestartBehavior,
 
     pub yes: bool,
+
+    /// Maximum number of parallel installation threads.
+    ///
+    /// `None` (default) uses the number of logical CPU threads available.
+    /// `Some(n)` pins the pool to exactly `n` threads.
+    pub threads: Option<usize>,
 }
 
 impl Config {
@@ -206,6 +212,11 @@ impl Config {
 
     pub fn with_yes(mut self, yes: bool) -> Self {
         self.yes = yes;
+        self
+    }
+
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = Some(threads);
         self
     }
 }
