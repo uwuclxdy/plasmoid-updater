@@ -23,11 +23,17 @@ pub(crate) fn check_with_components(
     }
 
     let (registry_components, regular_components) = store::partition_components(components);
-    let regular_types = store::scannable_types(config.system);
 
-    let store_entries =
-        store::fetch_store_entries(api_client, &regular_types, &regular_components)?;
+    // Build local caches before any network call so fetch_store_entries
+    // can resolve known IDs without touching the paginated catalog.
     let registry_id_cache = crate::registry::build_id_cache();
+
+    let store_entries = store::fetch_store_entries(
+        api_client,
+        &regular_components,
+        &config.widgets_id_table,
+        &registry_id_cache,
+    )?;
 
     let mut result = UpdateCheckResult::default();
 

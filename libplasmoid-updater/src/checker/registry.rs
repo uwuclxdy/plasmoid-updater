@@ -18,7 +18,7 @@ pub(crate) fn check_components(
     registry_id_cache: &HashMap<String, u64>,
     result: &mut UpdateCheckResult,
 ) {
-    let resolved: Vec<_> = registry_components
+    let resolved: Vec<(&InstalledComponent, u64)> = registry_components
         .iter()
         .filter_map(|c| {
             resolution::resolve_content_id(c, store_entries, widgets_id_table, registry_id_cache)
@@ -26,25 +26,43 @@ pub(crate) fn check_components(
         })
         .collect();
 
-    let content_ids: Vec<u64> = resolved.iter().map(|(_, id)| *id).collect();
-    let fetched_entries = client.fetch_details(&content_ids);
+    // Reuse any entries already present in store_entries; fetch only the rest.
+    let missing_ids: Vec<u64> = resolved
+        .iter()
+        .filter(|(_, id)| resolution::find_store_entry(store_entries, *id).is_none())
+        .map(|(_, id)| *id)
+        .collect();
 
-    for ((component, content_id), fetch_result) in resolved.iter().zip(fetched_entries) {
-        match fetch_result {
-            Ok(entry) => match evaluation::evaluate_store_entry(component, &entry, *content_id) {
-                evaluation::ComponentCheckResult::Update(update) => result.add_update(*update),
-                evaluation::ComponentCheckResult::CheckFailed(diagnostic) => {
-                    result.add_check_failure(diagnostic);
+    let fetched: HashMap<u64, StoreEntry> = client
+        .fetch_details(&missing_ids)
+        .into_iter()
+        .zip(missing_ids.iter())
+        .filter_map(|(r, &id)| r.ok().map(|e| (id, e)))
+        .collect();
+
+    for (component, content_id) in &resolved {
+        let entry = resolution::find_store_entry(store_entries, *content_id)
+            .or_else(|| fetched.get(content_id));
+
+        match entry {
+            Some(entry) => {
+                match evaluation::evaluate_store_entry(component, entry, *content_id) {
+                    evaluation::ComponentCheckResult::Update(update) => {
+                        result.add_update(*update);
+                    }
+                    evaluation::ComponentCheckResult::CheckFailed(diagnostic) => {
+                        result.add_check_failure(diagnostic);
+                    }
+                    evaluation::ComponentCheckResult::UpToDate => {}
+                    evaluation::ComponentCheckResult::Unresolved(_) => {
+                        unreachable!("evaluate_store_entry never returns Unresolved")
+                    }
                 }
-                evaluation::ComponentCheckResult::UpToDate => {}
-                evaluation::ComponentCheckResult::Unresolved(_) => {
-                    unreachable!("evaluate_store_entry never returns Unresolved")
-                }
-            },
-            Err(e) => {
+            }
+            None => {
                 let diagnostic = ComponentDiagnostic::new(
                     component.name.clone(),
-                    format!("failed to fetch store entry: {e}"),
+                    "failed to fetch store entry".to_string(),
                 )
                 .with_content_id(*content_id);
                 result.add_check_failure(diagnostic);
