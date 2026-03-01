@@ -70,7 +70,7 @@ impl ApiClient {
     }
 
     /// Total number of HTTP requests sent since this client was created.
-    #[cfg(feature = "cli")]
+    #[cfg(feature = "debug")]
     pub fn request_count(&self) -> usize {
         self.request_count.load(Ordering::Relaxed)
     }

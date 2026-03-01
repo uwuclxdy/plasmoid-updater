@@ -203,7 +203,7 @@ pub fn update(config: &Config) -> std::result::Result<UpdateResult, UpdateError>
 
     let result = crate::utils::install_selected_updates(&selected, &api_client, config)?;
 
-    #[cfg(feature = "cli")]
+    #[cfg(feature = "debug")]
     {
         let n = api_client.request_count();
         let plural = if n == 1 { "" } else { "s" };

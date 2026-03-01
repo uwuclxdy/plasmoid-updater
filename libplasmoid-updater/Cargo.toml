@@ -14,6 +14,7 @@ documentation = "https://docs.rs/libplasmoid-updater"
 [features]
 default = ["cli"]
 cli = ["indicatif", "comfy-table", "bytesize", "inquire", "is-terminal", "terminal_size"]
+debug = []
 
 [dependencies]
 reqwest = { version = "0.13.2", default-features = false, features = [
