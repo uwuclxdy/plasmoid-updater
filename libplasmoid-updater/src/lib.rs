@@ -202,6 +202,14 @@ pub fn update(config: &Config) -> std::result::Result<UpdateResult, UpdateError>
     }
 
     let result = crate::utils::install_selected_updates(&selected, &api_client, config)?;
+
+    #[cfg(feature = "cli")]
+    {
+        let n = api_client.request_count();
+        let plural = if n == 1 { "" } else { "s" };
+        println!("{n} web request{plural}");
+    }
+
     crate::utils::handle_restart(config, &check_result.updates, &result);
 
     Ok(result)
@@ -303,7 +311,8 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 /// Returns an error if download, installation, or backup operations fail.
 pub fn install_update(update: &AvailableUpdate) -> Result<()> {
     let api_client = ApiClient::new();
-    installer::update_component(update, api_client.http_client(), |_| {})
+    let counter = api_client.request_counter();
+    installer::update_component(update, api_client.http_client(), |_| {}, &counter)
 }
 
 /// Discovers and prints all installed KDE components as a formatted table.

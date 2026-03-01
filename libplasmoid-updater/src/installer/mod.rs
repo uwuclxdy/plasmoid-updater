@@ -12,6 +12,7 @@ pub(crate) mod privilege;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::AtomicUsize,
 };
 
 use crate::{
@@ -29,17 +30,20 @@ pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
 /// - `1` — backup done, download starting
 /// - `2` — download done, extraction starting
 /// - `3` — extraction done, install starting
+///
+/// `counter` is incremented once for each HTTP request made.
 pub(crate) fn update_component(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
     reporter: impl Fn(u8),
+    counter: &AtomicUsize,
 ) -> Result<()> {
     let component = &update.installed;
 
     let backup_path = create_backup(component)?;
     reporter(1);
 
-    match perform_installation(update, client, &reporter) {
+    match perform_installation(update, client, &reporter, counter) {
         Ok(()) => {
             post_install_tasks(update)?;
             log::info!(target: "update", "updated {}", component.name);
@@ -63,6 +67,7 @@ fn perform_installation(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
     reporter: &dyn Fn(u8),
+    counter: &AtomicUsize,
 ) -> Result<()> {
     let component = &update.installed;
     let downloaded_path = download_with_error_handling(
@@ -70,10 +75,16 @@ fn perform_installation(
         &update.download_url,
         update.checksum.as_deref(),
         &component.name,
+        counter,
     )?;
     reporter(2);
 
-    execute_installation(&downloaded_path, component, &update.latest_version, reporter)
+    execute_installation(
+        &downloaded_path,
+        component,
+        &update.latest_version,
+        reporter,
+    )
 }
 
 fn download_with_error_handling(
@@ -81,8 +92,9 @@ fn download_with_error_handling(
     url: &str,
     checksum: Option<&str>,
     component_name: &str,
+    counter: &AtomicUsize,
 ) -> Result<PathBuf> {
-    download::download_package(client, url, checksum).map_err(|e| {
+    download::download_package(client, url, checksum, counter).map_err(|e| {
         log::error!(target: "download", "failed for {}: {e}", component_name);
         e
     })

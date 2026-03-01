@@ -153,6 +153,8 @@ pub(crate) fn install_selected_updates(
         .build()
         .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
+    let counter = api_client.request_counter();
+
     pool.install(|| {
         use rayon::prelude::*;
         updates.par_iter().enumerate().for_each(|(_i, update)| {
@@ -163,7 +165,8 @@ pub(crate) fn install_selected_updates(
             #[cfg(not(feature = "cli"))]
             let reporter = |_: u8| {};
 
-            match installer::update_component(update, api_client.http_client(), reporter) {
+            match installer::update_component(update, api_client.http_client(), reporter, &counter)
+            {
                 Ok(()) => {
                     #[cfg(feature = "cli")]
                     ui.complete_task(_i, true);

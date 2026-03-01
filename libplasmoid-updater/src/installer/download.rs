@@ -5,6 +5,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -25,6 +26,7 @@ pub(crate) fn download_package(
     client: &reqwest::blocking::Client,
     url: &str,
     expected_checksum: Option<&str>,
+    counter: &AtomicUsize,
 ) -> Result<PathBuf> {
     let temp = temp_dir();
     fs::create_dir_all(&temp)?;
@@ -37,6 +39,7 @@ pub(crate) fn download_package(
 
     let dest = temp.join(&file_name);
 
+    counter.fetch_add(1, Ordering::Relaxed);
     let response = client
         .get(url)
         .timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))

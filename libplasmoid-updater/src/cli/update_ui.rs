@@ -134,7 +134,11 @@ fn render_progress_row(
 
     // Visible text: "⠋ {name} [⣿⣿  ] {label}"
     // bar visible width = BAR_WIDTH + 2 brackets
-    let visible_left = format!("{spinner} {} [{}] {label}", state.name, " ".repeat(BAR_WIDTH));
+    let visible_left = format!(
+        "{spinner} {} [{}] {label}",
+        state.name,
+        " ".repeat(BAR_WIDTH)
+    );
     let padding = padding_between(visible_left.len(), time_str.len(), width);
 
     format!(

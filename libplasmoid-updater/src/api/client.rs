@@ -3,7 +3,14 @@
 // API interaction based on Apdatifier (https://github.com/exequtic/apdatifier) - MIT License
 // and KDE Discover (https://invent.kde.org/plasma/discover) - GPL-2.0+/LGPL-2.0+
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -22,6 +29,7 @@ use super::ocs_parser::{build_category_string, parse_ocs_response};
 pub(crate) struct ApiClient {
     client: reqwest::blocking::Client,
     config: &'static ApiConfig,
+    request_count: Arc<AtomicUsize>,
 }
 
 impl Default for ApiClient {
@@ -49,12 +57,27 @@ impl ApiClient {
             .user_agent(USER_AGENT)
             .build()?;
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            request_count: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     /// Returns a reference to the underlying HTTP client for reuse.
     pub fn http_client(&self) -> &reqwest::blocking::Client {
         &self.client
+    }
+
+    /// Total number of HTTP requests sent since this client was created.
+    #[cfg(feature = "cli")]
+    pub fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::Relaxed)
+    }
+
+    /// A shared handle to the request counter, suitable for passing to the installer.
+    pub(crate) fn request_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.request_count)
     }
 
     /// Fetches all content from specified categories with parallel page fetching.
@@ -124,6 +147,7 @@ impl ApiClient {
 
         for attempt in 0..self.config.max_retries {
             let response = {
+                self.request_count.fetch_add(1, Ordering::Relaxed);
                 let r = self.client.get(url).send()?;
                 let xml = r.text()?;
                 parse_ocs_response(&xml)

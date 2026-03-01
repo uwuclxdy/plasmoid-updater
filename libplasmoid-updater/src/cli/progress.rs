@@ -20,4 +20,3 @@ fn create_spinner(msg: impl Into<String>) -> ProgressBar {
 pub fn create_fetch_spinner() -> ProgressBar {
     create_spinner("Fetching component data")
 }
-
