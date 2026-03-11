@@ -6,9 +6,8 @@ mod registry;
 mod resolution;
 mod store;
 
-use rayon::prelude::*;
-
 use crate::{Result, api::ApiClient, config::Config, types::UpdateCheckResult};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 pub(crate) use discovery::find_installed;
 

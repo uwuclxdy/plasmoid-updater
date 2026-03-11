@@ -14,7 +14,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use rayon::prelude::*;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     types::{ComponentType, StoreEntry},

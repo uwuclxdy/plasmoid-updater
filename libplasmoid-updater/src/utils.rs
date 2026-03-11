@@ -5,6 +5,7 @@ use crate::cli::{self, progress::create_fetch_spinner};
 #[cfg(feature = "cli")]
 use inquire::InquireError;
 
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 
 use crate::{
@@ -163,7 +164,6 @@ pub(crate) fn install_selected_updates(
     let counter = api_client.request_counter();
 
     pool.install(|| {
-        use rayon::prelude::*;
         updates.par_iter().enumerate().for_each(|(index, update)| {
             let name = update.installed.name.clone();
 

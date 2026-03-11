@@ -66,58 +66,6 @@ where
     None
 }
 
-// --- Installation Strategy Pattern ---
-
-/// Strategy trait for component-type-specific installation logic.
-trait InstallStrategy {
-    fn install(&self, extract_dir: &Path, component: &InstalledComponent) -> Result<()>;
-}
-
-struct ColorSchemeInstaller;
-struct IconThemeInstaller;
-struct WallpaperInstaller;
-struct ThemeDirInstaller;
-
-impl InstallStrategy for ColorSchemeInstaller {
-    fn install(&self, extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
-        install_color_scheme(extract_dir, &component.path)
-    }
-}
-
-impl InstallStrategy for IconThemeInstaller {
-    fn install(&self, extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
-        install_icon_theme(extract_dir, &component.path)
-    }
-}
-
-impl InstallStrategy for WallpaperInstaller {
-    fn install(&self, extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
-        install_wallpaper(extract_dir, component)
-    }
-}
-
-impl InstallStrategy for ThemeDirInstaller {
-    fn install(&self, extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
-        install_theme_dir(extract_dir, &component.path, component.component_type)
-    }
-}
-
-/// Returns the appropriate installation strategy for a component type,
-/// or `None` if the type should use kpackagetool instead.
-fn get_install_strategy(component_type: ComponentType) -> Option<Box<dyn InstallStrategy>> {
-    match component_type {
-        ComponentType::ColorScheme => Some(Box::new(ColorSchemeInstaller)),
-        ComponentType::IconTheme => Some(Box::new(IconThemeInstaller)),
-        ComponentType::Wallpaper => Some(Box::new(WallpaperInstaller)),
-        ComponentType::AuroraeDecoration
-        | ComponentType::GlobalTheme
-        | ComponentType::PlasmaStyle
-        | ComponentType::SplashScreen
-        | ComponentType::SddmTheme => Some(Box::new(ThemeDirInstaller)),
-        _ => None,
-    }
-}
-
 // --- Utility Functions ---
 
 fn replace_destination<F>(dest: &Path, action: F) -> Result<()>
@@ -365,18 +313,23 @@ fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
 // --- Direct Installation Methods ---
 
 /// Installs a component using direct file operations (not kpackagetool).
-///
-/// Uses the strategy pattern to select the appropriate installation method
-/// based on the component type.
 pub(super) fn install_direct(extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
-    let strategy = get_install_strategy(component.component_type).ok_or_else(|| {
-        Error::install(format!(
+    match component.component_type {
+        ComponentType::ColorScheme => install_color_scheme(extract_dir, &component.path),
+        ComponentType::IconTheme => install_icon_theme(extract_dir, &component.path),
+        ComponentType::Wallpaper => install_wallpaper(extract_dir, component),
+        ComponentType::AuroraeDecoration
+        | ComponentType::GlobalTheme
+        | ComponentType::PlasmaStyle
+        | ComponentType::SplashScreen
+        | ComponentType::SddmTheme => {
+            install_theme_dir(extract_dir, &component.path, component.component_type)
+        }
+        _ => Err(Error::install(format!(
             "{} should use kpackagetool",
             component.component_type
-        ))
-    })?;
-
-    strategy.install(extract_dir, component)
+        ))),
+    }
 }
 
 fn install_color_scheme(extract_dir: &Path, dest_path: &Path) -> Result<()> {

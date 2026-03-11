@@ -7,15 +7,8 @@ use crate::{
     {Error, Result},
 };
 
-fn get_user_id() -> Option<String> {
-    std::env::var("UID").ok().or_else(|| {
-        Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-    })
+fn get_user_id() -> String {
+    std::env::var("UID").unwrap_or_else(|_| nix::unistd::Uid::current().as_raw().to_string())
 }
 
 /// Restarts the plasmashell service via systemd.
@@ -25,18 +18,14 @@ pub(crate) fn restart_plasmashell() -> Result<()> {
 
     let uid = get_user_id();
 
-    if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err()
-        && let Some(ref uid) = uid
-    {
+    if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err() {
         cmd.env(
             "DBUS_SESSION_BUS_ADDRESS",
             format!("unix:path=/run/user/{uid}/bus"),
         );
     }
 
-    if std::env::var("XDG_RUNTIME_DIR").is_err()
-        && let Some(ref uid) = uid
-    {
+    if std::env::var("XDG_RUNTIME_DIR").is_err() {
         cmd.env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
     }
 
