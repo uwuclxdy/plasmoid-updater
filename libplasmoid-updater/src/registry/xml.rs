@@ -3,7 +3,10 @@
 // KNewStuff registry format based on KDE Discover (https://invent.kde.org/plasma/discover) -
 // GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use quick_xml::{Reader, Writer, events::Event};
 
@@ -158,9 +161,20 @@ pub(super) fn create_empty_registry() -> String {
 
 /// Escapes special characters for XML text content.
 fn escape_xml_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let Some(first) = s.find(['&', '<', '>']) else {
+        return s.to_owned();
+    };
+    let mut out = String::with_capacity(s.len() + 4);
+    out.push_str(&s[..first]);
+    for c in s[first..].chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Adds a new entry to the registry XML.
@@ -338,15 +352,22 @@ fn rewrite_with_updates(
 }
 
 /// Returns the replacement value for a field being updated, or None if no replacement.
-fn get_field_replacement(element_name: &[u8], fields: &UpdateFields) -> Option<String> {
+///
+/// Returns borrowed slices where possible to avoid allocation for fields that
+/// are already owned by the caller (`version`, `payload`, `releasedate`, `status`).
+/// Only `id` (integer formatting) and `installedfile` (path formatting) allocate.
+fn get_field_replacement<'a>(
+    element_name: &[u8],
+    fields: &'a UpdateFields,
+) -> Option<Cow<'a, str>> {
     match element_name {
-        b"version" => Some(fields.new_version.to_string()),
-        b"id" => Some(fields.content_id.to_string()),
-        b"payload" => Some(fields.download_url.to_string()),
-        b"releasedate" => Some(fields.release_date.to_string()),
-        b"status" => Some("installed".to_string()),
+        b"version" => Some(Cow::Borrowed(fields.new_version)),
+        b"id" => Some(Cow::Owned(fields.content_id.to_string())),
+        b"payload" => Some(Cow::Borrowed(fields.download_url)),
+        b"releasedate" => Some(Cow::Borrowed(fields.release_date)),
+        b"status" => Some(Cow::Borrowed("installed")),
         b"installedfile" | b"uninstalledfile" => {
-            Some(utils::registry_installed_file_path(fields.installed_path))
+            Some(Cow::Owned(utils::registry_installed_file_path(fields.installed_path)))
         }
         _ => None,
     }

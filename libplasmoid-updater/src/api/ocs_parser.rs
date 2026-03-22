@@ -242,9 +242,31 @@ pub(crate) fn parse_ocs_response(xml: &str) -> Result<(Vec<StoreEntry>, Meta)> {
 }
 
 pub(crate) fn build_category_string(types: &[ComponentType]) -> String {
-    types
-        .iter()
-        .map(|c| c.category_id().to_string())
-        .collect::<Vec<_>>()
-        .join("x")
+    // u16 max is 5 digits; reserve 4 chars per type (3-4 digits + separator)
+    let mut s = String::with_capacity(types.len() * 4);
+    for (i, c) in types.iter().enumerate() {
+        if i > 0 {
+            s.push('x');
+        }
+        append_u16(&mut s, c.category_id());
+    }
+    s
+}
+
+/// Appends the decimal digits of `n` directly into `s` without a heap allocation.
+fn append_u16(s: &mut String, mut n: u16) {
+    if n == 0 {
+        s.push('0');
+        return;
+    }
+    let mut buf = [0u8; 5];
+    let mut pos = buf.len();
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = (n % 10) as u8 + b'0';
+        n /= 10;
+    }
+    for &byte in &buf[pos..] {
+        s.push(byte as char);
+    }
 }
