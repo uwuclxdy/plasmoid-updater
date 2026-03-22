@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/// Internal errors that can occur during plasmoid-updater operations.
+/// Errors that can occur during plasmoid-updater operations.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("unsupported operating system: {0}")]
+    UnsupportedOS(String),
+
+    #[error("KDE Plasma desktop environment not detected")]
+    NotKDE,
+
     #[error("network request failed: {0}")]
     Network(#[from] reqwest::Error),
 
@@ -59,6 +65,23 @@ pub enum Error {
 
     #[error("no updates available")]
     NoUpdatesAvailable,
+}
+
+impl Error {
+    /// Returns `true` for expected, non-error conditions (e.g., no updates found).
+    pub fn is_skippable(&self) -> bool {
+        matches!(self, Self::NoUpdatesAvailable | Self::ComponentNotFound(_))
+    }
+
+    /// Returns `true` for temporary failures that may succeed on retry.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Network(_) | Self::RateLimited)
+    }
+
+    /// Returns `true` for permanent failures that require user intervention.
+    pub fn is_fatal(&self) -> bool {
+        !self.is_skippable() && !self.is_transient()
+    }
 }
 
 macro_rules! error_ctor {

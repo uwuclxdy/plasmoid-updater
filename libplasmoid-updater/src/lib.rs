@@ -25,11 +25,12 @@ pub(crate) mod version;
 pub mod cli;
 
 use api::ApiClient;
+use serde::Serialize;
 use types::UpdateCheckResult;
 
 pub use config::{Config, RestartBehavior};
 pub use error::Error;
-pub use types::{AvailableUpdate, ComponentType, InstalledComponent};
+pub use types::{AvailableUpdate, ComponentType, Diagnostic, InstalledComponent};
 
 /// A specialized `Result` type for libplasmoid-updater operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -43,10 +44,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// # Errors
 ///
-/// - [`CheckError::UnsupportedOS`] — not running on Linux
-/// - [`CheckError::NotKDE`] — KDE Plasma not detected
-/// - [`CheckError::Other`] — unexpected failure
-pub fn check(config: &Config) -> std::result::Result<CheckResult, CheckError> {
+/// - [`Error::UnsupportedOS`] — not running on Linux
+/// - [`Error::NotKDE`] — KDE Plasma not detected
+pub fn check(config: &Config) -> Result<CheckResult> {
     crate::utils::validate_environment()?;
 
     let api_client = ApiClient::new();
@@ -55,38 +55,31 @@ pub fn check(config: &Config) -> std::result::Result<CheckResult, CheckError> {
     #[cfg(feature = "cli")]
     crate::utils::display_check_results(&result);
 
-    Ok(CheckResult::from_internal(&result))
+    Ok(CheckResult::from_internal(result))
 }
 
 /// Result of checking for available updates.
 ///
-/// Returned by [`check()`](crate::check). Summarizes available updates and lists any
-/// components that could not be checked, along with the reason for each failure.
-#[derive(Debug, Clone)]
+/// Returned by [`check()`](crate::check). Contains the full [`AvailableUpdate`] data
+/// for each pending update, plus diagnostics for components that could not be checked.
+#[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     /// Available updates found during the check.
-    pub available_updates: Vec<AvailableUpdateInfo>,
-    /// Components that could not be checked (name, reason).
-    pub diagnostics: Vec<(String, String)>,
+    pub available_updates: Vec<AvailableUpdate>,
+    /// Components that could not be checked, with the reason for each failure.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl CheckResult {
-    pub(crate) fn from_internal(result: &UpdateCheckResult) -> Self {
-        let available_updates = result
-            .updates
-            .iter()
-            .map(AvailableUpdateInfo::from_internal)
-            .collect();
-
+    pub(crate) fn from_internal(result: UpdateCheckResult) -> Self {
         let diagnostics = result
             .unresolved
-            .iter()
-            .chain(&result.check_failures)
-            .map(|d| (d.name.clone(), d.reason.clone()))
+            .into_iter()
+            .chain(result.check_failures)
             .collect();
 
         Self {
-            available_updates,
+            available_updates: result.updates,
             diagnostics,
         }
     }
@@ -100,70 +93,10 @@ impl CheckResult {
     pub fn update_count(&self) -> usize {
         self.available_updates.len()
     }
-}
 
-/// Describes a single installed component that has an available update.
-///
-/// Returned as part of [`CheckResult::available_updates`]. Contains version
-/// info and metadata needed to identify and display the pending update.
-#[derive(Debug, Clone)]
-pub struct AvailableUpdateInfo {
-    pub name: String,
-    pub directory_name: String,
-    pub current_version: String,
-    pub available_version: String,
-    pub component_type: String,
-    pub content_id: u64,
-    pub download_size: Option<u64>,
-}
-
-impl AvailableUpdateInfo {
-    fn from_internal(update: &AvailableUpdate) -> Self {
-        Self {
-            name: update.installed.name.clone(),
-            directory_name: update.installed.directory_name.clone(),
-            current_version: update.installed.version.clone(),
-            available_version: update.latest_version.clone(),
-            component_type: update.installed.component_type.to_string(),
-            content_id: update.content_id,
-            download_size: update.download_size,
-        }
-    }
-}
-
-/// Error returned by [`check()`](crate::check) during the detection phase.
-#[derive(Debug)]
-pub enum CheckError {
-    /// The current operating system is not supported.
-    UnsupportedOS(String),
-    /// The desktop environment is not KDE Plasma.
-    NotKDE,
-    /// An unexpected error occurred during detection.
-    Other(Box<dyn std::error::Error + Send + Sync>),
-}
-
-impl std::fmt::Display for CheckError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedOS(os) => write!(f, "unsupported operating system: {os}"),
-            Self::NotKDE => write!(f, "KDE Plasma desktop environment not detected"),
-            Self::Other(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for CheckError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Other(e) => Some(e.as_ref()),
-            _ => None,
-        }
-    }
-}
-
-impl From<Error> for CheckError {
-    fn from(e: Error) -> Self {
-        Self::Other(Box::new(e))
+    /// Returns `true` if there are no updates and no diagnostics.
+    pub fn is_empty(&self) -> bool {
+        self.available_updates.is_empty() && self.diagnostics.is_empty()
     }
 }
 
@@ -173,19 +106,17 @@ impl From<Error> for CheckError {
 /// which to apply, then download and install. Handles plasmashell restart based on
 /// [`Config::restart`]. Components in [`Config::excluded_packages`] are always skipped.
 ///
-/// With the `cli` feature enabled and [`Config::yes`] unset, shows an interactive
+/// With the `cli` feature enabled and [`Config::auto_confirm`] unset, shows an interactive
 /// multi-select menu. Otherwise, all available updates are applied automatically.
 ///
 /// # Errors
 ///
-/// - [`UpdateError::Check`] — detection or fetch phase failed
-/// - [`UpdateError::Other`] — one or more components failed to update
-pub fn update(config: &Config) -> std::result::Result<UpdateResult, UpdateError> {
-    crate::utils::validate_environment().map_err(UpdateError::Check)?;
+/// Returns an [`Error`] if environment validation, network requests, or installation fails.
+pub fn update(config: &Config) -> Result<UpdateResult> {
+    crate::utils::validate_environment()?;
 
     let api_client = ApiClient::new();
-    let check_result =
-        crate::utils::fetch_updates(&api_client, config).map_err(UpdateError::Check)?;
+    let check_result = crate::utils::fetch_updates(&api_client, config)?;
 
     if check_result.updates.is_empty() {
         #[cfg(feature = "cli")]
@@ -221,7 +152,7 @@ pub fn update(config: &Config) -> std::result::Result<UpdateResult, UpdateError>
 ///
 /// Returned by [`update()`](crate::update). Tracks which components succeeded,
 /// failed, or were skipped during the update run.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct UpdateResult {
     pub succeeded: Vec<String>,
     pub failed: Vec<(String, String)>,
@@ -239,55 +170,26 @@ impl UpdateResult {
         self.succeeded.is_empty() && self.failed.is_empty() && self.skipped.is_empty()
     }
 
+    /// Returns the number of successfully updated components.
+    pub fn success_count(&self) -> usize {
+        self.succeeded.len()
+    }
+
+    /// Returns the number of components that failed to update.
+    pub fn failure_count(&self) -> usize {
+        self.failed.len()
+    }
+
     /// Prints a formatted table of failed updates to stdout.
     #[cfg(feature = "cli")]
     pub fn print_error_table(&self) {
-        crate::cli::output::print_error_table(self.clone());
+        crate::cli::output::print_error_table(self);
     }
 
     /// Prints a one-line summary of the update outcome to stdout.
     #[cfg(feature = "cli")]
     pub fn print_summary(&self) {
-        crate::cli::output::print_summary(self.clone());
-    }
-}
-
-/// Error returned by [`update()`](crate::update) during the update phase.
-#[derive(Debug)]
-pub enum UpdateError {
-    /// The check phase failed before updates could be attempted.
-    Check(CheckError),
-    /// An error occurred during the update process.
-    Other(Box<dyn std::error::Error + Send + Sync>),
-}
-
-impl std::fmt::Display for UpdateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Check(e) => write!(f, "{e}"),
-            Self::Other(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for UpdateError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Check(e) => Some(e),
-            Self::Other(e) => Some(e.as_ref()),
-        }
-    }
-}
-
-impl From<Error> for UpdateError {
-    fn from(e: Error) -> Self {
-        Self::Other(Box::new(e))
-    }
-}
-
-impl From<CheckError> for UpdateError {
-    fn from(e: CheckError) -> Self {
-        Self::Check(e)
+        crate::cli::output::print_summary(self);
     }
 }
 
@@ -311,7 +213,8 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 /// # Errors
 ///
 /// Returns an error if download, installation, or backup operations fail.
-pub fn install_update(update: &AvailableUpdate) -> Result<()> {
+pub fn install_update(update: &AvailableUpdate, config: &Config) -> Result<()> {
+    let _ = config;
     let api_client = ApiClient::new();
     let counter = api_client.request_counter();
     installer::update_component(update, api_client.http_client(), |_| {}, &counter)
@@ -326,6 +229,7 @@ pub fn install_update(update: &AvailableUpdate) -> Result<()> {
 ///
 /// Returns an error if the filesystem scan fails.
 #[cfg(feature = "cli")]
+#[doc(hidden)]
 pub fn show_installed(config: &Config) -> Result<()> {
     let components = checker::find_installed(config.system)?;
 
