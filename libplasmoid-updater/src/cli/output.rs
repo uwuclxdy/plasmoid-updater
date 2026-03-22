@@ -84,12 +84,12 @@ pub fn print_components_table(components: &[InstalledComponent]) {
     print_table(components, &headers);
 }
 
-pub fn print_error_table(update_result: UpdateResult) {
+pub fn print_error_table(update_result: &UpdateResult) {
     let headers = vec!["NAME", "ERROR"];
     print_table(&update_result.failed, &headers);
 }
 
-pub fn print_summary(update_result: UpdateResult) {
+pub fn print_summary(update_result: &UpdateResult) {
     let total =
         update_result.succeeded.len() + update_result.failed.len() + update_result.skipped.len();
     println!(
