@@ -3,7 +3,7 @@
 // KNewStuff registry format based on KDE Discover (https://invent.kde.org/plasma/discover) -
 // GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Extracts the component directory or file name from an installed path.
 /// For paths ending with metadata.json: returns parent directory name.
@@ -20,6 +20,19 @@ pub(super) fn extract_directory_name(path: &Path) -> Option<String> {
     }
 
     Some(name.to_string())
+}
+
+/// Resolves the installed_path from a registry entry to the actual component path.
+/// KNewStuff stores metadata.json/metadata.desktop file paths; this returns the parent
+/// directory for those, so InstalledComponent.path always points to the component root.
+pub(super) fn resolve_component_path(path: PathBuf) -> PathBuf {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "metadata.json" || name == "metadata.desktop" {
+        if let Some(parent) = path.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    path
 }
 
 /// Determines the correct registry path for the installedfile element.

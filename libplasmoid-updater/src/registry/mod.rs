@@ -31,12 +31,13 @@ pub(crate) fn scan_registry_components(
         .into_iter()
         .filter_map(|entry| {
             let directory_name = utils::extract_directory_name(&entry.installed_path)?;
+            let path = utils::resolve_component_path(entry.installed_path);
             Some(InstalledComponent {
                 name: entry.name,
                 directory_name,
                 version: entry.version,
                 component_type,
-                path: entry.installed_path,
+                path,
                 is_system: false,
                 release_date: entry.release_date,
             })
