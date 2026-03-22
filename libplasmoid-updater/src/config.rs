@@ -87,7 +87,9 @@ pub struct Config {
     /// Controls plasmashell restart behavior after successful updates.
     pub restart: RestartBehavior,
 
-    pub yes: bool,
+    /// When `true`, skip interactive prompts and apply all non-excluded updates
+    /// automatically. Has no effect without the `cli` feature.
+    pub auto_confirm: bool,
 
     /// Maximum number of parallel installation threads.
     ///
@@ -210,8 +212,8 @@ impl Config {
         table
     }
 
-    pub fn with_yes(mut self, yes: bool) -> Self {
-        self.yes = yes;
+    pub fn with_auto_confirm(mut self, auto_confirm: bool) -> Self {
+        self.auto_confirm = auto_confirm;
         self
     }
 

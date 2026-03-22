@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use cli_config::CliConfig;
 use exit_code::ExitCode;
-use libplasmoid_updater::{UpdateError, check, show_installed, update};
+use libplasmoid_updater::{check, show_installed, update};
 
 #[derive(Parser)]
 #[command(name = "plasmoid-updater")]
@@ -114,7 +114,7 @@ fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, libplasmoi
 }
 
 fn do_check(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> {
-    check(&config.inner).map_err(|e| libplasmoid_updater::Error::other(e.to_string()))?;
+    check(&config.inner)?;
     Ok(ExitCode::Success)
 }
 
@@ -127,7 +127,7 @@ fn do_update(config: &CliConfig, args: UpdateArgs) -> Result<ExitCode, libplasmo
     let mut update_config = config.inner.clone();
 
     if args.yes || config.assume_yes || config.update_all_by_default {
-        update_config.yes = true;
+        update_config.auto_confirm = true;
     }
 
     if args.restart_plasma {
@@ -147,13 +147,12 @@ fn do_update_single(
     name: &str,
     mut config: libplasmoid_updater::Config,
 ) -> Result<ExitCode, libplasmoid_updater::Error> {
-    let check_result =
-        check(&config).map_err(|e| libplasmoid_updater::Error::other(e.to_string()))?;
+    let check_result = check(&config)?;
 
     let matched = check_result
         .available_updates
         .iter()
-        .any(|u| u.name == name || u.directory_name == name);
+        .any(|u| u.installed.name == name || u.installed.directory_name == name);
 
     if !matched {
         println!("no update available for '{name}'");
@@ -163,12 +162,12 @@ fn do_update_single(
     let excluded: Vec<String> = check_result
         .available_updates
         .iter()
-        .filter(|u| u.name != name && u.directory_name != name)
-        .map(|u| u.directory_name.clone())
+        .filter(|u| u.installed.name != name && u.installed.directory_name != name)
+        .map(|u| u.installed.directory_name.clone())
         .collect();
 
     config.excluded_packages.extend(excluded);
-    config.yes = true;
+    config.auto_confirm = true;
 
     do_full_update(config)
 }
@@ -176,18 +175,14 @@ fn do_update_single(
 fn do_full_update(
     config: libplasmoid_updater::Config,
 ) -> Result<ExitCode, libplasmoid_updater::Error> {
-    match update(&config) {
-        Ok(result) => {
-            result.print_summary();
-            if result.has_failures() {
-                result.print_error_table();
-                Ok(ExitCode::PartialFailure)
-            } else {
-                Ok(ExitCode::Success)
-            }
-        }
-        Err(UpdateError::Check(e)) => Err(libplasmoid_updater::Error::other(e.to_string())),
-        Err(UpdateError::Other(e)) => Err(libplasmoid_updater::Error::other(e.to_string())),
+    let result = update(&config)?;
+
+    result.print_summary();
+    if result.has_failures() {
+        result.print_error_table();
+        Ok(ExitCode::PartialFailure)
+    } else {
+        Ok(ExitCode::Success)
     }
 }
 

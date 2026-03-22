@@ -9,19 +9,19 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIter
 use std::sync::Arc;
 
 use crate::{
-    CheckError, Config, RestartBehavior, UpdateResult,
+    Config, Error, RestartBehavior, UpdateResult,
     api::ApiClient,
     checker::{check_with_components, find_installed},
     installer,
     types::{AvailableUpdate, UpdateCheckResult},
 };
 
-pub(crate) fn validate_environment() -> std::result::Result<(), CheckError> {
+pub(crate) fn validate_environment() -> crate::Result<()> {
     if cfg!(not(target_os = "linux")) {
-        return Err(CheckError::UnsupportedOS(std::env::consts::OS.to_string()));
+        return Err(Error::UnsupportedOS(std::env::consts::OS.to_string()));
     }
     if !crate::paths::is_kde() {
-        return Err(CheckError::NotKDE);
+        return Err(Error::NotKDE);
     }
     Ok(())
 }
@@ -29,7 +29,7 @@ pub(crate) fn validate_environment() -> std::result::Result<(), CheckError> {
 pub(crate) fn fetch_updates(
     api_client: &ApiClient,
     config: &Config,
-) -> std::result::Result<UpdateCheckResult, CheckError> {
+) -> crate::Result<UpdateCheckResult> {
     #[cfg(feature = "cli")]
     let spinner = create_fetch_spinner();
 
@@ -47,7 +47,7 @@ pub(crate) fn select_updates<'a>(
     config: &Config,
 ) -> crate::Result<Vec<&'a AvailableUpdate>> {
     #[cfg(feature = "cli")]
-    if !config.yes && stdin_is_terminal() {
+    if !config.auto_confirm && stdin_is_terminal() {
         return prompt_update_selection(updates, &config.excluded_packages);
     }
 
