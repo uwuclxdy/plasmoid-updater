@@ -371,9 +371,12 @@ impl PackageMetadata {
     }
 }
 
-/// Detailed diagnostic information about component check status.
+/// Diagnostic information about a component that could not be checked or updated.
+///
+/// Returned as part of [`CheckResult::diagnostics`](crate::CheckResult::diagnostics).
+/// Contains the component name, the reason it was skipped, and optional version/ID metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ComponentDiagnostic {
+pub struct Diagnostic {
     pub name: String,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -384,7 +387,7 @@ pub(crate) struct ComponentDiagnostic {
     pub content_id: Option<u64>,
 }
 
-impl ComponentDiagnostic {
+impl Diagnostic {
     pub(crate) fn new(name: String, reason: String) -> Self {
         Self {
             name,
@@ -415,8 +418,8 @@ impl ComponentDiagnostic {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct UpdateCheckResult {
     pub updates: Vec<AvailableUpdate>,
-    pub unresolved: Vec<ComponentDiagnostic>,
-    pub check_failures: Vec<ComponentDiagnostic>,
+    pub unresolved: Vec<Diagnostic>,
+    pub check_failures: Vec<Diagnostic>,
 }
 
 impl UpdateCheckResult {
@@ -424,11 +427,11 @@ impl UpdateCheckResult {
         self.updates.push(update);
     }
 
-    pub fn add_unresolved(&mut self, diagnostic: ComponentDiagnostic) {
+    pub fn add_unresolved(&mut self, diagnostic: Diagnostic) {
         self.unresolved.push(diagnostic);
     }
 
-    pub fn add_check_failure(&mut self, diagnostic: ComponentDiagnostic) {
+    pub fn add_check_failure(&mut self, diagnostic: Diagnostic) {
         self.check_failures.push(diagnostic);
     }
 }
