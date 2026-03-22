@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{
     api::ApiClient,
-    types::{ComponentDiagnostic, InstalledComponent, StoreEntry, UpdateCheckResult},
+    types::{Diagnostic, InstalledComponent, StoreEntry, UpdateCheckResult},
 };
 
 use super::{evaluation, resolution};
@@ -58,7 +58,7 @@ pub(crate) fn check_components(
                 }
             },
             None => {
-                let diagnostic = ComponentDiagnostic::new(
+                let diagnostic = Diagnostic::new(
                     component.name.clone(),
                     "failed to fetch store entry".to_string(),
                 )
@@ -73,7 +73,7 @@ pub(crate) fn check_components(
             .iter()
             .any(|(c, _)| c.directory_name == component.directory_name)
         {
-            let diagnostic = ComponentDiagnostic::new(
+            let diagnostic = Diagnostic::new(
                 component.name.clone(),
                 "could not match to kde store entry".to_string(),
             );

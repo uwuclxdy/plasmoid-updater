@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    types::{AvailableUpdate, ComponentDiagnostic, InstalledComponent, StoreEntry},
+    types::{AvailableUpdate, Diagnostic, InstalledComponent, StoreEntry},
     version,
 };
 
@@ -11,8 +11,8 @@ use super::resolution;
 
 pub(crate) enum ComponentCheckResult {
     Update(Box<AvailableUpdate>),
-    Unresolved(ComponentDiagnostic),
-    CheckFailed(ComponentDiagnostic),
+    Unresolved(Diagnostic),
+    CheckFailed(Diagnostic),
     UpToDate,
 }
 
@@ -41,7 +41,7 @@ pub(crate) fn check_component(
             version_str,
         );
         let installed_version = (!component.version.is_empty()).then(|| component.version.clone());
-        let diagnostic = ComponentDiagnostic::new(
+        let diagnostic = Diagnostic::new(
             component.name.clone(),
             "could not match to kde store entry".to_string(),
         )
@@ -56,7 +56,7 @@ pub(crate) fn check_component(
             content_id,
             component.name
         );
-        let diagnostic = ComponentDiagnostic::new(
+        let diagnostic = Diagnostic::new(
             component.name.clone(),
             format!("store entry {content_id} not in fetched data"),
         )
@@ -95,7 +95,7 @@ pub(crate) fn evaluate_store_entry(
         );
         let installed_version = (!component.version.is_empty()).then(|| component.version.clone());
         let available_version = (!entry.version.is_empty()).then(|| entry.version.clone());
-        let diagnostic = ComponentDiagnostic::new(
+        let diagnostic = Diagnostic::new(
             component.name.clone(),
             "no download url available".to_string(),
         )
