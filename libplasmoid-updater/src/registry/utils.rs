@@ -37,8 +37,3 @@ pub(super) fn registry_installed_file_path(installed_path: &Path) -> String {
 pub(super) fn extract_date_from_iso(iso: &str) -> String {
     iso.split('T').next().unwrap_or(iso).to_string()
 }
-
-/// Checks if a path contains a directory name as a segment.
-pub(super) fn path_matches_directory(path: &str, directory_name: &str) -> bool {
-    path.split('/').any(|segment| segment == directory_name)
-}

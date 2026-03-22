@@ -35,13 +35,6 @@ impl RawEntry {
             .first()
             .map(|f| PathBuf::from(f.trim_end_matches("/*")))
     }
-
-    pub(super) fn path_matches_directory(&self, directory_name: &str) -> bool {
-        self.installed_files
-            .iter()
-            .chain(self.uninstalled_files.iter())
-            .any(|path| utils::path_matches_directory(path, directory_name))
-    }
 }
 
 /// Entry data for adding to the registry.
@@ -105,14 +98,28 @@ pub(super) fn parse_raw_entries(xml: &str) -> Vec<RawEntry> {
                     continue;
                 }
 
-                let text = String::from_utf8_lossy(e.as_ref()).to_string();
+                // Defer the UTF-8 allocation to the field that actually needs it;
+                // the registry format has ~13 ignored fields per entry (providerid,
+                // author, rating, summary, …) so this avoids most allocations.
                 match current_element.as_slice() {
-                    b"name" => current.name = text,
-                    b"version" => current.version = text,
-                    b"id" => current.id_text = text,
-                    b"releasedate" => current.release_date = text,
-                    b"installedfile" => current.installed_files.push(text),
-                    b"uninstalledfile" => current.uninstalled_files.push(text),
+                    b"name" => current.name = String::from_utf8_lossy(e.as_ref()).into_owned(),
+                    b"version" => {
+                        current.version = String::from_utf8_lossy(e.as_ref()).into_owned();
+                    }
+                    b"id" => current.id_text = String::from_utf8_lossy(e.as_ref()).into_owned(),
+                    b"releasedate" => {
+                        current.release_date = String::from_utf8_lossy(e.as_ref()).into_owned();
+                    }
+                    b"installedfile" => {
+                        current
+                            .installed_files
+                            .push(String::from_utf8_lossy(e.as_ref()).into_owned());
+                    }
+                    b"uninstalledfile" => {
+                        current
+                            .uninstalled_files
+                            .push(String::from_utf8_lossy(e.as_ref()).into_owned());
+                    }
                     _ => {}
                 }
             }
@@ -210,14 +217,65 @@ pub(super) fn add_entry(xml: &str, entry: &NewEntry) -> String {
 /// Updates an existing entry in the registry XML.
 /// Returns `Some(new_xml)` if entry was found and updated, `None` if not found.
 pub(super) fn update_entry(xml: &str, fields: &UpdateFields) -> Result<Option<String>> {
-    let Some(target_index) = parse_raw_entries(xml)
-        .iter()
-        .position(|entry| entry.path_matches_directory(fields.directory_name))
-    else {
+    let Some(target_index) = find_target_index(xml, fields.directory_name) else {
         return Ok(None);
     };
 
     rewrite_with_updates(xml, target_index, fields)
+}
+
+/// Returns the 0-based index of the `<stuff>` entry whose installed or uninstalled
+/// file paths contain `directory_name` as a path segment.
+fn find_target_index(xml: &str, directory_name: &str) -> Option<usize> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let dir_bytes = directory_name.as_bytes();
+
+    let mut current_element: Vec<u8> = Vec::new();
+    let mut entry_index: Option<usize> = None;
+    let mut in_entry = false;
+    let mut current_matches = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                current_element.clear();
+                current_element.extend_from_slice(name);
+
+                if name == b"stuff" {
+                    in_entry = true;
+                    entry_index = Some(entry_index.map_or(0, |i| i + 1));
+                    current_matches = false;
+                }
+            }
+            Ok(Event::Text(e)) if in_entry => {
+                if !current_matches
+                    && matches!(
+                        current_element.as_slice(),
+                        b"installedfile" | b"uninstalledfile"
+                    )
+                {
+                    // Check path segments at byte level — no UTF-8 conversion needed.
+                    current_matches = e.as_ref().split(|&b| b == b'/').any(|seg| seg == dir_bytes);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if e.name().as_ref() == b"stuff" && in_entry {
+                    if current_matches {
+                        return entry_index;
+                    }
+                    in_entry = false;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Rewrites the registry XML, updating fields in the target entry.
