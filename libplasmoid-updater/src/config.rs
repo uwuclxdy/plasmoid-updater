@@ -229,13 +229,13 @@ pub(crate) fn parse_widgets_id_line(line: &str) -> Option<(u64, String)> {
         return None;
     }
 
-    let parts: Vec<&str> = line.splitn(2, ' ').collect();
-    if parts.len() == 2
-        && let Ok(id) = parts[0].trim().parse::<u64>()
-    {
-        return Some((id, parts[1].trim().to_string()));
+    let mut parts = line.splitn(2, ' ');
+    let id = parts.next()?.parse::<u64>().ok()?;
+    let name = parts.next()?.trim();
+    if name.is_empty() {
+        return None;
     }
-    None
+    Some((id, name.to_string()))
 }
 
 #[cfg(test)]
