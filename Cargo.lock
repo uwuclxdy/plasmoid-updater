@@ -1082,6 +1082,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "libplasmoid-updater"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8e014054a37cc8558e559d9257b73696217eed4438ea547568ee9f0a16e3a3a"
+dependencies = [
+ "bytesize",
+ "chrono",
+ "comfy-table",
+ "dirs",
+ "freedesktop_entry_parser",
+ "fs_extra",
+ "indicatif",
+ "inquire",
+ "is-terminal",
+ "log",
+ "md5",
+ "nix",
+ "parking_lot",
+ "quick-xml",
+ "rayon",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "terminal_size",
+ "thiserror 2.0.18",
+ "versions",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1267,11 +1296,11 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "plasmoid-updater"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "clap",
  "dirs",
- "libplasmoid-updater",
+ "libplasmoid-updater 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "nix",
  "serde",
  "serde_json",
