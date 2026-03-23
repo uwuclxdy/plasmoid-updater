@@ -90,21 +90,24 @@ pub(crate) fn download_package(
 pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)?;
 
-    let status = Command::new("bsdtar")
+    let output = Command::new("bsdtar")
         .args([
             "-xf",
             &archive_path.to_string_lossy(),
             "-C",
             &dest.to_string_lossy(),
         ])
-        .status()
+        .output()
         .map_err(|e| Error::extraction(format!("failed to run bsdtar: {e}")))?;
 
-    if !status.success() {
-        return Err(Error::extraction(format!(
-            "bsdtar exited with status {}",
-            status
-        )));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            format!("bsdtar exited with status {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(Error::extraction(detail));
     }
 
     Ok(())
