@@ -15,7 +15,7 @@ name = "plasmoid-updater"
 path = "src/main.rs"
 
 [dependencies]
-libplasmoid-updater = "0.1.5"
+libplasmoid-updater = { path = "../libplasmoid-updater", features = ["cli"] }
 clap = { version = "4.5.60", features = ["derive"] }
 toml = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
