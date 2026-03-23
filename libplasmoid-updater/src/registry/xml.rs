@@ -216,9 +216,11 @@ pub(super) fn add_entry(xml: &str, entry: &NewEntry) -> String {
     );
 
     if let Some(pos) = xml.rfind("</hotnewstuffregistry>") {
-        let mut result = xml[..pos].to_string();
+        let suffix = "</hotnewstuffregistry>\n";
+        let mut result = String::with_capacity(pos + new_entry.len() + suffix.len());
+        result.push_str(&xml[..pos]);
         result.push_str(&new_entry);
-        result.push_str("</hotnewstuffregistry>\n");
+        result.push_str(suffix);
         result
     } else {
         format!(
