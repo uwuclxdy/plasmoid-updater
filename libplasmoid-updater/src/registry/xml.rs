@@ -160,9 +160,12 @@ pub(super) fn create_empty_registry() -> String {
 }
 
 /// Escapes special characters for XML text content.
-fn escape_xml_text(s: &str) -> String {
+///
+/// Returns a borrowed slice when no escaping is needed (the common case),
+/// avoiding a heap allocation entirely.
+fn escape_xml_text(s: &str) -> Cow<'_, str> {
     let Some(first) = s.find(['&', '<', '>']) else {
-        return s.to_owned();
+        return Cow::Borrowed(s);
     };
     let mut out = String::with_capacity(s.len() + 4);
     out.push_str(&s[..first]);
@@ -174,7 +177,7 @@ fn escape_xml_text(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Adds a new entry to the registry XML.
