@@ -15,6 +15,16 @@ pub(crate) fn is_update_available_with_date(
     installed_date: &str,
     available_date: &str,
 ) -> bool {
+    // Fast path: identical non-empty version strings skip expensive parsing.
+    // If strings are equal their Versioning representations are also equal,
+    // so the only possible update signal is a newer release date.
+    if !installed_version.is_empty()
+        && !available_version.is_empty()
+        && installed_version == available_version
+    {
+        return is_date_newer(installed_date, available_date);
+    }
+
     let installed_parsed = Versioning::new(installed_version);
     let available_parsed = Versioning::new(available_version);
 
