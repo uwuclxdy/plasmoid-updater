@@ -177,6 +177,10 @@ fn do_full_update(
 ) -> Result<ExitCode, libplasmoid_updater::Error> {
     let result = update(&config)?;
 
+    if result.is_empty() {
+        return Ok(ExitCode::Success);
+    }
+
     result.print_summary();
     if result.has_failures() {
         result.print_error_table();
