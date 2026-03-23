@@ -22,10 +22,14 @@ pub(crate) fn temp_dir() -> PathBuf {
 }
 
 /// Downloads a package with optional checksum verification.
+///
+/// `directory_name` is used to namespace the download file, preventing
+/// filename collisions when multiple components download in parallel.
 pub(crate) fn download_package(
     client: &reqwest::blocking::Client,
     url: &str,
     expected_checksum: Option<&str>,
+    directory_name: &str,
     counter: &AtomicUsize,
 ) -> Result<PathBuf> {
     let temp = temp_dir();
@@ -34,10 +38,9 @@ pub(crate) fn download_package(
     let file_name = url
         .rsplit('/')
         .next()
-        .unwrap_or("package.tar.gz")
-        .to_string();
+        .unwrap_or("package.tar.gz");
 
-    let dest = temp.join(&file_name);
+    let dest = temp.join(format!("{directory_name}_{file_name}"));
 
     counter.fetch_add(1, Ordering::Relaxed);
     let response = client

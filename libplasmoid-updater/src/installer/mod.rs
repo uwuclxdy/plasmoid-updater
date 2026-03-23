@@ -76,6 +76,7 @@ fn perform_installation(
         &update.download_url,
         update.checksum.as_deref(),
         &component.name,
+        &component.directory_name,
         counter,
     )?;
     reporter(2);
@@ -93,9 +94,10 @@ fn download_with_error_handling(
     url: &str,
     checksum: Option<&str>,
     component_name: &str,
+    directory_name: &str,
     counter: &AtomicUsize,
 ) -> Result<PathBuf> {
-    download::download_package(client, url, checksum, counter).map_err(|e| {
+    download::download_package(client, url, checksum, directory_name, counter).map_err(|e| {
         log::error!(target: "download", "failed for {}: {e}", component_name);
         e
     })
