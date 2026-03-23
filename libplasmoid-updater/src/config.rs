@@ -203,7 +203,7 @@ impl Config {
     /// The format is one entry per line: `content_id directory_name`
     /// Lines starting with `#` are comments.
     pub fn parse_widgets_id(content: &str) -> HashMap<String, u64> {
-        let mut table = HashMap::new();
+        let mut table = HashMap::with_capacity(content.lines().count());
         for line in content.lines() {
             if let Some((id, name)) = parse_widgets_id_line(line) {
                 table.insert(name, id);
