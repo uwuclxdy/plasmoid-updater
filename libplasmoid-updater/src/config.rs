@@ -96,6 +96,9 @@ pub struct Config {
     /// `None` (default) uses the number of logical CPU threads available.
     /// `Some(n)` pins the pool to exactly `n` threads.
     pub threads: Option<usize>,
+
+    /// When `true`, skip KDE Plasma environment detection and proceed regardless.
+    pub skip_plasma_detection: bool,
 }
 
 impl Config {
@@ -219,6 +222,11 @@ impl Config {
 
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = Some(threads);
+        self
+    }
+
+    pub fn with_skip_plasma_detection(mut self, skip: bool) -> Self {
+        self.skip_plasma_detection = skip;
         self
     }
 }

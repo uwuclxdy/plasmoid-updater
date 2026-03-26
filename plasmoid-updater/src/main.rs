@@ -35,6 +35,9 @@ struct Cli {
 
     #[arg(long, help = "open configuration file in editor")]
     edit_config: bool,
+
+    #[arg(long, global = true, help = "skip KDE Plasma detection")]
+    skip_plasma_detection: bool,
 }
 
 #[derive(Subcommand)]
@@ -83,6 +86,7 @@ fn run(cli: Cli) -> Result<ExitCode, libplasmoid_updater::Error> {
 
     let mut config = CliConfig::load()?;
     config.inner.system = cli.system;
+    config.inner.skip_plasma_detection = cli.skip_plasma_detection;
 
     execute_command(&cli, &config)
 }

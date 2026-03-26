@@ -16,11 +16,12 @@ use crate::{
     types::{AvailableUpdate, UpdateCheckResult},
 };
 
-pub(crate) fn validate_environment() -> crate::Result<()> {
+pub(crate) fn validate_environment(skip_plasma_detection: bool) -> crate::Result<()> {
     if cfg!(not(target_os = "linux")) {
         return Err(Error::UnsupportedOS(std::env::consts::OS.to_string()));
     }
-    if !crate::paths::is_kde() {
+    let plasma_found = skip_plasma_detection || crate::paths::is_kde();
+    if !plasma_found {
         return Err(Error::NotKDE);
     }
     Ok(())
