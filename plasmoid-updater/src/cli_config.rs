@@ -56,7 +56,7 @@ impl CliConfig {
         let toml_config = Self::load_toml_config()?;
 
         let mut inner = libplasmoid_updater::Config::new()
-            .with_excluded_packages(toml_config.excluded_packages.clone())
+            .with_excluded_packages(toml_config.excluded_packages)
             .with_restart(if toml_config.prompt_restart {
                 libplasmoid_updater::RestartBehavior::Prompt
             } else {
