@@ -50,5 +50,14 @@ fn user_home() -> PathBuf {
 
     std::env::var("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default())
+        .unwrap_or_else(|_| {
+            dirs::home_dir().unwrap_or_else(|| {
+                log::warn!(
+                    target: "paths",
+                    "could not determine home directory; \
+                     defaulting to /tmp/plasmoid-updater-fallback"
+                );
+                PathBuf::from("/tmp/plasmoid-updater-fallback")
+            })
+        })
 }
