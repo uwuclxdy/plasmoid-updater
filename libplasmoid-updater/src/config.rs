@@ -215,16 +215,53 @@ impl Config {
         table
     }
 
+    /// Sets whether to skip interactive prompts and apply all non-excluded
+    /// updates automatically.
+    ///
+    /// Has no effect without the `cli` feature enabled.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use libplasmoid_updater::Config;
+    ///
+    /// let config = Config::new().with_auto_confirm(true);
+    /// ```
     pub fn with_auto_confirm(mut self, auto_confirm: bool) -> Self {
         self.auto_confirm = auto_confirm;
         self
     }
 
+    /// Sets the maximum number of parallel installation threads.
+    ///
+    /// By default (`None`), the library uses the number of logical CPUs.
+    /// Setting this to a specific value pins the thread pool to exactly
+    /// that many threads.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use libplasmoid_updater::Config;
+    ///
+    /// let config = Config::new().with_threads(4);
+    /// ```
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = Some(threads);
         self
     }
 
+    /// Sets whether to skip KDE Plasma environment detection.
+    ///
+    /// When `true`, the library proceeds without checking for the KNewStuff3
+    /// registry directory. Useful for CI, testing, or non-standard KDE setups.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use libplasmoid_updater::Config;
+    ///
+    /// let config = Config::new().with_skip_plasma_detection(true);
+    /// ```
     pub fn with_skip_plasma_detection(mut self, skip: bool) -> Self {
         self.skip_plasma_detection = skip;
         self
