@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::HashMap;
-
 use crate::{
     types::{AvailableUpdate, Diagnostic, InstalledComponent, StoreEntry},
     version,
 };
 
-use super::resolution;
+use super::{IdLookup, resolution};
 
 pub(crate) enum ComponentCheckResult {
     Update(Box<AvailableUpdate>),
@@ -20,15 +18,9 @@ pub(crate) enum ComponentCheckResult {
 pub(crate) fn check_component(
     component: &InstalledComponent,
     store_entries: &[StoreEntry],
-    widgets_id_table: &HashMap<String, u64>,
-    registry_id_cache: &HashMap<String, u64>,
+    lookup: &IdLookup,
 ) -> ComponentCheckResult {
-    let Some(content_id) = resolution::resolve_content_id(
-        component,
-        store_entries,
-        widgets_id_table,
-        registry_id_cache,
-    ) else {
+    let Some(content_id) = resolution::resolve_content_id(component, store_entries, lookup) else {
         let version_str = if component.version.is_empty() {
             "<empty>"
         } else {

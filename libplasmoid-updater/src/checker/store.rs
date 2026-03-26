@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::{
     Result,
     api::ApiClient,
     types::{ComponentType, InstalledComponent, StoreEntry},
 };
+
+use super::IdLookup;
 
 pub(crate) fn partition_components(
     components: Vec<InstalledComponent>,
@@ -28,8 +30,7 @@ pub(crate) fn partition_components(
 pub(crate) fn fetch_store_entries(
     client: &ApiClient,
     regular_components: &[InstalledComponent],
-    widgets_id_table: &HashMap<String, u64>,
-    registry_id_cache: &HashMap<String, u64>,
+    lookup: &IdLookup,
 ) -> Result<Vec<StoreEntry>> {
     if regular_components.is_empty() {
         return Ok(Vec::new());
@@ -37,7 +38,7 @@ pub(crate) fn fetch_store_entries(
 
     let known_ids: Vec<u64> = regular_components
         .iter()
-        .filter_map(|c| resolve_id_locally(c, widgets_id_table, registry_id_cache))
+        .filter_map(|c| resolve_id_locally(c, lookup))
         .collect();
 
     // Always fetch catalog for all distinct component types — not just unresolved ones.
@@ -69,15 +70,12 @@ pub(crate) fn fetch_store_entries(
         .collect())
 }
 
-fn resolve_id_locally(
-    component: &InstalledComponent,
-    widgets_id_table: &HashMap<String, u64>,
-    registry_id_cache: &HashMap<String, u64>,
-) -> Option<u64> {
-    registry_id_cache
+fn resolve_id_locally(component: &InstalledComponent, lookup: &IdLookup) -> Option<u64> {
+    lookup
+        .registry_id_cache
         .get(&component.directory_name)
         .copied()
-        .or_else(|| widgets_id_table.get(&component.directory_name).copied())
+        .or_else(|| lookup.widgets_id_table.get(&component.directory_name).copied())
 }
 
 fn distinct_types(components: &[InstalledComponent]) -> Vec<ComponentType> {

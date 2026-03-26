@@ -7,22 +7,20 @@ use crate::{
     types::{Diagnostic, InstalledComponent, StoreEntry, UpdateCheckResult},
 };
 
-use super::{evaluation, resolution};
+use super::{IdLookup, evaluation, resolution};
 
 /// Checks if any of the components from the widget-id registry table have updates available.
 pub(crate) fn check_components(
     registry_components: &[InstalledComponent],
     client: &ApiClient,
     store_entries: &[StoreEntry],
-    widgets_id_table: &HashMap<String, u64>,
-    registry_id_cache: &HashMap<String, u64>,
+    lookup: &IdLookup,
     result: &mut UpdateCheckResult,
 ) {
     let resolved: Vec<(&InstalledComponent, u64)> = registry_components
         .iter()
         .filter_map(|c| {
-            resolution::resolve_content_id(c, store_entries, widgets_id_table, registry_id_cache)
-                .map(|id| (c, id))
+            resolution::resolve_content_id(c, store_entries, lookup).map(|id| (c, id))
         })
         .collect();
 

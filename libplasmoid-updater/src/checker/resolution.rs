@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use crate::types::{InstalledComponent, StoreEntry};
 
+use super::IdLookup;
+
 pub(crate) struct DownloadInfo {
     pub(crate) url: String,
     pub(crate) checksum: Option<String>,
@@ -21,14 +23,14 @@ pub(crate) struct DownloadInfo {
 pub(crate) fn resolve_content_id(
     component: &InstalledComponent,
     store_entries: &[StoreEntry],
-    widgets_id_table: &HashMap<String, u64>,
-    registry_id_cache: &HashMap<String, u64>,
+    lookup: &IdLookup,
 ) -> Option<u64> {
-    registry_id_cache
+    lookup
+        .registry_id_cache
         .get(&component.directory_name)
         .copied()
         .or_else(|| resolve_by_name(component, store_entries))
-        .or_else(|| resolve_by_table(component, widgets_id_table))
+        .or_else(|| resolve_by_table(component, lookup.widgets_id_table))
 }
 
 fn resolve_by_name(component: &InstalledComponent, store_entries: &[StoreEntry]) -> Option<u64> {
