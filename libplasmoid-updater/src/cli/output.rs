@@ -4,6 +4,7 @@ use bytesize::ByteSize;
 use comfy_table::{Attribute, Cell, CellAlignment, Table, presets};
 
 use crate::{
+    FailedUpdate,
     UpdateResult,
     types::{AvailableUpdate, InstalledComponent},
 };
@@ -51,9 +52,9 @@ impl TableRow for InstalledComponent {
     }
 }
 
-impl TableRow for (String, String) {
+impl TableRow for FailedUpdate {
     fn to_row(&self) -> Vec<Cell> {
-        vec![Cell::new(&self.0), Cell::new(&self.1)]
+        vec![Cell::new(&self.name), Cell::new(&self.error)]
     }
 }
 

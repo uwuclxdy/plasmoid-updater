@@ -5,6 +5,7 @@ use crate::cli::{self, progress::create_fetch_spinner};
 #[cfg(feature = "cli")]
 use inquire::InquireError;
 
+use crate::FailedUpdate;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 
@@ -183,7 +184,7 @@ pub(crate) fn install_selected_updates(
                 Err(e) => {
                     #[cfg(feature = "cli")]
                     ui.complete_task(index, false);
-                    result.lock().failed.push((name, e.to_string()));
+                    result.lock().failed.push(FailedUpdate { name, error: e.to_string() });
                 }
             }
         });

@@ -148,6 +148,15 @@ pub fn update(config: &Config) -> Result<UpdateResult> {
     Ok(result)
 }
 
+/// A component that failed to update, with the error message.
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedUpdate {
+    /// Display name of the component that failed.
+    pub name: String,
+    /// Human-readable error description.
+    pub error: String,
+}
+
 /// Result of performing updates.
 ///
 /// Returned by [`update()`](crate::update). Tracks which components succeeded,
@@ -155,7 +164,7 @@ pub fn update(config: &Config) -> Result<UpdateResult> {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UpdateResult {
     pub succeeded: Vec<String>,
-    pub failed: Vec<(String, String)>,
+    pub failed: Vec<FailedUpdate>,
     pub skipped: Vec<String>,
 }
 
