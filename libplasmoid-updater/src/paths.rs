@@ -21,9 +21,13 @@ pub(crate) fn knewstuff_dir() -> PathBuf {
     data_home().join("knewstuff3")
 }
 
-/// Returns true if KDE Plasma desktop environment is detected.
+/// Returns true if KDE Plasma is detected on this system.
+///
+/// Checks for the presence of the KNewStuff3 registry directory, which is
+/// created when KDE Plasma runs for the first time. This works over SSH and
+/// in headless environments where session environment variables are not set.
 pub(crate) fn is_kde() -> bool {
-    std::env::var("KDE_SESSION_VERSION").is_ok()
+    knewstuff_dir().exists()
 }
 
 /// Gets the user's home directory, even when running with sudo.

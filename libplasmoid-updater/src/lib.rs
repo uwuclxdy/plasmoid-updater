@@ -47,7 +47,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// - [`Error::UnsupportedOS`] — not running on Linux
 /// - [`Error::NotKDE`] — KDE Plasma not detected
 pub fn check(config: &Config) -> Result<CheckResult> {
-    crate::utils::validate_environment()?;
+    crate::utils::validate_environment(config.skip_plasma_detection)?;
 
     let api_client = ApiClient::new();
     let result = crate::utils::fetch_updates(&api_client, config)?;
@@ -113,7 +113,7 @@ impl CheckResult {
 ///
 /// Returns an [`Error`] if environment validation, network requests, or installation fails.
 pub fn update(config: &Config) -> Result<UpdateResult> {
-    crate::utils::validate_environment()?;
+    crate::utils::validate_environment(config.skip_plasma_detection)?;
 
     let api_client = ApiClient::new();
     let check_result = crate::utils::fetch_updates(&api_client, config)?;
