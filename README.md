@@ -2,40 +2,27 @@
 
 Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier's and KDE Discover's logic.
 
-## Supported Components
-
-| Component Type             | KDE Store Category |
-| -------------------------- | ------------------ |
-| Plasma Widgets (Plasmoids) | 705                |
-| Wallpaper Plugins          | 715                |
-| KWin Effects               | 719                |
-| KWin Scripts               | 720                |
-| Global Themes              | 722                |
-| Plasma Styles              | 709                |
-| Aurorae Window Decorations | 114                |
-| Color Schemes              | 112                |
-| Splash Screens             | 708                |
-| SDDM Themes                | 101                |
+> [!IMPORTANT]
+> The core logic (a combination of **Apdatifier** and **KDE Discover**) was ported to Rust with AI assistance (Claude Code and GH Copilot). The code was audited and tested by me. Feel free to contribute with an issue or PR.
 
 ## Requirements
 
-- bsdtar
-- kpackagetool6
-- [Rust Toolchain](https://rust-lang.org/tools/install/)
+- bsdtar, kpackagetool6
+- [Rust](https://rust-lang.org/tools/install/)
 
 ## Installation
 
-**Binary release**
-
-Precompiled binary available on [GitHub Releases](https://github.com/uwuclxdy/plasmoid-updater/releases/latest).
-
-**From source:**
+**From source with Cargo:**
 
 ```bash
 git clone https://github.com/uwuclxdy/plasmoid-updater
 cd plasmoid-updater
-cargo install --path .
+cargo install --path plasmoid-updater/
 ```
+
+**Binary release**
+
+Precompiled binary available on [GitHub Releases](https://github.com/uwuclxdy/plasmoid-updater/releases/latest).
 
 ## Usage
 
@@ -51,10 +38,11 @@ Commands:
   update          update components
 
 Options:
-      --system       operate on system-wide components (needs sudo)
-      --edit-config  open configuration file in editor
-  -h, --help         Print help
-  -V, --version      Print version
+      --system                 operate on system-wide components (needs sudo)
+      --edit-config            open configuration file in editor
+      --skip-plasma-detection  skip KDE Plasma detection
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 ```bash
@@ -67,16 +55,29 @@ Arguments:
   [COMPONENT]  component name or directory to update
 
 Options:
-      --restart-plasma     automatically restart plasmashell
-      --no-restart-plasma  do not restart plasmashell
-  -y, --yes                automatically confirm all updates
-      --system             operate on system-wide components (needs sudo)
-  -h, --help               Print help
+      --restart-plasma         automatically restart plasmashell
+      --no-restart-plasma      do not restart plasmashell
+  -y, --yes                    automatically confirm all updates
+      --system                 operate on system-wide components (needs sudo)
+      --skip-plasma-detection  skip KDE Plasma detection
+  -h, --help                   Print help
+
 ```
 
-## Reporting Bugs
+## Supported (Updatable) Components
 
-Please open a GitHub issue for any bugs that you may find.
+| Component Type             | KDE Store Category |
+| -------------------------- | ------------------ |
+| Plasma Widgets (Plasmoids) | 705                |
+| Wallpaper Plugins          | 715                |
+| KWin Effects               | 719                |
+| KWin Scripts               | 720                |
+| Global Themes              | 722                |
+| Plasma Styles              | 709                |
+| Aurorae Window Decorations | 114                |
+| Color Schemes              | 112                |
+| Splash Screens             | 708                |
+| SDDM Themes                | 101                |
 
 ---
 
