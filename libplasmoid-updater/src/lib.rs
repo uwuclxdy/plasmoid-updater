@@ -219,11 +219,13 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 /// On failure, the original component is restored from backup. Does not handle
 /// plasmashell restart — the caller is responsible for restarting if needed.
 ///
+/// The `config` parameter is currently unused but is part of the public API
+/// signature for forward compatibility (e.g., thread count, dry-run mode).
+///
 /// # Errors
 ///
 /// Returns an error if download, installation, or backup operations fail.
-pub fn install_update(update: &AvailableUpdate, config: &Config) -> Result<()> {
-    let _ = config;
+pub fn install_update(update: &AvailableUpdate, _config: &Config) -> Result<()> {
     let api_client = ApiClient::new();
     let counter = api_client.request_counter();
     installer::update_component(update, api_client.http_client(), |_| {}, &counter)
