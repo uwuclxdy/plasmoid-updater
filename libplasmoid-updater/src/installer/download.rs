@@ -35,10 +35,7 @@ pub(crate) fn download_package(
     let temp = temp_dir();
     fs::create_dir_all(&temp)?;
 
-    let file_name = url
-        .rsplit('/')
-        .next()
-        .unwrap_or("package.tar.gz");
+    let file_name = url.rsplit('/').next().unwrap_or("package.tar.gz");
 
     let dest = temp.join(format!("{directory_name}_{file_name}"));
 

@@ -371,9 +371,9 @@ fn get_field_replacement<'a>(
         b"payload" => Some(Cow::Borrowed(fields.download_url)),
         b"releasedate" => Some(Cow::Borrowed(fields.release_date)),
         b"status" => Some(Cow::Borrowed("installed")),
-        b"installedfile" | b"uninstalledfile" => {
-            Some(Cow::Owned(utils::registry_installed_file_path(fields.installed_path)))
-        }
+        b"installedfile" | b"uninstalledfile" => Some(Cow::Owned(
+            utils::registry_installed_file_path(fields.installed_path),
+        )),
         _ => None,
     }
 }

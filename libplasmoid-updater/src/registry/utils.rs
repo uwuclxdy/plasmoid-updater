@@ -27,10 +27,10 @@ pub(super) fn extract_directory_name(path: &Path) -> Option<String> {
 /// directory for those, so InstalledComponent.path always points to the component root.
 pub(super) fn resolve_component_path(path: PathBuf) -> PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name == "metadata.json" || name == "metadata.desktop" {
-        if let Some(parent) = path.parent() {
-            return parent.to_path_buf();
-        }
+    if (name == "metadata.json" || name == "metadata.desktop")
+        && let Some(parent) = path.parent()
+    {
+        return parent.to_path_buf();
     }
     path
 }
