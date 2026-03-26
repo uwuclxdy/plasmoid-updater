@@ -193,7 +193,9 @@ pub(crate) fn install_selected_updates(
     #[cfg(feature = "cli")]
     ui.finish();
 
-    Ok(Arc::try_unwrap(result).unwrap().into_inner())
+    Ok(Arc::try_unwrap(result)
+        .expect("thread pool completed; Arc should have single owner")
+        .into_inner())
 }
 
 pub(crate) fn handle_restart(config: &Config, updates: &[AvailableUpdate], result: &UpdateResult) {

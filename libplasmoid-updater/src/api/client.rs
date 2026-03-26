@@ -119,12 +119,16 @@ impl ApiClient {
             }
         });
 
-        let errors = Arc::try_unwrap(errors).unwrap().into_inner();
+        let errors = Arc::try_unwrap(errors)
+            .expect("parallel fetch completed; Arc should have single owner")
+            .into_inner();
         if !errors.is_empty() {
             log::warn!(target: "api", "{} page{} failed to fetch", errors.len(), if errors.len() == 1 { "" } else { "s" });
         }
 
-        Ok(Arc::try_unwrap(all_entries).unwrap().into_inner())
+        Ok(Arc::try_unwrap(all_entries)
+            .expect("parallel fetch completed; Arc should have single owner")
+            .into_inner())
     }
 
     /// Fetches content details of multiple components.
