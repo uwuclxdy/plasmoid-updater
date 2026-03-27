@@ -11,7 +11,7 @@ use std::{
 
 use crate::{Error, Result};
 
-const DOWNLOAD_TIMEOUT_SECS: u64 = 10;
+const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const DOWNLOAD_BUFFER_SIZE: usize = 8192;
 
 pub(crate) fn temp_dir() -> PathBuf {
