@@ -173,6 +173,8 @@ pub(crate) fn install_selected_updates(
 
     pool.install(|| {
         updates.par_iter().enumerate().for_each(|(index, update)| {
+            #[cfg(not(feature = "cli"))]
+            let _ = index;
             let name = update.installed.name.clone();
 
             #[cfg(feature = "cli")]

@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 /// 3. No-op with a warning (non-systemd systems or missing tools)
 pub(crate) enum InhibitGuard {
     #[cfg(feature = "inhibit")]
+    #[allow(dead_code)] // fd kept open intentionally to hold the inhibit lock
     Dbus(zbus::zvariant::OwnedFd),
     Subprocess(Child),
     None,

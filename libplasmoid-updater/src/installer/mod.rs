@@ -32,6 +32,7 @@ pub(crate) use lock::UpdateLock;
 pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
 
 /// Outcome of a single component update, including post-install verification.
+#[allow(dead_code)]
 pub(crate) struct InstallOutcome {
     /// `true` if the post-install version matches the expected version.
     pub verified: bool,
@@ -247,24 +248,22 @@ fn read_installed_version(component: &InstalledComponent) -> Option<String> {
 
     // Try metadata.json first
     let json_path = component.path.join("metadata.json");
-    if json_path.exists() {
-        if let Ok(content) = fs::read_to_string(&json_path) {
-            if let Ok(meta) = serde_json::from_str::<crate::types::PackageMetadata>(&content) {
-                if let Some(v) = meta.version() {
-                    return Some(v.to_string());
-                }
-            }
-        }
+    if json_path.exists()
+        && let Ok(content) = fs::read_to_string(&json_path)
+        && let Ok(meta) = serde_json::from_str::<crate::types::PackageMetadata>(&content)
+        && let Some(v) = meta.version()
+    {
+        return Some(v.to_string());
     }
 
     // Fall back to metadata.desktop
     let desktop_path = component.path.join("metadata.desktop");
-    if desktop_path.exists() {
-        if let Ok(content) = fs::read_to_string(&desktop_path) {
-            for line in content.lines() {
-                if let Some(version) = line.strip_prefix("X-KDE-PluginInfo-Version=") {
-                    return Some(version.to_string());
-                }
+    if desktop_path.exists()
+        && let Ok(content) = fs::read_to_string(&desktop_path)
+    {
+        for line in content.lines() {
+            if let Some(version) = line.strip_prefix("X-KDE-PluginInfo-Version=") {
+                return Some(version.to_string());
             }
         }
     }
