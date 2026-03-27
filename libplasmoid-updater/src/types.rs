@@ -91,6 +91,30 @@ impl ComponentType {
         matches!(self, Self::IconTheme | Self::Wallpaper | Self::ColorScheme)
     }
 
+    /// Returns all component types that share the same filesystem path.
+    ///
+    /// `GlobalTheme` and `SplashScreen` both use `plasma/look-and-feel`.
+    /// During discovery, components in shared directories need to be
+    /// checked against all possible types to assign the correct `ComponentType`.
+    pub(crate) fn shared_path_types(self) -> &'static [ComponentType] {
+        match self {
+            Self::GlobalTheme | Self::SplashScreen => {
+                &[Self::GlobalTheme, Self::SplashScreen]
+            }
+            Self::PlasmaWidget => &[Self::PlasmaWidget],
+            Self::WallpaperPlugin => &[Self::WallpaperPlugin],
+            Self::KWinEffect => &[Self::KWinEffect],
+            Self::KWinScript => &[Self::KWinScript],
+            Self::KWinSwitcher => &[Self::KWinSwitcher],
+            Self::PlasmaStyle => &[Self::PlasmaStyle],
+            Self::AuroraeDecoration => &[Self::AuroraeDecoration],
+            Self::ColorScheme => &[Self::ColorScheme],
+            Self::SddmTheme => &[Self::SddmTheme],
+            Self::IconTheme => &[Self::IconTheme],
+            Self::Wallpaper => &[Self::Wallpaper],
+        }
+    }
+
     // -- Filesystem paths --
 
     /// Returns the user-local data directory suffix, or `None` for system-only types (e.g., SDDM).
@@ -433,6 +457,43 @@ impl UpdateCheckResult {
 
     pub fn add_check_failure(&mut self, diagnostic: Diagnostic) {
         self.check_failures.push(diagnostic);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_path_types_returns_both_for_global_theme() {
+        let types = ComponentType::GlobalTheme.shared_path_types();
+        assert!(types.contains(&ComponentType::GlobalTheme));
+        assert!(types.contains(&ComponentType::SplashScreen));
+        assert_eq!(types.len(), 2);
+    }
+
+    #[test]
+    fn shared_path_types_returns_both_for_splash_screen() {
+        let types = ComponentType::SplashScreen.shared_path_types();
+        assert!(types.contains(&ComponentType::GlobalTheme));
+        assert!(types.contains(&ComponentType::SplashScreen));
+        assert_eq!(types.len(), 2);
+    }
+
+    #[test]
+    fn shared_path_types_returns_single_for_unique_path() {
+        assert_eq!(
+            ComponentType::PlasmaWidget.shared_path_types(),
+            &[ComponentType::PlasmaWidget]
+        );
+        assert_eq!(
+            ComponentType::KWinEffect.shared_path_types(),
+            &[ComponentType::KWinEffect]
+        );
+        assert_eq!(
+            ComponentType::IconTheme.shared_path_types(),
+            &[ComponentType::IconTheme]
+        );
     }
 }
 

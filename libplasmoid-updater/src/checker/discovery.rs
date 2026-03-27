@@ -42,8 +42,16 @@ pub(crate) fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
             continue;
         }
 
-        let registry_map = registry::load_registry_map(component_type);
-        let discovered = scan_directory(&path, component_type, system, &registry_map)?;
+        // For shared directories (e.g., plasma/look-and-feel), load registry
+        // maps for all component types that use this path so we can assign the
+        // correct type based on which registry file contains the entry.
+        let shared_types = component_type.shared_path_types();
+        let registry_maps: Vec<_> = shared_types
+            .iter()
+            .map(|&ct| (ct, registry::load_registry_map(ct)))
+            .collect();
+
+        let discovered = scan_directory(&path, component_type, system, &registry_maps)?;
         components.extend(discovered);
     }
 
@@ -52,9 +60,9 @@ pub(crate) fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
 
 fn scan_directory(
     dir: &Path,
-    component_type: ComponentType,
+    default_type: ComponentType,
     is_system: bool,
-    registry_map: &std::collections::HashMap<String, registry::RegistryEntry>,
+    registry_maps: &[(ComponentType, std::collections::HashMap<String, registry::RegistryEntry>)],
 ) -> Result<Vec<InstalledComponent>> {
     let mut components = Vec::new();
 
@@ -84,10 +92,15 @@ fn scan_directory(
         let name = metadata.name().unwrap_or(&directory_name).to_string();
         let version = metadata.version().unwrap_or("0.0.0").to_string();
 
-        let release_date = registry_map
-            .get(&directory_name)
-            .map(|e| e.release_date.clone())
-            .unwrap_or_default();
+        // Determine the correct component type by checking which registry
+        // file contains this directory name. Fall back to the default type.
+        let (component_type, release_date) = registry_maps
+            .iter()
+            .find_map(|(ct, map)| {
+                map.get(&directory_name)
+                    .map(|e| (*ct, e.release_date.clone()))
+            })
+            .unwrap_or((default_type, String::new()));
 
         components.push(InstalledComponent {
             name,
