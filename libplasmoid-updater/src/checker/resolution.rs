@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::types::{InstalledComponent, StoreEntry};
+use crate::version::normalize_version;
 
 use super::IdLookup;
 
@@ -68,10 +69,18 @@ pub(crate) fn select_download_with_info(
     let link = if entry.download_links.len() == 1 {
         &entry.download_links[0]
     } else {
+        let normalized_target = normalize_version(target_version);
+        // Prefer exact match, then normalized match, then first link
         entry
             .download_links
             .iter()
             .find(|l| l.version == target_version)
+            .or_else(|| {
+                entry
+                    .download_links
+                    .iter()
+                    .find(|l| normalize_version(&l.version) == normalized_target)
+            })
             .or_else(|| entry.download_links.first())?
     };
 
@@ -171,6 +180,68 @@ mod tests {
 
         let result = resolve_content_id(&component, &entries, &lookup);
         assert_eq!(result, Some(555));
+    }
+
+    #[test]
+    fn download_link_matches_with_normalized_version() {
+        use crate::types::DownloadLink;
+
+        let entry = StoreEntry {
+            id: 1,
+            name: "Test".to_string(),
+            version: "2.0.0".to_string(),
+            type_id: 705,
+            download_links: vec![
+                DownloadLink {
+                    url: "https://example.com/old.tar.gz".to_string(),
+                    version: "v1.0.0".to_string(),
+                    checksum: None,
+                    size_kb: None,
+                },
+                DownloadLink {
+                    url: "https://example.com/new.tar.gz".to_string(),
+                    version: "v2.0.0".to_string(),
+                    checksum: None,
+                    size_kb: None,
+                },
+            ],
+            changed_date: String::new(),
+        };
+
+        let result = select_download_with_info(&entry, "2.0.0");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().url, "https://example.com/new.tar.gz");
+    }
+
+    #[test]
+    fn download_link_exact_match_preferred() {
+        use crate::types::DownloadLink;
+
+        let entry = StoreEntry {
+            id: 1,
+            name: "Test".to_string(),
+            version: "2.0.0".to_string(),
+            type_id: 705,
+            download_links: vec![
+                DownloadLink {
+                    url: "https://example.com/a.tar.gz".to_string(),
+                    version: "2.0.0".to_string(),
+                    checksum: None,
+                    size_kb: None,
+                },
+                DownloadLink {
+                    url: "https://example.com/b.tar.gz".to_string(),
+                    version: "2.0.0".to_string(),
+                    checksum: None,
+                    size_kb: None,
+                },
+            ],
+            changed_date: String::new(),
+        };
+
+        let result = select_download_with_info(&entry, "2.0.0");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().url, "https://example.com/a.tar.gz");
     }
 
     #[test]
