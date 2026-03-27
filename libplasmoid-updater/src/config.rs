@@ -99,6 +99,12 @@ pub struct Config {
 
     /// When `true`, skip KDE Plasma environment detection and proceed regardless.
     pub skip_plasma_detection: bool,
+
+    /// When `true` (default), inhibit system idle/sleep/shutdown during installs.
+    ///
+    /// Uses a 3-tier fallback: logind DBus → `systemd-inhibit` subprocess → no-op.
+    /// Set to `false` if the caller handles its own power management inhibition.
+    pub inhibit_idle: bool,
 }
 
 impl Config {
@@ -116,6 +122,7 @@ impl Config {
     pub fn new() -> Self {
         Self {
             widgets_id_table: Self::parse_widgets_id(DEFAULT_WIDGETS_ID),
+            inhibit_idle: true,
             ..Default::default()
         }
     }
@@ -264,6 +271,15 @@ impl Config {
     /// ```
     pub fn with_skip_plasma_detection(mut self, skip: bool) -> Self {
         self.skip_plasma_detection = skip;
+        self
+    }
+
+    /// Sets whether to inhibit system idle/sleep/shutdown during installs.
+    ///
+    /// Defaults to `true`. Set to `false` if the calling application handles
+    /// its own power management inhibition (e.g., a GUI app using DBus directly).
+    pub fn with_inhibit_idle(mut self, inhibit: bool) -> Self {
+        self.inhibit_idle = inhibit;
         self
     }
 }

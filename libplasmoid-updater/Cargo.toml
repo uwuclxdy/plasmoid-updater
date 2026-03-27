@@ -12,8 +12,9 @@ homepage = "https://github.com/uwuclxdy/plasmoid-updater"
 documentation = "https://docs.rs/libplasmoid-updater"
 
 [features]
-default = ["cli"]
+default = ["cli", "inhibit"]
 cli = ["indicatif", "comfy-table", "bytesize", "inquire", "is-terminal", "terminal_size"]
+inhibit = ["zbus"]
 debug = []
 
 [dependencies]
@@ -35,6 +36,7 @@ chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 fs_extra = "1.3.0"
 freedesktop_entry_parser = "2.0.1"
 nix = { version = "0.31.2", features = ["fs", "user"] }
+zbus = { version = "5.14.0", default-features = false, optional = true }
 
 # CLI-only dependencies
 indicatif = { version = "0.18.4", optional = true }
