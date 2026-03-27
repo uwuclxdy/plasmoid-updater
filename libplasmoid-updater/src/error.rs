@@ -65,12 +65,15 @@ pub enum Error {
 
     #[error("no updates available")]
     NoUpdatesAvailable,
+
+    #[error("another plasmoid-updater instance is already running")]
+    AlreadyRunning,
 }
 
 impl Error {
     /// Returns `true` for expected, non-error conditions (e.g., no updates found).
     pub fn is_skippable(&self) -> bool {
-        matches!(self, Self::NoUpdatesAvailable | Self::ComponentNotFound(_))
+        matches!(self, Self::NoUpdatesAvailable | Self::ComponentNotFound(_) | Self::AlreadyRunning)
     }
 
     /// Returns `true` for temporary failures that may succeed on retry.
