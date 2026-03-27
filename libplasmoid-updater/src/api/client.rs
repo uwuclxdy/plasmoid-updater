@@ -192,6 +192,11 @@ impl ApiClient {
         thread::sleep(Duration::from_secs(secs));
         self.request_count.fetch_add(1, Ordering::Relaxed);
         let r = self.client.get(url).send()?;
+
+        if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(Error::RateLimited);
+        }
+
         let xml = r.text()?;
         parse_ocs_response(&xml)
     }
