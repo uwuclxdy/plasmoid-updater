@@ -151,15 +151,26 @@ impl ApiClient {
         let mut backoff_ms = self.config.initial_backoff_ms;
 
         for attempt in 0..self.config.max_retries {
-            let response = {
-                self.request_count.fetch_add(1, Ordering::Relaxed);
-                let r = self.client.get(url).send()?;
-                let xml = r.text()?;
-                parse_ocs_response(&xml)
-            };
-            match response {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+            let r = self.client.get(url).send()?;
+            let retry_after_secs = parse_retry_after(&r);
+
+            // HTTP 429: respect Retry-After with a single retry.
+            if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return match retry_after_secs {
+                    Some(secs) => self.send_after(url, secs),
+                    None => Err(Error::RateLimited),
+                };
+            }
+
+            let xml = r.text()?;
+            match parse_ocs_response(&xml) {
                 Ok(result) => return Ok(result),
-                // Only retry potentially-transient errors (garbled XML, rate limits).
+                // OCS rate limit with Retry-After: respect it with a single retry.
+                Err(Error::RateLimited) if retry_after_secs.is_some() => {
+                    return self.send_after(url, retry_after_secs.unwrap());
+                }
+                // Retry transient errors (including OCS rate limit without Retry-After).
                 // ApiError is a deterministic OCS status — retrying wastes a request.
                 Err(ref e)
                     if !matches!(e, Error::ApiError(_))
@@ -174,4 +185,24 @@ impl ApiClient {
 
         Err(Error::other("max retries exceeded"))
     }
+
+    /// Sleeps for `secs` then sends one retry request.
+    fn send_after(&self, url: &str, secs: u64) -> Result<(Vec<StoreEntry>, Meta)> {
+        log::info!(target: "api", "rate limited, retrying after {secs}s");
+        thread::sleep(Duration::from_secs(secs));
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        let r = self.client.get(url).send()?;
+        let xml = r.text()?;
+        parse_ocs_response(&xml)
+    }
+}
+
+fn parse_retry_after(response: &reqwest::blocking::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
