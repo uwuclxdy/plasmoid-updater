@@ -221,7 +221,13 @@ pub(crate) fn handle_restart(config: &Config, updates: &[AvailableUpdate], resul
     if result.succeeded.is_empty() {
         return;
     }
-    if !installer::any_requires_restart(updates) {
+
+    let succeeded_updates: Vec<&AvailableUpdate> = updates
+        .iter()
+        .filter(|u| result.succeeded.contains(&u.installed.name))
+        .collect();
+
+    if !installer::any_requires_restart(&succeeded_updates) {
         return;
     }
 

@@ -55,7 +55,7 @@ fn requires_plasmashell_restart(component: &InstalledComponent) -> bool {
 }
 
 /// Returns `true` if any of the updates require a plasmashell restart.
-pub(crate) fn any_requires_restart(updates: &[AvailableUpdate]) -> bool {
+pub(crate) fn any_requires_restart(updates: &[&AvailableUpdate]) -> bool {
     updates
         .iter()
         .any(|u| requires_plasmashell_restart(&u.installed))
