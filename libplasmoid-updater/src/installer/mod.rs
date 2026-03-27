@@ -24,8 +24,20 @@ use crate::{
 };
 use backup::{backup_component, restore_component};
 
+use crate::version::normalize_version;
+
 pub(crate) use lock::UpdateLock;
 pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
+
+/// Outcome of a single component update, including post-install verification.
+pub(crate) struct InstallOutcome {
+    /// `true` if the post-install version matches the expected version.
+    pub verified: bool,
+    /// The version we expected to install.
+    pub expected_version: String,
+    /// The version actually found on disk after install, if readable.
+    pub actual_version: Option<String>,
+}
 
 /// Updates a single component using the provided HTTP client.
 ///
@@ -40,7 +52,7 @@ pub(crate) fn update_component(
     client: &reqwest::blocking::Client,
     reporter: impl Fn(u8),
     counter: &AtomicUsize,
-) -> Result<()> {
+) -> Result<InstallOutcome> {
     let component = &update.installed;
 
     let backup_path = create_backup(component)?;
@@ -49,8 +61,9 @@ pub(crate) fn update_component(
     match perform_installation(update, client, &reporter, counter) {
         Ok(()) => {
             post_install_tasks(update)?;
+            let outcome = verify_installed_version(update);
             log::info!(target: "update", "updated {}", component.name);
-            Ok(())
+            Ok(outcome)
         }
         Err(e) => {
             log::error!(target: "install", "failed for {}: {e}", component.name);
@@ -188,6 +201,84 @@ fn post_install_tasks(update: &AvailableUpdate) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn verify_installed_version(update: &AvailableUpdate) -> InstallOutcome {
+    let component = &update.installed;
+    let expected = &update.latest_version;
+
+    let actual = read_installed_version(component);
+
+    let verified = match &actual {
+        Some(v) => normalize_version(v) == normalize_version(expected),
+        None => false,
+    };
+
+    if verified {
+        log::debug!(
+            target: "verify",
+            "{}: version {} confirmed",
+            component.name, expected,
+        );
+    } else {
+        log::warn!(
+            target: "verify",
+            "{}: expected version {}, found {}",
+            component.name,
+            expected,
+            actual.as_deref().unwrap_or("(unreadable)"),
+        );
+    }
+
+    InstallOutcome {
+        verified,
+        expected_version: expected.clone(),
+        actual_version: actual,
+    }
+}
+
+fn read_installed_version(component: &InstalledComponent) -> Option<String> {
+    // For registry-only types, read from the KNewStuff registry
+    if component.component_type.registry_only() {
+        return read_version_from_registry(component);
+    }
+
+    // Try metadata.json first
+    let json_path = component.path.join("metadata.json");
+    if json_path.exists() {
+        if let Ok(content) = fs::read_to_string(&json_path) {
+            if let Ok(meta) = serde_json::from_str::<crate::types::PackageMetadata>(&content) {
+                if let Some(v) = meta.version() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+
+    // Fall back to metadata.desktop
+    let desktop_path = component.path.join("metadata.desktop");
+    if desktop_path.exists() {
+        if let Ok(content) = fs::read_to_string(&desktop_path) {
+            for line in content.lines() {
+                if let Some(version) = line.strip_prefix("X-KDE-PluginInfo-Version=") {
+                    return Some(version.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn read_version_from_registry(component: &InstalledComponent) -> Option<String> {
+    use crate::registry::RegistryManager;
+
+    let manager = RegistryManager::for_component_type(component.component_type)?;
+    let entries = manager.read_entries().ok()?;
+    entries
+        .iter()
+        .find(|e| e.name == component.name || e.installed_path == component.path)
+        .map(|e| e.version.clone())
 }
 
 fn handle_installation_failure(backup_path: &Path, component_path: &Path) -> Result<()> {
