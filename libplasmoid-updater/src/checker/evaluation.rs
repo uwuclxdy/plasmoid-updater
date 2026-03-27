@@ -41,7 +41,20 @@ pub(crate) fn check_component(
         return ComponentCheckResult::Unresolved(diagnostic);
     };
 
-    let Some(entry) = resolution::find_store_entry(store_entries, content_id) else {
+    // Try to find the entry by resolved ID; if not found, retry with name match.
+    // This handles stale registry entries pointing to delisted/re-uploaded content.
+    let entry = resolution::find_store_entry(store_entries, content_id).or_else(|| {
+        log::debug!(
+            target: "resolver",
+            "registry id {} not in catalog for '{}', retrying name match",
+            content_id,
+            component.name
+        );
+        resolution::resolve_by_name_only(component, store_entries)
+            .and_then(|fallback_id| resolution::find_store_entry(store_entries, fallback_id))
+    });
+
+    let Some(entry) = entry else {
         log::debug!(
             target: "resolver",
             "store entry not found for id {} ({})",
@@ -56,7 +69,7 @@ pub(crate) fn check_component(
         return ComponentCheckResult::Unresolved(diagnostic);
     };
 
-    evaluate_store_entry(component, entry, content_id)
+    evaluate_store_entry(component, entry, entry.id)
 }
 
 /// Shared logic for evaluating a store entry against an installed component.
@@ -108,4 +121,90 @@ pub(crate) fn evaluate_store_entry(
     .build();
 
     ComponentCheckResult::Update(Box::new(update))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ComponentType, DownloadLink};
+    use std::{collections::HashMap, path::PathBuf};
+
+    fn make_component(name: &str, dir_name: &str) -> InstalledComponent {
+        InstalledComponent {
+            name: name.to_string(),
+            directory_name: dir_name.to_string(),
+            version: "1.0.0".to_string(),
+            component_type: ComponentType::PlasmaWidget,
+            path: PathBuf::from("/tmp/test"),
+            is_system: false,
+            release_date: "2024-01-01".to_string(),
+        }
+    }
+
+    fn make_entry(id: u64, name: &str, version: &str, type_id: u16) -> StoreEntry {
+        StoreEntry {
+            id,
+            name: name.to_string(),
+            version: version.to_string(),
+            type_id,
+            download_links: vec![DownloadLink {
+                url: "https://example.com/download.tar.gz".to_string(),
+                version: version.to_string(),
+                checksum: None,
+                size_kb: None,
+            }],
+            changed_date: "2025-06-01".to_string(),
+        }
+    }
+
+    #[test]
+    fn stale_registry_id_falls_back_to_name_match() {
+        let component = make_component("Cool Widget", "org.example.cool");
+        let store_entries = vec![make_entry(222, "Cool Widget", "2.0.0", 705)];
+
+        let mut reg = HashMap::new();
+        reg.insert("org.example.cool".to_string(), 111_u64);
+        let wid = HashMap::new();
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+
+        let result = check_component(&component, &store_entries, &lookup);
+        assert!(matches!(result, ComponentCheckResult::Update(_)));
+    }
+
+    #[test]
+    fn valid_registry_id_still_works() {
+        let component = make_component("My Widget", "org.example.widget");
+        let store_entries = vec![make_entry(100, "My Widget", "2.0.0", 705)];
+
+        let mut reg = HashMap::new();
+        reg.insert("org.example.widget".to_string(), 100_u64);
+        let wid = HashMap::new();
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+
+        let result = check_component(&component, &store_entries, &lookup);
+        assert!(matches!(result, ComponentCheckResult::Update(_)));
+    }
+
+    #[test]
+    fn stale_id_with_no_name_match_reports_unresolved() {
+        let component = make_component("Missing Widget", "org.example.missing");
+        let store_entries = vec![make_entry(222, "Other Widget", "2.0.0", 705)];
+
+        let mut reg = HashMap::new();
+        reg.insert("org.example.missing".to_string(), 111_u64);
+        let wid = HashMap::new();
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+
+        let result = check_component(&component, &store_entries, &lookup);
+        assert!(matches!(result, ComponentCheckResult::Unresolved(_)));
+    }
 }

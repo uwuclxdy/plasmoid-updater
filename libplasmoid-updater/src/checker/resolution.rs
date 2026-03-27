@@ -88,7 +88,6 @@ pub(crate) fn find_store_entry(entries: &[StoreEntry], content_id: u64) -> Optio
 
 /// Name-only resolution without registry/table lookups.
 /// Used as a fallback when the primary resolved ID is absent from fetched data.
-#[expect(dead_code, reason = "will be used by stale-ID fallback in a follow-up change")]
 pub(crate) fn resolve_by_name_only(
     component: &InstalledComponent,
     store_entries: &[StoreEntry],
