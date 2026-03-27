@@ -6,6 +6,7 @@
 
 mod backup;
 mod download;
+mod inhibit;
 mod install;
 mod lock;
 mod plasmashell;
@@ -26,6 +27,7 @@ use backup::{backup_component, restore_component};
 
 use crate::version::normalize_version;
 
+pub(crate) use inhibit::InhibitGuard;
 pub(crate) use lock::UpdateLock;
 pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
 

@@ -278,7 +278,7 @@ fn find_target_index(xml: &str, directory_name: &str) -> Option<usize> {
                     )
                 {
                     // Check path segments at byte level — no UTF-8 conversion needed.
-                    current_matches = e.as_ref().split(|&b| b == b'/').any(|seg| seg == dir_bytes);
+                    current_matches = (*e).split(|&b| b == b'/').any(|seg| seg == dir_bytes);
                 }
             }
             Ok(Event::End(e)) => {
