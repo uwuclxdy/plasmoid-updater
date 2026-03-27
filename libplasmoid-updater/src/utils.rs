@@ -149,6 +149,12 @@ pub(crate) fn install_selected_updates(
 ) -> crate::Result<UpdateResult> {
     let result = Arc::new(parking_lot::Mutex::new(UpdateResult::default()));
 
+    let _inhibit = if config.inhibit_idle {
+        installer::InhibitGuard::acquire()
+    } else {
+        installer::InhibitGuard::None
+    };
+
     #[cfg(feature = "cli")]
     let ui = cli::update_ui::UpdateUi::new(updates);
 
