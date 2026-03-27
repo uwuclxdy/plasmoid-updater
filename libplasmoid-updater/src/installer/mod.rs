@@ -143,7 +143,18 @@ fn install_from_archive(
     reporter(3);
 
     let result = if component.component_type.kpackage_type().is_some() {
-        install::install_via_kpackage(&extract_dir, component, new_version)
+        match install::install_via_kpackage(&extract_dir, component, new_version) {
+            Ok(()) => Ok(()),
+            Err(e) if component.component_type.has_direct_fallback() => {
+                log::warn!(
+                    target: "install",
+                    "kpackagetool6 failed for {}, falling back to direct install: {e}",
+                    component.name,
+                );
+                install::install_direct(&extract_dir, component)
+            }
+            Err(e) => Err(e),
+        }
     } else {
         install::install_direct(&extract_dir, component)
     };
