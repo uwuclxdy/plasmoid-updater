@@ -159,25 +159,20 @@ pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) ->
 /// Installs or updates a component package using `kpackagetool6`.
 fn install_via_kpackagetool(
     package_dir: &Path,
-    component_type: ComponentType,
+    _component_type: ComponentType,
     global: bool,
 ) -> Result<()> {
-    let kpackage_type = component_type
-        .kpackage_type()
-        .ok_or_else(|| Error::install(format!("{component_type} has no kpackage type")))?;
-
     let mut cmd = if global {
         privilege::sudo_command("kpackagetool6")
     } else {
         std::process::Command::new("kpackagetool6")
     };
-    cmd.args(["-t", kpackage_type]);
 
     if global {
         cmd.arg("--global");
     }
 
-    cmd.args(["-u", &package_dir.to_string_lossy()]);
+    cmd.arg("-u").arg(package_dir);
 
     let output = cmd
         .output()
