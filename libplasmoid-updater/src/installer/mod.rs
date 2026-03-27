@@ -7,6 +7,7 @@
 mod backup;
 mod download;
 mod install;
+mod lock;
 mod plasmashell;
 pub(crate) mod privilege;
 
@@ -23,6 +24,7 @@ use crate::{
 };
 use backup::{backup_component, restore_component};
 
+pub(crate) use lock::UpdateLock;
 pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
 
 /// Updates a single component using the provided HTTP client.
