@@ -4,8 +4,7 @@ use bytesize::ByteSize;
 use comfy_table::{Attribute, Cell, CellAlignment, Table, presets};
 
 use crate::{
-    FailedUpdate,
-    UpdateResult,
+    FailedUpdate, UpdateResult,
     types::{AvailableUpdate, InstalledComponent},
 };
 
@@ -112,10 +111,7 @@ pub fn print_summary(update_result: &UpdateResult) {
             total,
         );
         for u in &update_result.unverified {
-            let actual = u
-                .actual_version
-                .as_deref()
-                .unwrap_or("(unreadable)");
+            let actual = u.actual_version.as_deref().unwrap_or("(unreadable)");
             println!(
                 "  unverified: {} — expected {}, found {}",
                 u.name, u.expected_version, actual,

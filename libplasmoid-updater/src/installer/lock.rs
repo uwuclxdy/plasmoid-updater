@@ -23,9 +23,8 @@ impl UpdateLock {
         let lock_path = paths::runtime_dir().join("plasmoid-updater.lock");
 
         if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Error::other(format!("failed to create lock directory: {e}"))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::other(format!("failed to create lock directory: {e}")))?;
         }
 
         let file = OpenOptions::new()
@@ -44,9 +43,9 @@ impl UpdateLock {
                 log::debug!(target: "lock", "another instance is running");
                 Err(Error::AlreadyRunning)
             }
-            Err((_, errno)) => {
-                Err(Error::other(format!("failed to acquire update lock: {errno}")))
-            }
+            Err((_, errno)) => Err(Error::other(format!(
+                "failed to acquire update lock: {errno}"
+            ))),
         }
     }
 }

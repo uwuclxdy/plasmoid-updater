@@ -21,7 +21,10 @@ pub(crate) fn runtime_dir() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(format!("/tmp/plasmoid-updater-{}", nix::unistd::Uid::effective()))
+            PathBuf::from(format!(
+                "/tmp/plasmoid-updater-{}",
+                nix::unistd::Uid::effective()
+            ))
         })
 }
 

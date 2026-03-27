@@ -75,7 +75,12 @@ fn resolve_id_locally(component: &InstalledComponent, lookup: &IdLookup) -> Opti
         .registry_id_cache
         .get(&component.directory_name)
         .copied()
-        .or_else(|| lookup.widgets_id_table.get(&component.directory_name).copied())
+        .or_else(|| {
+            lookup
+                .widgets_id_table
+                .get(&component.directory_name)
+                .copied()
+        })
 }
 
 fn distinct_types(components: &[InstalledComponent]) -> Vec<ComponentType> {

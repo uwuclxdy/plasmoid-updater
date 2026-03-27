@@ -65,7 +65,13 @@ pub(crate) fn check_with_components(
         }
     }
 
-    registry::check_components(&registry_components, api_client, &store_entries, &lookup, &mut result);
+    registry::check_components(
+        &registry_components,
+        api_client,
+        &store_entries,
+        &lookup,
+        &mut result,
+    );
 
     Ok(result)
 }

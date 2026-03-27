@@ -72,7 +72,12 @@ fn try_dbus_inhibit() -> Option<InhibitGuard> {
         "/org/freedesktop/login1",
         Some("org.freedesktop.login1.Manager"),
         "Inhibit",
-        &("idle:sleep:shutdown", "plasmoid-updater", "Installing updates", "block"),
+        &(
+            "idle:sleep:shutdown",
+            "plasmoid-updater",
+            "Installing updates",
+            "block",
+        ),
     ) {
         Ok(r) => r,
         Err(e) => {

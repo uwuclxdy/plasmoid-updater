@@ -62,7 +62,10 @@ fn scan_directory(
     dir: &Path,
     default_type: ComponentType,
     is_system: bool,
-    registry_maps: &[(ComponentType, std::collections::HashMap<String, registry::RegistryEntry>)],
+    registry_maps: &[(
+        ComponentType,
+        std::collections::HashMap<String, registry::RegistryEntry>,
+    )],
 ) -> Result<Vec<InstalledComponent>> {
     let mut components = Vec::new();
 

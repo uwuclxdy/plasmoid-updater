@@ -279,7 +279,9 @@ fn read_version_from_registry(component: &InstalledComponent) -> Option<String> 
         .iter()
         .find(|e| {
             e.name == component.name
-                || e.installed_path.components().eq(component.path.components())
+                || e.installed_path
+                    .components()
+                    .eq(component.path.components())
         })
         .map(|e| e.version.clone())
 }

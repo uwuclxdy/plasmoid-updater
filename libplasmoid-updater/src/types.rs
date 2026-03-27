@@ -115,9 +115,7 @@ impl ComponentType {
     /// checked against all possible types to assign the correct `ComponentType`.
     pub(crate) fn shared_path_types(self) -> &'static [ComponentType] {
         match self {
-            Self::GlobalTheme | Self::SplashScreen => {
-                &[Self::GlobalTheme, Self::SplashScreen]
-            }
+            Self::GlobalTheme | Self::SplashScreen => &[Self::GlobalTheme, Self::SplashScreen],
             Self::PlasmaWidget => &[Self::PlasmaWidget],
             Self::WallpaperPlugin => &[Self::WallpaperPlugin],
             Self::KWinEffect => &[Self::KWinEffect],

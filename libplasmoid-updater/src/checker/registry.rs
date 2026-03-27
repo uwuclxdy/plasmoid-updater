@@ -19,9 +19,7 @@ pub(crate) fn check_components(
 ) {
     let resolved: Vec<(&InstalledComponent, u64)> = registry_components
         .iter()
-        .filter_map(|c| {
-            resolution::resolve_content_id(c, store_entries, lookup).map(|id| (c, id))
-        })
+        .filter_map(|c| resolution::resolve_content_id(c, store_entries, lookup).map(|id| (c, id)))
         .collect();
 
     // Reuse any entries already present in store_entries; fetch only the rest.

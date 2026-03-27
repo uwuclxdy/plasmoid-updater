@@ -139,8 +139,11 @@ mod tests {
 
     #[test]
     fn name_match_ignores_type_id() {
-        let component =
-            make_component("My Widget", "org.example.widget", ComponentType::PlasmaWidget);
+        let component = make_component(
+            "My Widget",
+            "org.example.widget",
+            ComponentType::PlasmaWidget,
+        );
         let entries = vec![make_entry(999, "My Widget", 714)];
         let (wid, reg) = empty_lookup();
         let lookup = IdLookup {
@@ -154,8 +157,7 @@ mod tests {
 
     #[test]
     fn name_match_prefers_same_type_when_ambiguous() {
-        let component =
-            make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
+        let component = make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
         let entries = vec![make_entry(100, "Clock", 708), make_entry(200, "Clock", 299)];
         let (wid, reg) = empty_lookup();
         let lookup = IdLookup {
@@ -169,8 +171,11 @@ mod tests {
 
     #[test]
     fn name_match_falls_back_to_any_type_when_no_type_match() {
-        let component =
-            make_component("Fancy Thing", "org.example.fancy", ComponentType::KWinEffect);
+        let component = make_component(
+            "Fancy Thing",
+            "org.example.fancy",
+            ComponentType::KWinEffect,
+        );
         let entries = vec![make_entry(555, "Fancy Thing", 705)];
         let (wid, reg) = empty_lookup();
         let lookup = IdLookup {
@@ -246,8 +251,11 @@ mod tests {
 
     #[test]
     fn registry_cache_takes_priority_over_name() {
-        let component =
-            make_component("My Widget", "org.example.widget", ComponentType::PlasmaWidget);
+        let component = make_component(
+            "My Widget",
+            "org.example.widget",
+            ComponentType::PlasmaWidget,
+        );
         let entries = vec![make_entry(200, "My Widget", 705)];
         let wid = HashMap::new();
         let mut reg = HashMap::new();

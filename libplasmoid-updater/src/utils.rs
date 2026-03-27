@@ -200,7 +200,10 @@ pub(crate) fn install_selected_updates(
                 Err(e) => {
                     #[cfg(feature = "cli")]
                     ui.complete_task(index, false);
-                    result.lock().failed.push(FailedUpdate { name, error: e.to_string() });
+                    result.lock().failed.push(FailedUpdate {
+                        name,
+                        error: e.to_string(),
+                    });
                 }
             }
         });
