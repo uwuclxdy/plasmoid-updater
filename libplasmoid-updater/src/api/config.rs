@@ -5,7 +5,7 @@ use std::time::Duration;
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kde-look.org/ocs/v1";
 pub(crate) const DEFAULT_PAGE_SIZE: u8 = 100;
 pub(crate) const DEFAULT_MAX_RETRIES: u8 = 3;
-pub(crate) const DEFAULT_INITIAL_BACKOFF_MS: u8 = 100;
+pub(crate) const DEFAULT_INITIAL_BACKOFF_MS: u32 = 100;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_DOWNLOAD_LINKS: usize = 64;
@@ -17,7 +17,7 @@ pub(super) struct ApiConfig {
     pub(super) base_url: &'static str,
     pub(super) page_size: u8,
     pub(super) max_retries: u8,
-    pub(super) initial_backoff_ms: u8,
+    pub(super) initial_backoff_ms: u32,
 }
 
 impl Default for ApiConfig {
