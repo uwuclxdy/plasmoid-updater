@@ -40,9 +40,12 @@ impl UpdateLock {
                 log::debug!(target: "lock", "acquired update lock at {}", lock_path.display());
                 Ok(Self { _flock: flock })
             }
-            Err((_, errno)) => {
-                log::debug!(target: "lock", "lock acquisition failed: {errno}");
+            Err((_, errno)) if errno == nix::errno::Errno::EWOULDBLOCK => {
+                log::debug!(target: "lock", "another instance is running");
                 Err(Error::AlreadyRunning)
+            }
+            Err((_, errno)) => {
+                Err(Error::other(format!("failed to acquire update lock: {errno}")))
             }
         }
     }
