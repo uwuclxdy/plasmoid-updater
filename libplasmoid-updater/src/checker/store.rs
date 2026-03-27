@@ -36,7 +36,7 @@ pub(crate) fn fetch_store_entries(
         return Ok(Vec::new());
     }
 
-    let known_ids: Vec<u64> = regular_components
+    let known_ids: HashSet<u64> = regular_components
         .iter()
         .filter_map(|c| resolve_id_locally(c, lookup))
         .collect();
@@ -50,7 +50,8 @@ pub(crate) fn fetch_store_entries(
     // (e.g. old/unlisted components that no longer appear in recent pages).
     let catalog_ids: HashSet<u64> = catalog_entries.iter().map(|e| e.id).collect();
     let missing_ids: Vec<u64> = known_ids
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|id| !catalog_ids.contains(id))
         .collect();
 
