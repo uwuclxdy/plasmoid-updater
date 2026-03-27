@@ -81,8 +81,25 @@ impl ComponentType {
             Self::KWinEffect => Some("KWin/Effect"),
             Self::KWinScript => Some("KWin/Script"),
             Self::KWinSwitcher => Some("KWin/WindowSwitcher"),
+            Self::GlobalTheme => Some("Plasma/LookAndFeel"),
+            Self::PlasmaStyle => Some("Plasma/Theme"),
+            Self::SplashScreen => Some("Plasma/LookAndFeel"),
             _ => None,
         }
+    }
+
+    /// Returns `true` if this type can fall back to direct file installation
+    /// when `kpackagetool6` fails.
+    ///
+    /// Only the newly-added kpackage types (GlobalTheme, PlasmaStyle, SplashScreen)
+    /// have this fallback, since they previously worked with direct install.
+    /// The original 5 types (PlasmaWidget, WallpaperPlugin, KWinEffect, KWinScript,
+    /// KWinSwitcher) have always required kpackagetool6 and have no fallback.
+    pub(crate) const fn has_direct_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::GlobalTheme | Self::PlasmaStyle | Self::SplashScreen
+        )
     }
 
     /// Returns true if this type uses registry-based discovery only
