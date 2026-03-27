@@ -93,13 +93,25 @@ pub fn print_error_table(update_result: &UpdateResult) {
 pub fn print_summary(update_result: &UpdateResult) {
     let total =
         update_result.succeeded.len() + update_result.failed.len() + update_result.skipped.len();
-    println!(
-        "Update Summary: {} succeeded, {} failed, {} skipped ({} total)",
-        update_result.succeeded.len(),
-        update_result.failed.len(),
-        update_result.skipped.len(),
-        total
-    );
+
+    if update_result.unverified.is_empty() {
+        println!(
+            "Update Summary: {} succeeded, {} failed, {} skipped ({} total)",
+            update_result.succeeded.len(),
+            update_result.failed.len(),
+            update_result.skipped.len(),
+            total,
+        );
+    } else {
+        println!(
+            "Update Summary: {} succeeded ({} unverified), {} failed, {} skipped ({} total)",
+            update_result.succeeded.len(),
+            update_result.unverified.len(),
+            update_result.failed.len(),
+            update_result.skipped.len(),
+            total,
+        );
+    }
 }
 
 pub fn print_count_message(count: usize, item_type: &str) {
