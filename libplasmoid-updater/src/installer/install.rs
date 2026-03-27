@@ -156,25 +156,73 @@ pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) ->
 
 // --- kpackagetool Installation ---
 
-/// Installs or updates a component package using `kpackagetool6`.
-fn install_via_kpackagetool(
-    package_dir: &Path,
-    _component_type: ComponentType,
-    global: bool,
-) -> Result<()> {
+/// Builds a base `kpackagetool6` command with `-t <type>`, `sudo`, and `--global` as needed.
+fn kpackagetool_cmd(kpackage_type: &str, global: bool) -> std::process::Command {
     let mut cmd = if global {
         privilege::sudo_command("kpackagetool6")
     } else {
         std::process::Command::new("kpackagetool6")
     };
-
+    cmd.arg("-t").arg(kpackage_type);
     if global {
         cmd.arg("--global");
     }
+    cmd
+}
 
-    cmd.arg("-u").arg(package_dir);
+/// Installs or updates a component package using `kpackagetool6`.
+///
+/// Tries `-u` (update) first. If that fails (e.g. stale kpackage DB entry after
+/// manual deletion), removes the old entry with `-r` and retries with `-i` (install).
+fn install_via_kpackagetool(
+    package_dir: &Path,
+    component: &InstalledComponent,
+    global: bool,
+) -> Result<()> {
+    let kpackage_type = component
+        .component_type
+        .kpackage_type()
+        .expect("install_via_kpackagetool called without kpackage_type");
 
-    let output = cmd
+    // Try update first — the common path
+    let output = kpackagetool_cmd(kpackage_type, global)
+        .arg("-u")
+        .arg(package_dir)
+        .output()
+        .map_err(|e| Error::install(format!("failed to run kpackagetool6: {e}")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    log::debug!(
+        target: "install",
+        "kpackagetool6 -u failed for {}: {}",
+        component.name,
+        stderr.trim(),
+    );
+
+    // Remove stale DB entry (ignore failure — it may not exist)
+    let remove_output = kpackagetool_cmd(kpackage_type, global)
+        .arg("-r")
+        .arg(&component.directory_name)
+        .output();
+
+    if let Ok(ref out) = remove_output
+        && out.status.success()
+    {
+        log::debug!(
+            target: "install",
+            "removed stale kpackage entry for {}",
+            component.directory_name,
+        );
+    }
+
+    // Fresh install
+    let output = kpackagetool_cmd(kpackage_type, global)
+        .arg("-i")
+        .arg(package_dir)
         .output()
         .map_err(|e| Error::install(format!("failed to run kpackagetool6: {e}")))?;
 
@@ -213,7 +261,7 @@ pub(super) fn install_via_kpackage(
     }
 
     let is_global = privilege::is_system_path(&component.path);
-    install_via_kpackagetool(&package_dir, component.component_type, is_global)
+    install_via_kpackagetool(&package_dir, component, is_global)
 }
 
 // --- Component Locators ---
