@@ -167,6 +167,9 @@ pub struct UpdateResult {
     pub succeeded: Vec<String>,
     pub failed: Vec<FailedUpdate>,
     pub skipped: Vec<String>,
+    /// Components that installed successfully but whose post-install version
+    /// could not be verified to match the expected version.
+    pub unverified: Vec<String>,
 }
 
 impl UpdateResult {
@@ -177,7 +180,10 @@ impl UpdateResult {
 
     /// Returns `true` if no update actions were attempted.
     pub fn is_empty(&self) -> bool {
-        self.succeeded.is_empty() && self.failed.is_empty() && self.skipped.is_empty()
+        self.succeeded.is_empty()
+            && self.failed.is_empty()
+            && self.skipped.is_empty()
+            && self.unverified.is_empty()
     }
 
     /// Returns the number of successfully updated components.
@@ -230,7 +236,7 @@ pub fn install_update(update: &AvailableUpdate, _config: &Config) -> Result<()> 
     let _lock = installer::UpdateLock::acquire()?;
     let api_client = ApiClient::new();
     let counter = api_client.request_counter();
-    installer::update_component(update, api_client.http_client(), |_| {}, &counter)
+    installer::update_component(update, api_client.http_client(), |_| {}, &counter).map(|_| ())
 }
 
 /// Discovers and prints all installed KDE components as a formatted table.

@@ -176,10 +176,14 @@ pub(crate) fn install_selected_updates(
 
             match installer::update_component(update, api_client.http_client(), reporter, &counter)
             {
-                Ok(()) => {
+                Ok(outcome) => {
                     #[cfg(feature = "cli")]
                     ui.complete_task(index, true);
-                    result.lock().succeeded.push(name);
+                    let mut r = result.lock();
+                    r.succeeded.push(name.clone());
+                    if !outcome.verified {
+                        r.unverified.push(name);
+                    }
                 }
                 Err(e) => {
                     #[cfg(feature = "cli")]
