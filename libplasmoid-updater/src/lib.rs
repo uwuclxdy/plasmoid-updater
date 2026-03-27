@@ -113,6 +113,7 @@ impl CheckResult {
 ///
 /// Returns an [`Error`] if environment validation, network requests, or installation fails.
 pub fn update(config: &Config) -> Result<UpdateResult> {
+    let _lock = installer::UpdateLock::acquire()?;
     crate::utils::validate_environment(config.skip_plasma_detection)?;
 
     let api_client = ApiClient::new();
@@ -226,6 +227,7 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 ///
 /// Returns an error if download, installation, or backup operations fail.
 pub fn install_update(update: &AvailableUpdate, _config: &Config) -> Result<()> {
+    let _lock = installer::UpdateLock::acquire()?;
     let api_client = ApiClient::new();
     let counter = api_client.request_counter();
     installer::update_component(update, api_client.http_client(), |_| {}, &counter)
