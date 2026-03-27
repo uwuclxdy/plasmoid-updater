@@ -35,7 +35,18 @@ pub(crate) fn check_components(
         .fetch_details(&missing_ids)
         .into_iter()
         .zip(missing_ids.iter())
-        .filter_map(|(r, &id)| r.ok().map(|e| (id, e)))
+        .filter_map(|(r, &id)| match r {
+            Ok(e) => Some((id, e)),
+            Err(e) => {
+                log::warn!(
+                    target: "resolver",
+                    "failed to fetch store entry {}: {}",
+                    id,
+                    e
+                );
+                None
+            }
+        })
         .collect();
 
     for (component, content_id) in &resolved {
