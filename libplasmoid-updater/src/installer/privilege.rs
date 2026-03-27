@@ -61,10 +61,17 @@ pub(crate) fn copy_file(src: &Path, dest: &Path) -> Result<()> {
     }
 }
 
-/// Recursively copies a directory, using sudo if the destination requires it.
+/// Recursively copies a directory's contents, using sudo if the destination requires it.
+///
+/// Uses `cp -rfT` for sudo to avoid creating a nested subdirectory when the
+/// destination already exists.
 pub(crate) fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
     if needs_sudo(dest) {
-        run_sudo(&["cp", "-rf", &src.to_string_lossy(), &dest.to_string_lossy()])
+        run_sudo(&[
+            "cp", "-rfT",
+            &src.to_string_lossy(),
+            &dest.to_string_lossy(),
+        ])
     } else {
         super::backup::copy_dir_recursive(src, dest)
     }
