@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     api::ApiClient,
@@ -23,11 +23,15 @@ pub(crate) fn check_components(
         .collect();
 
     // Reuse any entries already present in store_entries; fetch only the rest.
-    let missing_ids: Vec<u64> = resolved
-        .iter()
-        .filter(|(_, id)| resolution::find_store_entry(store_entries, *id).is_none())
-        .map(|(_, id)| *id)
-        .collect();
+    let missing_ids: Vec<u64> = {
+        let mut seen = HashSet::new();
+        resolved
+            .iter()
+            .filter(|(_, id)| resolution::find_store_entry(store_entries, *id).is_none())
+            .filter(|(_, id)| seen.insert(*id))
+            .map(|(_, id)| *id)
+            .collect()
+    };
 
     let fetched: HashMap<u64, StoreEntry> = client
         .fetch_details(&missing_ids)
