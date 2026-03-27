@@ -159,7 +159,12 @@ impl ApiClient {
             };
             match response {
                 Ok(result) => return Ok(result),
-                Err(_) if attempt + 1 < self.config.max_retries => {
+                // Only retry potentially-transient errors (garbled XML, rate limits).
+                // ApiError is a deterministic OCS status — retrying wastes a request.
+                Err(ref e)
+                    if !matches!(e, Error::ApiError(_))
+                        && attempt + 1 < self.config.max_retries =>
+                {
                     thread::sleep(Duration::from_millis(backoff_ms.into()));
                     backoff_ms = backoff_ms.saturating_mul(2);
                 }
