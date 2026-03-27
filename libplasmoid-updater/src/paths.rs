@@ -16,6 +16,15 @@ pub(crate) fn cache_home() -> PathBuf {
         .unwrap_or_else(|_| user_home().join(".cache"))
 }
 
+/// Returns the XDG runtime directory, or a UID-namespaced /tmp fallback.
+pub(crate) fn runtime_dir() -> PathBuf {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(format!("/tmp/plasmoid-updater-{}", nix::unistd::Uid::effective()))
+        })
+}
+
 /// Returns the KNewStuff3 registry directory.
 pub(crate) fn knewstuff_dir() -> PathBuf {
     data_home().join("knewstuff3")
