@@ -111,6 +111,16 @@ pub fn print_summary(update_result: &UpdateResult) {
             update_result.skipped.len(),
             total,
         );
+        for u in &update_result.unverified {
+            let actual = u
+                .actual_version
+                .as_deref()
+                .unwrap_or("(unreadable)");
+            println!(
+                "  unverified: {} — expected {}, found {}",
+                u.name, u.expected_version, actual,
+            );
+        }
     }
 }
 

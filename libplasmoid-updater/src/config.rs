@@ -278,6 +278,15 @@ impl Config {
     ///
     /// Defaults to `true`. Set to `false` if the calling application handles
     /// its own power management inhibition (e.g., a GUI app using DBus directly).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use libplasmoid_updater::Config;
+    ///
+    /// let config = Config::new().with_inhibit_idle(false);
+    /// assert!(!config.inhibit_idle);
+    /// ```
     pub fn with_inhibit_idle(mut self, inhibit: bool) -> Self {
         self.inhibit_idle = inhibit;
         self

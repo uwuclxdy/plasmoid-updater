@@ -158,6 +158,18 @@ pub struct FailedUpdate {
     pub error: String,
 }
 
+/// A component that installed successfully but whose post-install version
+/// could not be verified to match the expected version.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnverifiedUpdate {
+    /// Display name of the component.
+    pub name: String,
+    /// The version that was expected after install.
+    pub expected_version: String,
+    /// The version actually found on disk, if readable.
+    pub actual_version: Option<String>,
+}
+
 /// Result of performing updates.
 ///
 /// Returned by [`update()`](crate::update). Tracks which components succeeded,
@@ -169,7 +181,7 @@ pub struct UpdateResult {
     pub skipped: Vec<String>,
     /// Components that installed successfully but whose post-install version
     /// could not be verified to match the expected version.
-    pub unverified: Vec<String>,
+    pub unverified: Vec<UnverifiedUpdate>,
 }
 
 impl UpdateResult {

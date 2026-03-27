@@ -32,7 +32,6 @@ pub(crate) use lock::UpdateLock;
 pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
 
 /// Outcome of a single component update, including post-install verification.
-#[allow(dead_code)]
 pub(crate) struct InstallOutcome {
     /// `true` if the post-install version matches the expected version.
     pub verified: bool,
@@ -278,7 +277,10 @@ fn read_version_from_registry(component: &InstalledComponent) -> Option<String> 
     let entries = manager.read_entries().ok()?;
     entries
         .iter()
-        .find(|e| e.name == component.name || e.installed_path == component.path)
+        .find(|e| {
+            e.name == component.name
+                || e.installed_path.components().eq(component.path.components())
+        })
         .map(|e| e.version.clone())
 }
 
