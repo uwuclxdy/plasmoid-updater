@@ -89,13 +89,14 @@ pub(crate) fn is_update_available_with_date(
         return false;
     }
 
-    // if available version is parseable but installed is not, it's an update
-    if available_parsed.is_some() && installed_parsed.is_none() {
-        return true;
+    // Both versions unparseable — fall through to date comparison rather than
+    // assuming an update is available, matching KNewStuff behavior.
+    if installed_parsed.is_none() && available_parsed.is_none() {
+        return is_date_newer(installed_date, available_date);
     }
 
-    // version strings differ as raw text (unparseable but not equal)
-    if !inst_norm.is_empty() && !avail_norm.is_empty() && inst_norm != avail_norm {
+    // if available version is parseable but installed is not, it's an update
+    if available_parsed.is_some() && installed_parsed.is_none() {
         return true;
     }
 
@@ -171,6 +172,33 @@ mod tests {
         let non_ascii = "2024-01-0é";
         let _ = is_update_available_with_date("1.0", "1.0", non_ascii, "2024-01-02");
         let _ = is_update_available_with_date("1.0", "1.0", "2024-01-02", non_ascii);
+    }
+
+    #[test]
+    fn unparseable_versions_fall_back_to_date_comparison() {
+        // Both versions normalize to empty — should use date, not blindly flag as update
+        assert!(is_update_available_with_date(
+            "---",
+            "***",
+            "2024-01-01",
+            "2024-06-01"
+        ));
+        assert!(!is_update_available_with_date(
+            "---",
+            "***",
+            "2024-06-01",
+            "2024-01-01"
+        ));
+    }
+
+    #[test]
+    fn prerelease_detected_as_update_to_release() {
+        assert!(is_update_available_with_date("1.0.0-beta", "1.0.0", "", ""));
+    }
+
+    #[test]
+    fn release_not_downgraded_to_prerelease() {
+        assert!(!is_update_available_with_date("1.0.0", "1.0.0-beta", "", ""));
     }
 
     #[test]
