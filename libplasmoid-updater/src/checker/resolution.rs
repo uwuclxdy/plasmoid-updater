@@ -59,6 +59,11 @@ fn resolve_by_table(
     widgets_id_table.get(&component.directory_name).copied()
 }
 
+/// Returns true if the URL points to a detached signature file rather than an archive.
+fn is_signature_file(url: &str) -> bool {
+    url.ends_with(".asc") || url.ends_with(".sig")
+}
+
 pub(crate) fn select_download_with_info(
     entry: &StoreEntry,
     target_version: &str,
@@ -67,22 +72,31 @@ pub(crate) fn select_download_with_info(
         return None;
     }
 
-    let link = if entry.download_links.len() == 1 {
-        &entry.download_links[0]
+    let candidates: Vec<_> = entry
+        .download_links
+        .iter()
+        .filter(|l| !is_signature_file(&l.url))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let link = if candidates.len() == 1 {
+        candidates[0]
     } else {
         let normalized_target = normalize_version(target_version);
         // Prefer exact match, then normalized match, then first link
-        entry
-            .download_links
+        candidates
             .iter()
             .find(|l| l.version == target_version)
             .or_else(|| {
-                entry
-                    .download_links
+                candidates
                     .iter()
                     .find(|l| normalize_version(&l.version) == normalized_target)
             })
-            .or_else(|| entry.download_links.first())?
+            .or_else(|| candidates.first())
+            .copied()?
     };
 
     Some(DownloadInfo {
@@ -262,6 +276,55 @@ mod tests {
         let result = select_download_with_info(&entry, "2.0.0");
         assert!(result.is_some());
         assert_eq!(result.unwrap().url, "https://example.com/a.tar.gz");
+    }
+
+    #[test]
+    fn download_link_filters_signature_files() {
+        use crate::types::DownloadLink;
+        let entry = StoreEntry {
+            id: 1,
+            name: "Test".to_string(),
+            version: "1.0.0".to_string(),
+            type_id: 705,
+            download_links: vec![
+                DownloadLink {
+                    url: "https://example.com/pkg.tar.gz.asc".to_string(),
+                    version: "1.0.0".to_string(),
+                    checksum: None,
+                    size_kb: None,
+                },
+                DownloadLink {
+                    url: "https://example.com/pkg.tar.gz".to_string(),
+                    version: "1.0.0".to_string(),
+                    checksum: None,
+                    size_kb: None,
+                },
+            ],
+            changed_date: String::new(),
+        };
+        let result = select_download_with_info(&entry, "1.0.0");
+        assert!(result.is_some());
+        assert!(!result.unwrap().url.ends_with(".asc"));
+    }
+
+    #[test]
+    fn download_link_returns_none_if_only_signature() {
+        use crate::types::DownloadLink;
+        let entry = StoreEntry {
+            id: 1,
+            name: "Test".to_string(),
+            version: "1.0.0".to_string(),
+            type_id: 705,
+            download_links: vec![DownloadLink {
+                url: "https://example.com/pkg.tar.gz.asc".to_string(),
+                version: "1.0.0".to_string(),
+                checksum: None,
+                size_kb: None,
+            }],
+            changed_date: String::new(),
+        };
+        let result = select_download_with_info(&entry, "1.0.0");
+        assert!(result.is_none());
     }
 
     #[test]
