@@ -14,11 +14,15 @@ use crate::{Error, Result};
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const DOWNLOAD_BUFFER_SIZE: usize = 8192;
 
-pub(crate) fn temp_dir() -> PathBuf {
-    std::env::var("TMPDIR")
+/// Creates a temporary directory that is automatically cleaned up on drop.
+pub(crate) fn create_temp_dir() -> Result<tempfile::TempDir> {
+    let base = std::env::var("TMPDIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join("plasmoid-updater")
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    tempfile::Builder::new()
+        .prefix("plasmoid-updater-")
+        .tempdir_in(base)
+        .map_err(|e| Error::other(format!("failed to create temp dir: {e}")))
 }
 
 /// Downloads a package with optional checksum verification.
@@ -31,13 +35,11 @@ pub(crate) fn download_package(
     expected_checksum: Option<&str>,
     directory_name: &str,
     counter: &AtomicUsize,
+    temp_path: &Path,
 ) -> Result<PathBuf> {
-    let temp = temp_dir();
-    fs::create_dir_all(&temp)?;
-
     let file_name = url.rsplit('/').next().unwrap_or("package.tar.gz");
 
-    let dest = temp.join(format!("{directory_name}_{file_name}"));
+    let dest = temp_path.join(format!("{directory_name}_{file_name}"));
 
     counter.fetch_add(1, Ordering::Relaxed);
     let response = client
@@ -111,4 +113,19 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_temp_dir_is_raii() {
+        let temp = create_temp_dir().unwrap();
+        let path = temp.path().to_path_buf();
+        assert!(path.exists());
+        std::fs::write(path.join("test.txt"), b"data").unwrap();
+        drop(temp);
+        assert!(!path.exists());
+    }
 }

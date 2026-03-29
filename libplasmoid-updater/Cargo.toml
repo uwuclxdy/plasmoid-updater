@@ -34,6 +34,7 @@ parking_lot = "0.12.5"
 versions = "7.0.0"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 fs_extra = "1.3.0"
+tempfile = "3.27.0"
 freedesktop_entry_parser = "2.0.1"
 nix = { version = "0.31.2", features = ["fs", "user"] }
 zbus = { version = "5.14.0", default-features = false, features = ["async-io", "blocking-api"], optional = true }

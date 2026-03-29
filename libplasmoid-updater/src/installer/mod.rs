@@ -57,10 +57,12 @@ pub(crate) fn update_component(
 ) -> Result<InstallOutcome> {
     let component = &update.installed;
 
+    let temp = download::create_temp_dir()?;
+
     let backup_path = create_backup(component)?;
     reporter(1);
 
-    match perform_installation(update, client, &reporter, counter) {
+    match perform_installation(update, client, &reporter, counter, temp.path()) {
         Ok(()) => {
             post_install_tasks(update)?;
             let outcome = verify_installed_version(update);
@@ -86,6 +88,7 @@ fn perform_installation(
     client: &reqwest::blocking::Client,
     reporter: &dyn Fn(u8),
     counter: &AtomicUsize,
+    temp_path: &Path,
 ) -> Result<()> {
     let component = &update.installed;
     let downloaded_path = download_with_error_handling(
@@ -95,6 +98,7 @@ fn perform_installation(
         &component.name,
         &component.directory_name,
         counter,
+        temp_path,
     )?;
     reporter(2);
 
@@ -103,6 +107,7 @@ fn perform_installation(
         component,
         &update.latest_version,
         reporter,
+        temp_path,
     )
 }
 
@@ -113,11 +118,13 @@ fn download_with_error_handling(
     component_name: &str,
     directory_name: &str,
     counter: &AtomicUsize,
+    temp_path: &Path,
 ) -> Result<PathBuf> {
-    download::download_package(client, url, checksum, directory_name, counter).map_err(|e| {
-        log::error!(target: "download", "failed for {}: {e}", component_name);
-        e
-    })
+    download::download_package(client, url, checksum, directory_name, counter, temp_path)
+        .map_err(|e| {
+            log::error!(target: "download", "failed for {}: {e}", component_name);
+            e
+        })
 }
 
 fn execute_installation(
@@ -125,6 +132,7 @@ fn execute_installation(
     component: &InstalledComponent,
     new_version: &str,
     reporter: &dyn Fn(u8),
+    temp_path: &Path,
 ) -> Result<()> {
     if install::is_single_file_component(downloaded_path, component.component_type) {
         let result = install::install_raw_file(downloaded_path, component);
@@ -132,7 +140,7 @@ fn execute_installation(
         reporter(3);
         result
     } else {
-        install_from_archive(downloaded_path, component, new_version, reporter)
+        install_from_archive(downloaded_path, component, new_version, reporter, temp_path)
     }
 }
 
@@ -141,8 +149,9 @@ fn install_from_archive(
     component: &InstalledComponent,
     new_version: &str,
     reporter: &dyn Fn(u8),
+    temp_path: &Path,
 ) -> Result<()> {
-    let extract_dir = download::temp_dir().join(format!("extract-{}", component.directory_name));
+    let extract_dir = temp_path.join(format!("extract-{}", component.directory_name));
 
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)?;
