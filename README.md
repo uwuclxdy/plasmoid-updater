@@ -12,9 +12,14 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 
 ## Installation
 
-**From source with Cargo:**
+**Using Cargo (Recommended)**
+```
+cargo install plasmoid-updater
+```
 
-```bash
+**From source using Cargo:**
+
+```
 git clone https://github.com/uwuclxdy/plasmoid-updater
 cd plasmoid-updater
 cargo install --path plasmoid-updater/
@@ -26,7 +31,7 @@ Precompiled binary available on [GitHub Releases](https://github.com/uwuclxdy/pl
 
 ## Usage
 
-```bash
+```
 $ plasmoid-updater --help
 update kde plasma components from the kde store
 
@@ -45,7 +50,7 @@ Options:
   -V, --version                Print version
 ```
 
-```bash
+```
 $ plasmoid-updater update --help
 update components
 
