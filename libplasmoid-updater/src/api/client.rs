@@ -98,6 +98,14 @@ impl ApiClient {
         }
 
         let total_pages = total_items.div_ceil(u32::from(page_size));
+
+        if total_pages > 10 {
+            log::warn!(
+                target: "api",
+                "store returned {total_items} items across {total_pages} pages; fetch may be slow"
+            );
+        }
+
         let remaining_pages: Vec<u32> = (1..total_pages).collect();
 
         let results: Vec<Result<(Vec<StoreEntry>, _)>> = remaining_pages
