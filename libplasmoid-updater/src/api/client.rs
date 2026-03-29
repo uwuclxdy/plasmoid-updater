@@ -13,7 +13,6 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::Mutex;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
@@ -101,34 +100,30 @@ impl ApiClient {
         let total_pages = total_items.div_ceil(u32::from(page_size));
         let remaining_pages: Vec<u32> = (1..total_pages).collect();
 
-        let all_entries = Arc::new(Mutex::new(first_entries));
-        let errors = Arc::new(Mutex::new(Vec::new()));
+        let results: Vec<Result<(Vec<StoreEntry>, _)>> = remaining_pages
+            .par_iter()
+            .map(|&page| {
+                let url = format!(
+                    "{base_url}/content/data?categories={category_str}&page={page}&pagesize={page_size}&sort=new"
+                );
+                self.fetch_page(&url)
+            })
+            .collect();
 
-        remaining_pages.par_iter().for_each(|&page| {
-            let url = format!(
-                "{base_url}/content/data?categories={category_str}&page={page}&pagesize={page_size}&sort=new"
-            );
-
-            match self.fetch_page(&url) {
-                Ok((entries, _)) => {
-                    all_entries.lock().extend(entries);
-                }
-                Err(e) => {
-                    errors.lock().push(e);
-                }
+        let mut all_entries = first_entries;
+        let mut error_count = 0usize;
+        for result in results {
+            match result {
+                Ok((entries, _)) => all_entries.extend(entries),
+                Err(_) => error_count += 1,
             }
-        });
-
-        let errors = Arc::try_unwrap(errors)
-            .expect("parallel fetch completed; Arc should have single owner")
-            .into_inner();
-        if !errors.is_empty() {
-            log::warn!(target: "api", "{} page{} failed to fetch", errors.len(), if errors.len() == 1 { "" } else { "s" });
         }
 
-        Ok(Arc::try_unwrap(all_entries)
-            .expect("parallel fetch completed; Arc should have single owner")
-            .into_inner())
+        if error_count > 0 {
+            log::warn!(target: "api", "{error_count} page{} failed to fetch", if error_count == 1 { "" } else { "s" });
+        }
+
+        Ok(all_entries)
     }
 
     /// Fetches content details of multiple components.
