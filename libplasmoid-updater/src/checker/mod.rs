@@ -36,7 +36,7 @@ pub(crate) fn check_with_components(
 
     // Build local caches before any network call so fetch_store_entries
     // can resolve known IDs without touching the paginated catalog.
-    let registry_id_cache = crate::registry::build_id_cache();
+    let registry_id_cache = crate::registry::build_id_cache(config.system);
 
     let lookup = IdLookup {
         widgets_id_table: &config.widgets_id_table,

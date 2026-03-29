@@ -62,11 +62,19 @@ pub(crate) fn registry_path(component_type: ComponentType) -> Option<PathBuf> {
         .map(|f| crate::paths::knewstuff_dir().join(f))
 }
 
-/// Builds a directory_name → content_id lookup cache from all registry files.
+/// Returns true if the given path belongs to a system-wide installation.
+fn is_system_path(path: &str) -> bool {
+    path.starts_with("/usr") || path.starts_with("/lib")
+}
+
+/// Builds a directory_name -> content_id lookup cache from all registry files.
 ///
 /// Reads each registry file once and extracts directory names and content IDs,
 /// eliminating the need for per-component file I/O during resolution.
-pub(crate) fn build_id_cache() -> HashMap<String, u64> {
+///
+/// When `system` is true, only entries whose installed path starts with "/usr"
+/// or "/lib" are included. When false, only user-local entries are included.
+pub(crate) fn build_id_cache(system: bool) -> HashMap<String, u64> {
     let mut cache = HashMap::new();
     let knewstuff = crate::paths::knewstuff_dir();
 
@@ -86,12 +94,29 @@ pub(crate) fn build_id_cache() -> HashMap<String, u64> {
             if let Some(installed_path) = raw.first_installed_path()
                 && let Some(dir_name) = utils::extract_directory_name(&installed_path)
             {
-                cache.insert(dir_name, id);
+                let path_str = installed_path.to_string_lossy();
+                if system == is_system_path(&path_str) {
+                    cache.insert(dir_name, id);
+                }
             }
         }
     }
 
     cache
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_system_path_detects_system_paths() {
+        assert!(is_system_path("/usr/share/plasma/plasmoids/foo"));
+        assert!(is_system_path("/usr/lib/something"));
+        assert!(is_system_path("/lib/firmware/thing"));
+        assert!(!is_system_path("/home/user/.local/share/plasma/plasmoids/foo"));
+        assert!(!is_system_path("/tmp/test"));
+    }
 }
 
 /// Updates the KNS registry after a successful component update.
