@@ -69,7 +69,7 @@ pub(crate) fn update_component(
         }
         Err(e) => {
             log::error!(target: "install", "failed for {}: {e}", component.name);
-            handle_installation_failure(&backup_path, &component.path)?;
+            handle_installation_failure(&backup_path, &component.path, &e)?;
             Err(e)
         }
     }
@@ -286,12 +286,17 @@ fn read_version_from_registry(component: &InstalledComponent) -> Option<String> 
         .map(|e| e.version.clone())
 }
 
-fn handle_installation_failure(backup_path: &Path, component_path: &Path) -> Result<()> {
+fn handle_installation_failure(
+    backup_path: &Path,
+    component_path: &Path,
+    original_error: &Error,
+) -> Result<()> {
     if let Err(restore_err) = restore_component(backup_path, component_path) {
         log::error!(target: "restore", "failed: {restore_err}");
-        Err(Error::other(format!(
-            "installation failed and restore failed: {restore_err}"
-        )))
+        Err(Error::InstallAndRestoreFailed {
+            install_error: original_error.to_string(),
+            restore_error: restore_err.to_string(),
+        })
     } else {
         log::info!(target: "restore", "no changes were made");
         Ok(())

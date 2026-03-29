@@ -60,6 +60,12 @@ pub enum Error {
     #[error("restart failed: {0}")]
     RestartFailed(String),
 
+    #[error("installation failed ({install_error}) and backup restore also failed ({restore_error})")]
+    InstallAndRestoreFailed {
+        install_error: String,
+        restore_error: String,
+    },
+
     #[error("{0}")]
     Other(String),
 
@@ -119,5 +125,32 @@ impl Error {
             expected: expected.into(),
             actual: actual.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_and_restore_failed_displays_both_errors() {
+        let err = Error::InstallAndRestoreFailed {
+            install_error: "extraction failed".to_string(),
+            restore_error: "permission denied".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("extraction failed"));
+        assert!(msg.contains("permission denied"));
+    }
+
+    #[test]
+    fn install_and_restore_failed_is_fatal() {
+        let err = Error::InstallAndRestoreFailed {
+            install_error: "x".to_string(),
+            restore_error: "y".to_string(),
+        };
+        assert!(err.is_fatal());
+        assert!(!err.is_transient());
+        assert!(!err.is_skippable());
     }
 }
