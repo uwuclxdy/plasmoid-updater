@@ -71,8 +71,11 @@ pub(crate) fn is_update_available_with_date(
         return is_date_newer(installed_date, available_date);
     }
 
-    let installed_parsed = Versioning::new(&inst_norm);
-    let available_parsed = Versioning::new(&avail_norm);
+    // Try original strings first — normalization is only needed when raw parsing fails
+    let installed_parsed = Versioning::new(installed_version)
+        .or_else(|| Versioning::new(&inst_norm));
+    let available_parsed = Versioning::new(available_version)
+        .or_else(|| Versioning::new(&avail_norm));
 
     // both versions parseable: use semantic comparison, then date fallback
     if let (Some(inst), Some(avail)) = (&installed_parsed, &available_parsed) {
@@ -158,5 +161,12 @@ mod tests {
     #[test]
     fn normalized_versions_no_update_when_equal() {
         assert!(!is_update_available_with_date("v1.0.0", "v1.0.0", "", ""));
+    }
+
+    #[test]
+    fn v_prefix_still_works_after_normalization_fallback() {
+        // "v1.0.0" is parseable as-is by Versioning, so the raw-first path works
+        assert!(is_update_available_with_date("v1.0.0", "v2.0.0", "", ""));
+        assert!(!is_update_available_with_date("v2.0.0", "v1.0.0", "", ""));
     }
 }
