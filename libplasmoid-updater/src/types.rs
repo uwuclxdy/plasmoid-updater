@@ -70,8 +70,10 @@ impl ComponentType {
         if self.category_id() == type_id {
             return true;
         }
-        // PlasmaWidget (705) is the parent of subcategories 706-713, 723
-        matches!((self, type_id), (Self::PlasmaWidget, 706..=713 | 723))
+        // PlasmaWidget (705) is the parent category. The KDE Store uses
+        // subcategories in the 700-range (706-713, 723, etc.) which can grow
+        // over time, so match the full 700..=799 range to be future-proof.
+        matches!((self, type_id), (Self::PlasmaWidget, 700..=799))
     }
 
     pub(crate) const fn kpackage_type(self) -> Option<&'static str> {
@@ -493,6 +495,21 @@ mod tests {
         assert!(types.contains(&ComponentType::GlobalTheme));
         assert!(types.contains(&ComponentType::SplashScreen));
         assert_eq!(types.len(), 2);
+    }
+
+    #[test]
+    fn plasma_widget_matches_extended_subcategories() {
+        let pw = ComponentType::PlasmaWidget;
+        // Known subcategories
+        assert!(pw.matches_type_id(705)); // parent
+        assert!(pw.matches_type_id(708)); // existing subcat
+        assert!(pw.matches_type_id(723)); // existing subcat
+        // Future subcategories in the 700-range should also match
+        assert!(pw.matches_type_id(750));
+        assert!(pw.matches_type_id(799));
+        // Outside the range should not match
+        assert!(!pw.matches_type_id(699));
+        assert!(!pw.matches_type_id(800));
     }
 
     #[test]
