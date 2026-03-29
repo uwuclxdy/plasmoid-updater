@@ -6,7 +6,7 @@ pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kde-look.org/ocs/v1";
 pub(crate) const DEFAULT_PAGE_SIZE: u8 = 100;
 pub(crate) const DEFAULT_MAX_RETRIES: u8 = 3;
 pub(crate) const DEFAULT_INITIAL_BACKOFF_MS: u32 = 100;
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_DOWNLOAD_LINKS: usize = 64;
 
@@ -38,3 +38,13 @@ impl ApiConfig {
 }
 
 pub(crate) static DEFAULT_API_CONFIG: ApiConfig = ApiConfig::new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_timeout_is_10_seconds() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+    }
+}
