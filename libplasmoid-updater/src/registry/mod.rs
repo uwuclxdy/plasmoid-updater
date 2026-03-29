@@ -75,8 +75,12 @@ fn is_system_path(path: &str) -> bool {
 /// When `system` is true, only entries whose installed path starts with "/usr"
 /// or "/lib" are included. When false, only user-local entries are included.
 pub(crate) fn build_id_cache(system: bool) -> HashMap<String, u64> {
-    let mut cache = HashMap::new();
     let knewstuff = crate::paths::knewstuff_dir();
+
+    // Read all registry files once upfront, estimating capacity from entry counts
+    // to avoid repeated HashMap reallocations.
+    let mut entries_estimate = 0usize;
+    let mut files: Vec<(ComponentType, String)> = Vec::new();
 
     for &ct in ComponentType::all() {
         let Some(file) = ct.registry_file() else {
@@ -86,8 +90,14 @@ pub(crate) fn build_id_cache(system: bool) -> HashMap<String, u64> {
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
         };
+        entries_estimate += xml::count_entries(&content);
+        files.push((ct, content));
+    }
 
-        for raw in xml::parse_raw_entries(&content) {
+    let mut cache = HashMap::with_capacity(entries_estimate);
+
+    for (_ct, content) in &files {
+        for raw in xml::parse_raw_entries(content) {
             let Some(id) = raw.content_id() else {
                 continue;
             };

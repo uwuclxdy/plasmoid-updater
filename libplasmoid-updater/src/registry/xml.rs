@@ -67,6 +67,13 @@ const EMPTY_REGISTRY_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </hotnewstuffregistry>
 "#;
 
+/// Quickly estimates the number of `<stuff>` entries in registry XML.
+pub(super) fn count_entries(xml: &str) -> usize {
+    // Each entry starts with "<stuff ", so a simple substring count gives
+    // a fast upper-bound without full XML parsing.
+    xml.matches("<stuff ").count()
+}
+
 /// Parses all `<stuff>` entries from registry XML into raw field collections.
 pub(super) fn parse_raw_entries(xml: &str) -> Vec<RawEntry> {
     let mut reader = Reader::from_str(xml);
