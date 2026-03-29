@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Returns the user's data directory, respecting XDG_DATA_HOME.
 pub(crate) fn data_home() -> PathBuf {
@@ -42,8 +43,15 @@ pub(crate) fn is_kde() -> bool {
     knewstuff_dir().exists()
 }
 
+static USER_HOME: OnceLock<PathBuf> = OnceLock::new();
+
 /// Gets the user's home directory, even when running with sudo.
-fn user_home() -> PathBuf {
+/// Cached after first call via `OnceLock`.
+fn user_home() -> &'static Path {
+    USER_HOME.get_or_init(resolve_user_home)
+}
+
+fn resolve_user_home() -> PathBuf {
     if let Ok(sudo_home) = std::env::var("SUDO_USER_HOME") {
         return PathBuf::from(sudo_home);
     }
@@ -72,4 +80,38 @@ fn user_home() -> PathBuf {
                 PathBuf::from("/tmp/plasmoid-updater-fallback")
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_home_returns_consistent_path() {
+        let first = user_home();
+        let second = user_home();
+        assert_eq!(first, second);
+        assert!(std::ptr::eq(first, second), "should return same &'static ref");
+    }
+
+    #[test]
+    fn data_home_is_under_user_home_or_xdg() {
+        let dh = data_home();
+        if std::env::var("XDG_DATA_HOME").is_ok() {
+            // XDG override — just check it's a PathBuf
+            assert!(!dh.as_os_str().is_empty());
+        } else {
+            assert!(dh.starts_with(user_home()));
+        }
+    }
+
+    #[test]
+    fn cache_home_is_under_user_home_or_xdg() {
+        let ch = cache_home();
+        if std::env::var("XDG_CACHE_HOME").is_ok() {
+            assert!(!ch.as_os_str().is_empty());
+        } else {
+            assert!(ch.starts_with(user_home()));
+        }
+    }
 }
