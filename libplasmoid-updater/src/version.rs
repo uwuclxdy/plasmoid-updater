@@ -109,8 +109,9 @@ fn is_date_newer(installed_date: &str, available_date: &str) -> bool {
         return false;
     }
     // extract just the date part (first 10 chars for YYYY-MM-DD)
-    let local_date = &installed_date[..installed_date.len().min(10)];
-    let store_date = &available_date[..available_date.len().min(10)];
+    // use str::get to avoid panics on non-ASCII or short strings
+    let local_date = installed_date.get(..10).unwrap_or(installed_date);
+    let store_date = available_date.get(..10).unwrap_or(available_date);
     store_date > local_date
 }
 
@@ -161,6 +162,15 @@ mod tests {
     #[test]
     fn normalized_versions_no_update_when_equal() {
         assert!(!is_update_available_with_date("v1.0.0", "v1.0.0", "", ""));
+    }
+
+    #[test]
+    fn date_comparison_does_not_panic_on_non_ascii() {
+        // Multi-byte UTF-8 — byte-index 10 may land inside a char.
+        // The key invariant: no panic (the old byte-slicing code panicked here).
+        let non_ascii = "2024-01-0é";
+        let _ = is_update_available_with_date("1.0", "1.0", non_ascii, "2024-01-02");
+        let _ = is_update_available_with_date("1.0", "1.0", "2024-01-02", non_ascii);
     }
 
     #[test]
