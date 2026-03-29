@@ -124,6 +124,7 @@ pub(super) fn patch_metadata(
 /// Patches a `metadata.desktop` file to update the `X-KDE-PluginInfo-Version` field.
 pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) -> Result<()> {
     let content = fs::read_to_string(metadata_path)?;
+    let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
     let mut found = false;
     let patched: String = content
         .lines()
@@ -136,11 +137,11 @@ pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) ->
             }
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(line_ending);
 
     // Preserve trailing newline if original had one
     let patched = if content.ends_with('\n') && !patched.ends_with('\n') {
-        patched + "\n"
+        patched + line_ending
     } else {
         patched
     };
@@ -464,4 +465,34 @@ pub(super) fn install_raw_file(downloaded: &Path, component: &InstalledComponent
         log::debug!(target: "install", "copied raw file to {}", dest.display());
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_metadata_desktop_preserves_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.desktop");
+        std::fs::write(&path, "[Desktop Entry]\r\nX-KDE-PluginInfo-Version=1.0\r\nName=Test\r\n")
+            .unwrap();
+        patch_metadata_desktop(&path, "2.0").unwrap();
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("\r\n"), "should preserve CRLF");
+        assert!(result.contains("X-KDE-PluginInfo-Version=2.0"));
+        assert!(!result.contains("X-KDE-PluginInfo-Version=1.0"));
+    }
+
+    #[test]
+    fn patch_metadata_desktop_preserves_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.desktop");
+        std::fs::write(&path, "[Desktop Entry]\nX-KDE-PluginInfo-Version=1.0\nName=Test\n")
+            .unwrap();
+        patch_metadata_desktop(&path, "2.0").unwrap();
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(!result.contains("\r\n"), "should not introduce CRLF");
+        assert!(result.contains("X-KDE-PluginInfo-Version=2.0"));
+    }
 }
