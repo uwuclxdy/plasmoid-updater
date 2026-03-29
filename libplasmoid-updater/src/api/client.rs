@@ -150,7 +150,7 @@ impl ApiClient {
     fn fetch_page(&self, url: &str) -> Result<(Vec<StoreEntry>, Meta)> {
         let mut backoff_ms = self.config.initial_backoff_ms;
 
-        for attempt in 0..self.config.max_retries {
+        for attempt in 0..self.config.max_attempts {
             self.request_count.fetch_add(1, Ordering::Relaxed);
             let r = self.client.get(url).send()?;
             let retry_after_secs = parse_retry_after(&r);
@@ -174,7 +174,7 @@ impl ApiClient {
                 // ApiError is a deterministic OCS status — retrying wastes a request.
                 Err(ref e)
                     if !matches!(e, Error::ApiError(_))
-                        && attempt + 1 < self.config.max_retries =>
+                        && attempt + 1 < self.config.max_attempts =>
                 {
                     thread::sleep(Duration::from_millis(backoff_ms.into()));
                     backoff_ms = backoff_ms.saturating_mul(2);
@@ -183,7 +183,7 @@ impl ApiClient {
             }
         }
 
-        Err(Error::other("max retries exceeded"))
+        Err(Error::other("max attempts exceeded"))
     }
 
     /// Sleeps for `secs` then sends one retry request.
