@@ -171,6 +171,23 @@ fn kpackagetool_cmd(kpackage_type: &str, global: bool) -> std::process::Command 
     cmd
 }
 
+/// Reads the KPlugin.Id from metadata.json if present, falling back to directory_name.
+fn resolve_plugin_id(package_dir: &Path, fallback: &str) -> String {
+    let metadata_path = package_dir.join("metadata.json");
+    let Ok(content) = fs::read_to_string(&metadata_path) else {
+        return fallback.to_string();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return fallback.to_string();
+    };
+    json.get("KPlugin")
+        .and_then(|kp| kp.get("Id"))
+        .and_then(|id| id.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// Installs or updates a component package using `kpackagetool6`.
 ///
 /// Tries `-u` (update) first. If that fails (e.g. stale kpackage DB entry after
@@ -204,10 +221,14 @@ fn install_via_kpackagetool(
         stderr.trim(),
     );
 
+    // Use KPlugin.Id from metadata.json for the -r flag if available,
+    // as the directory name may not match the registered plugin ID.
+    let plugin_id = resolve_plugin_id(package_dir, &component.directory_name);
+
     // Remove stale DB entry (ignore failure — it may not exist)
     let remove_output = kpackagetool_cmd(kpackage_type, global)
         .arg("-r")
-        .arg(&component.directory_name)
+        .arg(&plugin_id)
         .output();
 
     if let Ok(ref out) = remove_output
@@ -482,6 +503,24 @@ mod tests {
         assert!(result.contains("\r\n"), "should preserve CRLF");
         assert!(result.contains("X-KDE-PluginInfo-Version=2.0"));
         assert!(!result.contains("X-KDE-PluginInfo-Version=1.0"));
+    }
+
+    #[test]
+    fn resolve_plugin_id_reads_from_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.kde.real.id", "Name": "Test"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_plugin_id(dir.path(), "fallback"), "org.kde.real.id");
+    }
+
+    #[test]
+    fn resolve_plugin_id_falls_back_to_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // No metadata.json exists
+        assert_eq!(resolve_plugin_id(dir.path(), "my.widget"), "my.widget");
     }
 
     #[test]
