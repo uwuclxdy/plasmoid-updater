@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Default embedded widgets-id mapping file provided by Apdatifier.
 ///
 /// This file maps component directory names to KDE Store content IDs
 /// and is used as a fallback when other resolution methods fail.
 const DEFAULT_WIDGETS_ID: &str = include_str!("../widgets-id");
+
+static DEFAULT_WIDGETS_TABLE: LazyLock<HashMap<String, u64>> =
+    LazyLock::new(|| Config::parse_widgets_id(DEFAULT_WIDGETS_ID));
 
 /// Controls plasmashell restart behavior after updates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -121,7 +125,7 @@ impl Config {
     /// exact name matching.
     pub fn new() -> Self {
         Self {
-            widgets_id_table: Self::parse_widgets_id(DEFAULT_WIDGETS_ID),
+            widgets_id_table: DEFAULT_WIDGETS_TABLE.clone(),
             inhibit_idle: true,
             ..Default::default()
         }
@@ -383,5 +387,20 @@ mod tests {
             config.widgets_id_table.get("com.bxabi.bumblebee-indicator"),
             None
         );
+    }
+
+    #[test]
+    fn default_widgets_table_is_cached() {
+        let config1 = Config::new();
+        let config2 = Config::new();
+        assert_eq!(config1.widgets_id_table, config2.widgets_id_table);
+        assert!(!config1.widgets_id_table.is_empty());
+    }
+
+    #[test]
+    fn cached_table_matches_fresh_parse() {
+        let cached = &*DEFAULT_WIDGETS_TABLE;
+        let fresh = Config::parse_widgets_id(DEFAULT_WIDGETS_ID);
+        assert_eq!(cached, &fresh);
     }
 }
