@@ -1294,7 +1294,7 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libplasmoid-updater"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "bytesize",
  "chrono",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "plasmoid-updater"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dirs",

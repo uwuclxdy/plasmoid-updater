@@ -1,6 +1,6 @@
 [package]
 name = "plasmoid-updater"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "CLI tool for updating KDE Plasma 6 components from the KDE Store"
