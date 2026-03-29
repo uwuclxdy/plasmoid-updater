@@ -61,46 +61,55 @@ pub(crate) fn is_update_available_with_date(
     installed_date: &str,
     available_date: &str,
 ) -> bool {
-    let inst_norm = normalize_version(installed_version);
-    let avail_norm = normalize_version(available_version);
-
-    // Fast path: identical non-empty version strings skip expensive parsing.
-    // If strings are equal their Versioning representations are also equal,
-    // so the only possible update signal is a newer release date.
-    if !inst_norm.is_empty() && !avail_norm.is_empty() && inst_norm == avail_norm {
+    // Fast path: identical raw strings
+    if !installed_version.is_empty()
+        && !available_version.is_empty()
+        && installed_version == available_version
+    {
         return is_date_newer(installed_date, available_date);
     }
 
-    // Try original strings first — normalization is only needed when raw parsing fails
-    let installed_parsed = Versioning::new(installed_version)
-        .or_else(|| Versioning::new(&inst_norm));
-    let available_parsed = Versioning::new(available_version)
-        .or_else(|| Versioning::new(&avail_norm));
+    // Try parsing originals first (preserves pre-release semantics)
+    let inst_orig = Versioning::new(installed_version);
+    let avail_orig = Versioning::new(available_version);
 
-    // both versions parseable: use semantic comparison, then date fallback
-    if let (Some(inst), Some(avail)) = (&installed_parsed, &available_parsed) {
+    if let (Some(inst), Some(avail)) = (&inst_orig, &avail_orig) {
         if inst < avail {
             return true;
         }
-        // same version — check if the release date is newer (content refresh)
         if inst == avail {
             return is_date_newer(installed_date, available_date);
         }
         return false;
     }
 
-    // Both versions unparseable — fall through to date comparison rather than
-    // assuming an update is available, matching KNewStuff behavior.
-    if installed_parsed.is_none() && available_parsed.is_none() {
+    // Fall back to normalized comparison
+    let inst_norm = normalize_version(installed_version);
+    let avail_norm = normalize_version(available_version);
+
+    if !inst_norm.is_empty() && !avail_norm.is_empty() && inst_norm == avail_norm {
         return is_date_newer(installed_date, available_date);
     }
 
-    // if available version is parseable but installed is not, it's an update
-    if available_parsed.is_some() && installed_parsed.is_none() {
+    let inst_parsed = Versioning::new(&inst_norm);
+    let avail_parsed = Versioning::new(&avail_norm);
+
+    if let (Some(inst), Some(avail)) = (&inst_parsed, &avail_parsed) {
+        if inst < avail {
+            return true;
+        }
+        if inst == avail {
+            return is_date_newer(installed_date, available_date);
+        }
+        return false;
+    }
+
+    if avail_parsed.is_some() && inst_parsed.is_none() {
         return true;
     }
 
-    // fall back to date comparison
+    // Both unparseable and differ: we can't determine ordering,
+    // so fall through to date comparison instead of assuming update.
     is_date_newer(installed_date, available_date)
 }
 
@@ -110,7 +119,6 @@ fn is_date_newer(installed_date: &str, available_date: &str) -> bool {
         return false;
     }
     // extract just the date part (first 10 chars for YYYY-MM-DD)
-    // use str::get to avoid panics on non-ASCII or short strings
     let local_date = installed_date.get(..10).unwrap_or(installed_date);
     let store_date = available_date.get(..10).unwrap_or(available_date);
     store_date > local_date
@@ -167,44 +175,44 @@ mod tests {
 
     #[test]
     fn date_comparison_does_not_panic_on_non_ascii() {
-        // Multi-byte UTF-8 — byte-index 10 may land inside a char.
-        // The key invariant: no panic (the old byte-slicing code panicked here).
-        let non_ascii = "2024-01-0é";
-        let _ = is_update_available_with_date("1.0", "1.0", non_ascii, "2024-01-02");
-        let _ = is_update_available_with_date("1.0", "1.0", "2024-01-02", non_ascii);
+        // Multi-byte chars before byte 10 — must not panic.
+        // "2024-é1-01" has é (2 bytes) making it 11 bytes; get(..10) truncates
+        // to "2024-é1-0" which is still lexicographically < "2025-01-01"
+        assert!(is_date_newer("2024-é1-01", "2025-01-01"));
+        // "2025-ñ1-01" similarly truncates; year 2025 > 2024 so still newer
+        assert!(is_date_newer("2024-01-01", "2025-ñ1-01"));
+        // All multi-byte: ë (0xc3..) > '2' (0x32) so local_date > store_date
+        assert!(!is_date_newer("ëëëëëëëëëë", "2025-01-01"));
     }
 
     #[test]
     fn unparseable_versions_fall_back_to_date_comparison() {
-        // Both versions normalize to empty — should use date, not blindly flag as update
-        assert!(is_update_available_with_date(
-            "---",
-            "***",
-            "2024-01-01",
-            "2024-06-01"
-        ));
-        assert!(!is_update_available_with_date(
-            "---",
-            "***",
-            "2024-06-01",
-            "2024-01-01"
-        ));
+        // Use strings that Versioning truly cannot parse (contain spaces)
+        // and normalize to empty (no digits), so both paths yield None.
+        // Both unparseable, differ, installed date newer → no update
+        assert!(!is_update_available_with_date("!@#", "***", "2025-06-01", "2024-01-01"));
+        // Both unparseable, differ, available date newer → update
+        assert!(is_update_available_with_date("!@#", "***", "2024-01-01", "2025-06-01"));
+        // Both unparseable, differ, no dates → no update (conservative)
+        assert!(!is_update_available_with_date("!@#", "***", "", ""));
     }
 
     #[test]
     fn prerelease_detected_as_update_to_release() {
-        assert!(is_update_available_with_date("1.0.0-beta", "1.0.0", "", ""));
+        // 1.2.3-beta1 < 1.2.3 (pre-release is older than release)
+        assert!(is_update_available_with_date("1.2.3-beta1", "1.2.3", "", ""));
     }
 
     #[test]
     fn release_not_downgraded_to_prerelease() {
-        assert!(!is_update_available_with_date("1.0.0", "1.0.0-beta", "", ""));
+        // 1.2.3 > 1.2.3-beta1 (release is newer than pre-release)
+        assert!(!is_update_available_with_date("1.2.3", "1.2.3-beta1", "", ""));
     }
 
     #[test]
     fn v_prefix_still_works_after_normalization_fallback() {
-        // "v1.0.0" is parseable as-is by Versioning, so the raw-first path works
-        assert!(is_update_available_with_date("v1.0.0", "v2.0.0", "", ""));
-        assert!(!is_update_available_with_date("v2.0.0", "v1.0.0", "", ""));
+        // v1.0 should still parse via normalization fallback
+        assert!(is_update_available_with_date("v1.0", "v2.0", "", ""));
+        assert!(!is_update_available_with_date("v2.0", "v1.0", "", ""));
     }
 }

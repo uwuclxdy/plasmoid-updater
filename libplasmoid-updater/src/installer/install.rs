@@ -5,6 +5,7 @@
 // GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 
 use std::{
+    borrow::Cow,
     fs,
     path::{Path, PathBuf},
 };
@@ -155,6 +156,27 @@ pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) ->
     Ok(())
 }
 
+// --- Plugin ID Resolution ---
+
+/// Reads the KPlugin.Id from a component's metadata.json, falling back to directory_name.
+fn resolve_plugin_id(component: &InstalledComponent) -> Cow<'_, str> {
+    let metadata_path = component.path.join("metadata.json");
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(id) = json
+                .get("KPlugin")
+                .and_then(|kp| kp.get("Id"))
+                .and_then(|v| v.as_str())
+            {
+                if !id.is_empty() {
+                    return Cow::Owned(id.to_string());
+                }
+            }
+        }
+    }
+    Cow::Borrowed(&component.directory_name)
+}
+
 // --- kpackagetool Installation ---
 
 /// Builds a base `kpackagetool6` command with `-t <type>`, `sudo`, and `--global` as needed.
@@ -171,23 +193,6 @@ fn kpackagetool_cmd(kpackage_type: &str, global: bool) -> std::process::Command 
     cmd
 }
 
-/// Reads the KPlugin.Id from metadata.json if present, falling back to directory_name.
-fn resolve_plugin_id(package_dir: &Path, fallback: &str) -> String {
-    let metadata_path = package_dir.join("metadata.json");
-    let Ok(content) = fs::read_to_string(&metadata_path) else {
-        return fallback.to_string();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return fallback.to_string();
-    };
-    json.get("KPlugin")
-        .and_then(|kp| kp.get("Id"))
-        .and_then(|id| id.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| fallback.to_string())
-}
-
 /// Installs or updates a component package using `kpackagetool6`.
 ///
 /// Tries `-u` (update) first. If that fails (e.g. stale kpackage DB entry after
@@ -202,7 +207,7 @@ fn install_via_kpackagetool(
         .kpackage_type()
         .expect("install_via_kpackagetool called without kpackage_type");
 
-    // Try update first — the common path
+    // Try update first -- the common path
     let output = kpackagetool_cmd(kpackage_type, global)
         .arg("-u")
         .arg(package_dir)
@@ -221,14 +226,11 @@ fn install_via_kpackagetool(
         stderr.trim(),
     );
 
-    // Use KPlugin.Id from metadata.json for the -r flag if available,
-    // as the directory name may not match the registered plugin ID.
-    let plugin_id = resolve_plugin_id(package_dir, &component.directory_name);
-
-    // Remove stale DB entry (ignore failure — it may not exist)
+    // Remove stale DB entry (ignore failure -- it may not exist)
+    let plugin_id = resolve_plugin_id(component);
     let remove_output = kpackagetool_cmd(kpackage_type, global)
         .arg("-r")
-        .arg(&plugin_id)
+        .arg(plugin_id.as_ref())
         .output();
 
     if let Ok(ref out) = remove_output
@@ -237,7 +239,7 @@ fn install_via_kpackagetool(
         log::debug!(
             target: "install",
             "removed stale kpackage entry for {}",
-            component.directory_name,
+            plugin_id,
         );
     }
 
@@ -495,43 +497,75 @@ mod tests {
     #[test]
     fn patch_metadata_desktop_preserves_crlf() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("metadata.desktop");
-        std::fs::write(&path, "[Desktop Entry]\r\nX-KDE-PluginInfo-Version=1.0\r\nName=Test\r\n")
-            .unwrap();
-        patch_metadata_desktop(&path, "2.0").unwrap();
-        let result = std::fs::read_to_string(&path).unwrap();
-        assert!(result.contains("\r\n"), "should preserve CRLF");
-        assert!(result.contains("X-KDE-PluginInfo-Version=2.0"));
-        assert!(!result.contains("X-KDE-PluginInfo-Version=1.0"));
-    }
-
-    #[test]
-    fn resolve_plugin_id_reads_from_metadata() {
-        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("metadata.desktop");
         std::fs::write(
-            dir.path().join("metadata.json"),
-            r#"{"KPlugin": {"Id": "org.kde.real.id", "Name": "Test"}}"#,
+            &file,
+            "[Desktop Entry]\r\nX-KDE-PluginInfo-Version=1.0\r\nName=Test\r\n",
         )
         .unwrap();
-        assert_eq!(resolve_plugin_id(dir.path(), "fallback"), "org.kde.real.id");
-    }
-
-    #[test]
-    fn resolve_plugin_id_falls_back_to_directory_name() {
-        let dir = tempfile::tempdir().unwrap();
-        // No metadata.json exists
-        assert_eq!(resolve_plugin_id(dir.path(), "my.widget"), "my.widget");
+        patch_metadata_desktop(&file, "2.0").unwrap();
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("X-KDE-PluginInfo-Version=2.0\r\n"));
+        assert!(content.contains("Name=Test\r\n"));
+        // Verify no bare \n exists (all should be \r\n)
+        let without_cr = content.replace("\r\n", "");
+        assert!(!without_cr.contains('\n'));
     }
 
     #[test]
     fn patch_metadata_desktop_preserves_lf() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("metadata.desktop");
-        std::fs::write(&path, "[Desktop Entry]\nX-KDE-PluginInfo-Version=1.0\nName=Test\n")
-            .unwrap();
-        patch_metadata_desktop(&path, "2.0").unwrap();
-        let result = std::fs::read_to_string(&path).unwrap();
-        assert!(!result.contains("\r\n"), "should not introduce CRLF");
-        assert!(result.contains("X-KDE-PluginInfo-Version=2.0"));
+        let file = dir.path().join("metadata.desktop");
+        std::fs::write(
+            &file,
+            "[Desktop Entry]\nX-KDE-PluginInfo-Version=1.0\nName=Test\n",
+        )
+        .unwrap();
+        patch_metadata_desktop(&file, "2.0").unwrap();
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("X-KDE-PluginInfo-Version=2.0\n"));
+        assert!(!content.contains("\r\n"));
+    }
+
+    #[test]
+    fn resolve_plugin_id_reads_from_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = dir.path().join("metadata.json");
+        std::fs::write(
+            &metadata,
+            r#"{"KPlugin": {"Id": "org.kde.actual.id", "Name": "Test"}}"#,
+        )
+        .unwrap();
+
+        let component = InstalledComponent {
+            name: "Test".to_string(),
+            directory_name: "org.kde.wrong.name".to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::PlasmaWidget,
+            path: dir.path().to_path_buf(),
+            is_system: false,
+            release_date: String::new(),
+        };
+
+        let id = resolve_plugin_id(&component);
+        assert_eq!(id.as_ref(), "org.kde.actual.id");
+    }
+
+    #[test]
+    fn resolve_plugin_id_falls_back_to_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // No metadata.json
+        let component = InstalledComponent {
+            name: "Test".to_string(),
+            directory_name: "org.kde.fallback".to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::PlasmaWidget,
+            path: dir.path().to_path_buf(),
+            is_system: false,
+            release_date: String::new(),
+        };
+
+        let id = resolve_plugin_id(&component);
+        assert_eq!(id.as_ref(), "org.kde.fallback");
     }
 }

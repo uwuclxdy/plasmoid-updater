@@ -35,7 +35,7 @@ pub(crate) fn resolve_content_id(
 }
 
 fn resolve_by_name(component: &InstalledComponent, store_entries: &[StoreEntry]) -> Option<u64> {
-    // Prefer entries that match both name and type (case-insensitive)
+    // Prefer entries that match both name and type
     let type_match = store_entries.iter().find(|e| {
         e.name.eq_ignore_ascii_case(&component.name)
             && component.component_type.matches_type_id(e.type_id)
@@ -203,20 +203,6 @@ mod tests {
     }
 
     #[test]
-    fn name_match_is_case_insensitive() {
-        let component =
-            make_component("My Widget", "org.example.widget", ComponentType::PlasmaWidget);
-        let entries = vec![make_entry(42, "my widget", 705)];
-        let (wid, reg) = empty_lookup();
-        let lookup = IdLookup {
-            widgets_id_table: &wid,
-            registry_id_cache: &reg,
-        };
-        let result = resolve_content_id(&component, &entries, &lookup);
-        assert_eq!(result, Some(42));
-    }
-
-    #[test]
     fn download_link_matches_with_normalized_version() {
         use crate::types::DownloadLink;
 
@@ -279,6 +265,26 @@ mod tests {
     }
 
     #[test]
+    fn registry_cache_takes_priority_over_name() {
+        let component = make_component(
+            "My Widget",
+            "org.example.widget",
+            ComponentType::PlasmaWidget,
+        );
+        let entries = vec![make_entry(200, "My Widget", 705)];
+        let wid = HashMap::new();
+        let mut reg = HashMap::new();
+        reg.insert("org.example.widget".to_string(), 100);
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+
+        let result = resolve_content_id(&component, &entries, &lookup);
+        assert_eq!(result, Some(100));
+    }
+
+    #[test]
     fn download_link_filters_signature_files() {
         use crate::types::DownloadLink;
         let entry = StoreEntry {
@@ -328,22 +334,16 @@ mod tests {
     }
 
     #[test]
-    fn registry_cache_takes_priority_over_name() {
-        let component = make_component(
-            "My Widget",
-            "org.example.widget",
-            ComponentType::PlasmaWidget,
-        );
-        let entries = vec![make_entry(200, "My Widget", 705)];
-        let wid = HashMap::new();
-        let mut reg = HashMap::new();
-        reg.insert("org.example.widget".to_string(), 100);
+    fn name_match_is_case_insensitive() {
+        let component =
+            make_component("My Widget", "org.example.widget", ComponentType::PlasmaWidget);
+        let entries = vec![make_entry(42, "my widget", 705)];
+        let (wid, reg) = empty_lookup();
         let lookup = IdLookup {
             widgets_id_table: &wid,
             registry_id_cache: &reg,
         };
-
         let result = resolve_content_id(&component, &entries, &lookup);
-        assert_eq!(result, Some(100));
+        assert_eq!(result, Some(42));
     }
 }

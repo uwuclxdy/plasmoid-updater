@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    types::{ComponentType, InstalledComponent},
+    types::InstalledComponent,
     {Error, Result},
 };
 
@@ -38,7 +38,9 @@ pub(crate) fn backup_component(component: &InstalledComponent) -> Result<PathBuf
         fs::copy(&component.path, &backup_path)
             .map_err(|e| Error::backup(format!("copy file: {e}")))?;
 
+        // Prune old backups for this component type
         cleanup_old_backups(component.component_type);
+
         return Ok(backup_path);
     }
 
@@ -51,7 +53,9 @@ pub(crate) fn backup_component(component: &InstalledComponent) -> Result<PathBuf
 
     copy_dir_recursive(&component.path, &backup_path)?;
 
+    // Prune old backups for this component type
     cleanup_old_backups(component.component_type);
+
     Ok(backup_path)
 }
 
@@ -113,6 +117,7 @@ fn cleanup_old_backups_in(base: &Path, type_subdir: &str, max_keep: usize) {
         return;
     };
 
+    // Collect timestamp dirs that contain this component type's backup
     let mut dirs: Vec<(String, PathBuf)> = entries
         .flatten()
         .filter_map(|e| {
@@ -136,6 +141,7 @@ fn cleanup_old_backups_in(base: &Path, type_subdir: &str, max_keep: usize) {
     // Sort by timestamp name (lexicographic = chronological for ISO format)
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // Remove oldest, keep last max_keep
     let to_remove = dirs.len() - max_keep;
     for (_, path) in dirs.into_iter().take(to_remove) {
         let type_path = path.join(type_subdir);
@@ -150,7 +156,7 @@ fn cleanup_old_backups_in(base: &Path, type_subdir: &str, max_keep: usize) {
 }
 
 /// Removes old backups for a component type, keeping the most recent ones.
-pub(crate) fn cleanup_old_backups(component_type: ComponentType) {
+pub(crate) fn cleanup_old_backups(component_type: crate::types::ComponentType) {
     cleanup_old_backups_in(
         &backup_base_dir(),
         component_type.backup_subdir(),
@@ -161,12 +167,14 @@ pub(crate) fn cleanup_old_backups(component_type: ComponentType) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ComponentType;
 
     #[test]
     fn cleanup_old_backups_keeps_recent() {
         let base = tempfile::tempdir().unwrap();
         let subdir = ComponentType::PlasmaWidget.backup_subdir();
 
+        // Create 7 fake backup dirs
         for i in 1..=7 {
             let ts_dir = base.path().join(format!("2024-01-0{i}T00-00-00"));
             let type_dir = ts_dir.join(subdir);
@@ -174,6 +182,7 @@ mod tests {
             std::fs::write(type_dir.join("dummy"), b"data").unwrap();
         }
 
+        // Verify 7 exist
         let count_before = std::fs::read_dir(base.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -181,8 +190,10 @@ mod tests {
             .count();
         assert_eq!(count_before, 7);
 
+        // Run cleanup keeping 5
         cleanup_old_backups_in(base.path(), subdir, 5);
 
+        // Verify only 5 remain
         let count_after = std::fs::read_dir(base.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -190,9 +201,17 @@ mod tests {
             .count();
         assert_eq!(count_after, 5);
 
-        // Verify the oldest 2 were removed
-        assert!(!base.path().join("2024-01-01T00-00-00").join(subdir).exists());
-        assert!(!base.path().join("2024-01-02T00-00-00").join(subdir).exists());
+        // Verify the oldest 2 were removed (01 and 02)
+        assert!(!base
+            .path()
+            .join("2024-01-01T00-00-00")
+            .join(subdir)
+            .exists());
+        assert!(!base
+            .path()
+            .join("2024-01-02T00-00-00")
+            .join(subdir)
+            .exists());
 
         // Verify the newest 5 remain
         for i in 3..=7 {
@@ -209,6 +228,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let subdir = ComponentType::PlasmaWidget.backup_subdir();
 
+        // Create 3 fake backup dirs (under the limit of 5)
         for i in 1..=3 {
             let ts_dir = base.path().join(format!("2024-01-0{i}T00-00-00"));
             let type_dir = ts_dir.join(subdir);
@@ -217,6 +237,7 @@ mod tests {
 
         cleanup_old_backups_in(base.path(), subdir, 5);
 
+        // All 3 should still exist
         let count = std::fs::read_dir(base.path())
             .unwrap()
             .filter_map(|e| e.ok())

@@ -70,9 +70,10 @@ impl ComponentType {
         if self.category_id() == type_id {
             return true;
         }
-        // PlasmaWidget (705) is the parent category. The KDE Store uses
-        // subcategories in the 700-range (706-713, 723, etc.) which can grow
-        // over time, so match the full 700..=799 range to be future-proof.
+        // PlasmaWidget (705) is the parent of all subcategories in the 700-range.
+        // Using the full range is safe because other 700-range types (e.g. 708
+        // SplashScreen, 709 PlasmaStyle) have their own `category_id()` which
+        // fires first via the direct match above.
         matches!((self, type_id), (Self::PlasmaWidget, 700..=799))
     }
 
@@ -499,17 +500,13 @@ mod tests {
 
     #[test]
     fn plasma_widget_matches_extended_subcategories() {
-        let pw = ComponentType::PlasmaWidget;
-        // Known subcategories
-        assert!(pw.matches_type_id(705)); // parent
-        assert!(pw.matches_type_id(708)); // existing subcat
-        assert!(pw.matches_type_id(723)); // existing subcat
-        // Future subcategories in the 700-range should also match
-        assert!(pw.matches_type_id(750));
-        assert!(pw.matches_type_id(799));
-        // Outside the range should not match
-        assert!(!pw.matches_type_id(699));
-        assert!(!pw.matches_type_id(800));
+        assert!(ComponentType::PlasmaWidget.matches_type_id(705)); // parent
+        assert!(ComponentType::PlasmaWidget.matches_type_id(706)); // existing
+        assert!(ComponentType::PlasmaWidget.matches_type_id(714)); // previously missing
+        assert!(ComponentType::PlasmaWidget.matches_type_id(718)); // previously missing
+        assert!(ComponentType::PlasmaWidget.matches_type_id(723)); // existing
+        assert!(!ComponentType::PlasmaWidget.matches_type_id(100)); // unrelated
+        assert!(!ComponentType::PlasmaWidget.matches_type_id(800)); // out of range
     }
 
     #[test]

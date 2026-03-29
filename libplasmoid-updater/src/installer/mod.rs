@@ -44,9 +44,9 @@ pub(crate) struct InstallOutcome {
 /// Updates a single component using the provided HTTP client.
 ///
 /// `reporter` is called with a stage number as each phase completes:
-/// - `1` — backup done, download starting
-/// - `2` — download done, extraction starting
-/// - `3` — extraction done, install starting
+/// - `1` --- backup done, download starting
+/// - `2` --- download done, extraction starting
+/// - `3` --- extraction done, install starting
 ///
 /// `counter` is incremented once for each HTTP request made.
 pub(crate) fn update_component(
@@ -56,7 +56,6 @@ pub(crate) fn update_component(
     counter: &AtomicUsize,
 ) -> Result<InstallOutcome> {
     let component = &update.installed;
-
     let temp = download::create_temp_dir()?;
 
     let backup_path = create_backup(component)?;
@@ -75,6 +74,7 @@ pub(crate) fn update_component(
             Err(e)
         }
     }
+    // temp is dropped here, auto-cleanup
 }
 
 fn create_backup(component: &InstalledComponent) -> Result<PathBuf> {
@@ -120,11 +120,12 @@ fn download_with_error_handling(
     counter: &AtomicUsize,
     temp_path: &Path,
 ) -> Result<PathBuf> {
-    download::download_package(client, url, checksum, directory_name, counter, temp_path)
-        .map_err(|e| {
+    download::download_package(client, url, checksum, directory_name, counter, temp_path).map_err(
+        |e| {
             log::error!(target: "download", "failed for {}: {e}", component_name);
             e
-        })
+        },
+    )
 }
 
 fn execute_installation(

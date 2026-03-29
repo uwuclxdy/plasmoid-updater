@@ -391,6 +391,7 @@ mod tests {
 
     #[test]
     fn default_widgets_table_is_cached() {
+        // Creating multiple configs should all have the same table
         let config1 = Config::new();
         let config2 = Config::new();
         assert_eq!(config1.widgets_id_table, config2.widgets_id_table);
