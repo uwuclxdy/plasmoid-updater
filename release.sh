@@ -30,7 +30,7 @@ echo "Pushing main"
 git push origin main
 
 echo "Tagging and pushing v${VERSION}"
-git tag "v${VERSION}"
+git tag "v${VERSION} -m release"
 git push origin "v${VERSION}"
 
 echo "Done: released v${VERSION}"
