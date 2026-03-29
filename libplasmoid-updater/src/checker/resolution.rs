@@ -35,10 +35,11 @@ pub(crate) fn resolve_content_id(
 }
 
 fn resolve_by_name(component: &InstalledComponent, store_entries: &[StoreEntry]) -> Option<u64> {
-    // Prefer entries that match both name and type
-    let type_match = store_entries
-        .iter()
-        .find(|e| e.name == component.name && component.component_type.matches_type_id(e.type_id));
+    // Prefer entries that match both name and type (case-insensitive)
+    let type_match = store_entries.iter().find(|e| {
+        e.name.eq_ignore_ascii_case(&component.name)
+            && component.component_type.matches_type_id(e.type_id)
+    });
 
     if let Some(entry) = type_match {
         return Some(entry.id);
@@ -47,7 +48,7 @@ fn resolve_by_name(component: &InstalledComponent, store_entries: &[StoreEntry])
     // Fall back to name-only match (handles miscategorized store entries)
     store_entries
         .iter()
-        .find(|e| e.name == component.name)
+        .find(|e| e.name.eq_ignore_ascii_case(&component.name))
         .map(|e| e.id)
 }
 
@@ -185,6 +186,20 @@ mod tests {
 
         let result = resolve_content_id(&component, &entries, &lookup);
         assert_eq!(result, Some(555));
+    }
+
+    #[test]
+    fn name_match_is_case_insensitive() {
+        let component =
+            make_component("My Widget", "org.example.widget", ComponentType::PlasmaWidget);
+        let entries = vec![make_entry(42, "my widget", 705)];
+        let (wid, reg) = empty_lookup();
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+        let result = resolve_content_id(&component, &entries, &lookup);
+        assert_eq!(result, Some(42));
     }
 
     #[test]
