@@ -66,6 +66,9 @@ pub enum Error {
         restore_error: String,
     },
 
+    #[error("missing required dependency: {0}")]
+    MissingDependency(String),
+
     #[error("{0}")]
     Other(String),
 
@@ -141,6 +144,13 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("extraction failed"));
         assert!(msg.contains("permission denied"));
+    }
+
+    #[test]
+    fn missing_dependency_is_fatal() {
+        let err = Error::MissingDependency("bsdtar".to_string());
+        assert!(err.is_fatal());
+        assert!(err.to_string().contains("bsdtar"));
     }
 
     #[test]

@@ -25,7 +25,16 @@ pub(crate) fn validate_environment(skip_plasma_detection: bool) -> crate::Result
     if !plasma_found {
         return Err(Error::NotKDE);
     }
+    check_dependency("bsdtar")?;
     Ok(())
+}
+
+fn check_dependency(name: &str) -> crate::Result<()> {
+    use std::process::Command;
+    match Command::new("which").arg(name).output() {
+        Ok(output) if output.status.success() => Ok(()),
+        _ => Err(Error::MissingDependency(name.to_string())),
+    }
 }
 
 pub(crate) fn fetch_updates(
