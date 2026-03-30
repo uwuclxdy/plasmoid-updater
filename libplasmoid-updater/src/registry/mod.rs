@@ -74,6 +74,10 @@ fn is_system_path(path: &str) -> bool {
 ///
 /// When `system` is true, only entries whose installed path starts with "/usr"
 /// or "/lib" are included. When false, only user-local entries are included.
+///
+/// Registry-only component types (color schemes, wallpapers, icon themes) are
+/// always included regardless of the `system` flag, since KNewStuff registries
+/// are per-user and always store user-local paths even for system-wide installs.
 pub(crate) fn build_id_cache(system: bool) -> HashMap<String, u64> {
     let mut cache = HashMap::new();
     let knewstuff = crate::paths::knewstuff_dir();
@@ -87,17 +91,21 @@ pub(crate) fn build_id_cache(system: bool) -> HashMap<String, u64> {
             continue;
         };
 
+        // Registry-only types have no metadata files on disk; their identity
+        // comes solely from the KNewStuff registry which always uses user paths.
+        // Skipping them under --system would lose all ID mappings, causing
+        // wrong name-based fallback matches against unrelated store entries.
+        let skip_path_filter = ct.registry_only();
+
         for raw in xml::parse_raw_entries(&content) {
             let Some(id) = raw.content_id() else {
                 continue;
             };
             if let Some(installed_path) = raw.first_installed_path()
                 && let Some(dir_name) = utils::extract_directory_name(&installed_path)
+                && (skip_path_filter || system == is_system_path(&installed_path.to_string_lossy()))
             {
-                let path_str = installed_path.to_string_lossy();
-                if system == is_system_path(&path_str) {
-                    cache.insert(dir_name, id);
-                }
+                cache.insert(dir_name, id);
             }
         }
     }
@@ -183,7 +191,9 @@ mod tests {
         assert!(is_system_path("/usr/share/plasma/plasmoids/foo"));
         assert!(is_system_path("/usr/lib/something"));
         assert!(is_system_path("/lib/firmware/thing"));
-        assert!(!is_system_path("/home/user/.local/share/plasma/plasmoids/foo"));
+        assert!(!is_system_path(
+            "/home/user/.local/share/plasma/plasmoids/foo"
+        ));
         assert!(!is_system_path("/tmp/test"));
     }
 }
