@@ -69,6 +69,22 @@ Options:
 
 ```
 
+## Topgrade integreation (Preview)
+
+[Topgrade](https://github.com/topgrade-rs/topgrade/) is a CLI tool that updates everything with a single command.
+
+As this is meant to be a part of Topgrade at some point, I thought it's worth showing how to add it as a custom step until it's not officially supported.
+
+Run `topgrade --edit-config` and add the following under `[commands]`:
+
+```toml
+[commands]
+"Plasmoids" = "plasmoid-updater update -y"
+"Plasmoids System" = "plasmoid-updater update -y --system"
+```
+
+![](images/topgrade_custom_step.png)
+
 ## Supported (Updatable) Components
 
 | Component Type             | KDE Store Category |
