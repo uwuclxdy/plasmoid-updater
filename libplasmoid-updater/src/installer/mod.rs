@@ -70,16 +70,20 @@ pub(crate) fn update_component(
         }
         Err(e) => {
             log::error!(target: "install", "failed for {}: {e}", component.name);
-            handle_installation_failure(&backup_path, &component.path, &e)?;
+            if let Some(ref backup) = backup_path {
+                handle_installation_failure(backup, &component.path, &e)?;
+            }
             Err(e)
         }
     }
     // temp is dropped here, auto-cleanup
 }
 
-fn create_backup(component: &InstalledComponent) -> Result<PathBuf> {
+fn create_backup(component: &InstalledComponent) -> Result<Option<PathBuf>> {
     let backup_path = backup_component(component)?;
-    log::debug!(target: "backup", "created at {}", backup_path.display());
+    if let Some(ref path) = backup_path {
+        log::debug!(target: "backup", "created at {}", path.display());
+    }
     Ok(backup_path)
 }
 
@@ -135,7 +139,14 @@ fn execute_installation(
     reporter: &dyn Fn(u8),
     temp_path: &Path,
 ) -> Result<()> {
-    if install::is_single_file_component(downloaded_path, component.component_type) {
+    let is_single_file_type = matches!(
+        component.component_type,
+        ComponentType::ColorScheme | ComponentType::Wallpaper,
+    );
+    let is_raw_file = install::is_single_file_component(downloaded_path, component.component_type)
+        || (is_single_file_type && !has_archive_magic(downloaded_path));
+
+    if is_raw_file {
         let result = install::install_raw_file(downloaded_path, component);
         let _ = fs::remove_file(downloaded_path);
         reporter(3);

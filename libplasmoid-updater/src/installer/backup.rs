@@ -23,8 +23,19 @@ fn timestamp() -> String {
 }
 
 /// Creates a backup of the component before updating.
-/// Returns the path to the backup directory or file.
-pub(crate) fn backup_component(component: &InstalledComponent) -> Result<PathBuf> {
+/// Returns the path to the backup, or `None` if the component path
+/// does not exist on disk (nothing to back up).
+pub(crate) fn backup_component(component: &InstalledComponent) -> Result<Option<PathBuf>> {
+    if !component.path.exists() {
+        log::debug!(
+            target: "backup",
+            "nothing to back up for {}: {}",
+            component.name,
+            component.path.display(),
+        );
+        return Ok(None);
+    }
+
     let timestamp = timestamp();
     let base = backup_base_dir();
     let type_dir = component.component_type.backup_subdir();
@@ -41,7 +52,7 @@ pub(crate) fn backup_component(component: &InstalledComponent) -> Result<PathBuf
         // Prune old backups for this component type
         cleanup_old_backups(component.component_type);
 
-        return Ok(backup_path);
+        return Ok(Some(backup_path));
     }
 
     let backup_path = base
@@ -56,7 +67,7 @@ pub(crate) fn backup_component(component: &InstalledComponent) -> Result<PathBuf
     // Prune old backups for this component type
     cleanup_old_backups(component.component_type);
 
-    Ok(backup_path)
+    Ok(Some(backup_path))
 }
 
 /// Restores a component from backup.
@@ -202,24 +213,29 @@ mod tests {
         assert_eq!(count_after, 5);
 
         // Verify the oldest 2 were removed (01 and 02)
-        assert!(!base
-            .path()
-            .join("2024-01-01T00-00-00")
-            .join(subdir)
-            .exists());
-        assert!(!base
-            .path()
-            .join("2024-01-02T00-00-00")
-            .join(subdir)
-            .exists());
+        assert!(
+            !base
+                .path()
+                .join("2024-01-01T00-00-00")
+                .join(subdir)
+                .exists()
+        );
+        assert!(
+            !base
+                .path()
+                .join("2024-01-02T00-00-00")
+                .join(subdir)
+                .exists()
+        );
 
         // Verify the newest 5 remain
         for i in 3..=7 {
-            assert!(base
-                .path()
-                .join(format!("2024-01-0{i}T00-00-00"))
-                .join(subdir)
-                .exists());
+            assert!(
+                base.path()
+                    .join(format!("2024-01-0{i}T00-00-00"))
+                    .join(subdir)
+                    .exists()
+            );
         }
     }
 
