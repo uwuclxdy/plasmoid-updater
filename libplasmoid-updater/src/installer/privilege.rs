@@ -68,7 +68,8 @@ pub(crate) fn copy_file(src: &Path, dest: &Path) -> Result<()> {
 pub(crate) fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
     if needs_sudo(dest) {
         run_sudo(&[
-            "cp", "-rfT",
+            "cp",
+            "-rfT",
             &src.to_string_lossy(),
             &dest.to_string_lossy(),
         ])

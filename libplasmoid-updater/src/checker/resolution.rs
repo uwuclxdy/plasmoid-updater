@@ -335,8 +335,11 @@ mod tests {
 
     #[test]
     fn name_match_is_case_insensitive() {
-        let component =
-            make_component("My Widget", "org.example.widget", ComponentType::PlasmaWidget);
+        let component = make_component(
+            "My Widget",
+            "org.example.widget",
+            ComponentType::PlasmaWidget,
+        );
         let entries = vec![make_entry(42, "my widget", 705)];
         let (wid, reg) = empty_lookup();
         let lookup = IdLookup {

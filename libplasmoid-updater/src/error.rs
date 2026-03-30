@@ -60,7 +60,9 @@ pub enum Error {
     #[error("restart failed: {0}")]
     RestartFailed(String),
 
-    #[error("installation failed ({install_error}) and backup restore also failed ({restore_error})")]
+    #[error(
+        "installation failed ({install_error}) and backup restore also failed ({restore_error})"
+    )]
     InstallAndRestoreFailed {
         install_error: String,
         restore_error: String,

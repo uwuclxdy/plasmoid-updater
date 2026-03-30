@@ -91,7 +91,10 @@ mod tests {
         let first = user_home();
         let second = user_home();
         assert_eq!(first, second);
-        assert!(std::ptr::eq(first, second), "should return same &'static ref");
+        assert!(
+            std::ptr::eq(first, second),
+            "should return same &'static ref"
+        );
     }
 
     #[test]

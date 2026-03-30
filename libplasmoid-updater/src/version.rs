@@ -190,9 +190,19 @@ mod tests {
         // Use strings that Versioning truly cannot parse (contain spaces)
         // and normalize to empty (no digits), so both paths yield None.
         // Both unparseable, differ, installed date newer → no update
-        assert!(!is_update_available_with_date("!@#", "***", "2025-06-01", "2024-01-01"));
+        assert!(!is_update_available_with_date(
+            "!@#",
+            "***",
+            "2025-06-01",
+            "2024-01-01"
+        ));
         // Both unparseable, differ, available date newer → update
-        assert!(is_update_available_with_date("!@#", "***", "2024-01-01", "2025-06-01"));
+        assert!(is_update_available_with_date(
+            "!@#",
+            "***",
+            "2024-01-01",
+            "2025-06-01"
+        ));
         // Both unparseable, differ, no dates → no update (conservative)
         assert!(!is_update_available_with_date("!@#", "***", "", ""));
     }
@@ -200,13 +210,23 @@ mod tests {
     #[test]
     fn prerelease_detected_as_update_to_release() {
         // 1.2.3-beta1 < 1.2.3 (pre-release is older than release)
-        assert!(is_update_available_with_date("1.2.3-beta1", "1.2.3", "", ""));
+        assert!(is_update_available_with_date(
+            "1.2.3-beta1",
+            "1.2.3",
+            "",
+            ""
+        ));
     }
 
     #[test]
     fn release_not_downgraded_to_prerelease() {
         // 1.2.3 > 1.2.3-beta1 (release is newer than pre-release)
-        assert!(!is_update_available_with_date("1.2.3", "1.2.3-beta1", "", ""));
+        assert!(!is_update_available_with_date(
+            "1.2.3",
+            "1.2.3-beta1",
+            "",
+            ""
+        ));
     }
 
     #[test]
