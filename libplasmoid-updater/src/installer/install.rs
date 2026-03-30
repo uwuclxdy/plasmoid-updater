@@ -7,6 +7,7 @@
 use std::{
     borrow::Cow,
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
 };
 
@@ -125,7 +126,11 @@ pub(super) fn patch_metadata(
 /// Patches a `metadata.desktop` file to update the `X-KDE-PluginInfo-Version` field.
 pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) -> Result<()> {
     let content = fs::read_to_string(metadata_path)?;
-    let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut found = false;
     let patched: String = content
         .lines()
@@ -161,18 +166,15 @@ pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) ->
 /// Reads the KPlugin.Id from a component's metadata.json, falling back to directory_name.
 fn resolve_plugin_id(component: &InstalledComponent) -> Cow<'_, str> {
     let metadata_path = component.path.join("metadata.json");
-    if let Ok(content) = fs::read_to_string(&metadata_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(id) = json
-                .get("KPlugin")
-                .and_then(|kp| kp.get("Id"))
-                .and_then(|v| v.as_str())
-            {
-                if !id.is_empty() {
-                    return Cow::Owned(id.to_string());
-                }
-            }
-        }
+    if let Ok(content) = fs::read_to_string(&metadata_path)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(id) = json
+            .get("KPlugin")
+            .and_then(|kp| kp.get("Id"))
+            .and_then(|v| v.as_str())
+        && !id.is_empty()
+    {
+        return Cow::Owned(id.to_string());
     }
     Cow::Borrowed(&component.directory_name)
 }
@@ -291,8 +293,13 @@ pub(super) fn install_via_kpackage(
 // --- Component Locators ---
 
 /// Locates a color scheme file in an archive directory.
+///
+/// First tries matching by file extension (`.colors`, `.colorscheme`).
+/// Falls back to content inspection, looking for KDE color scheme section
+/// markers (`[Colors:`) in the first 4 KiB of each file.
 fn locate_color_scheme_file(dir: &Path) -> Option<PathBuf> {
-    find_file_in_dir(dir, |path| {
+    // Try by extension first (fast path)
+    if let Some(path) = find_file_in_dir(dir, |path| {
         path.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|name| {
@@ -300,6 +307,20 @@ fn locate_color_scheme_file(dir: &Path) -> Option<PathBuf> {
                     .iter()
                     .any(|ext| name.ends_with(ext))
             })
+    }) {
+        return Some(path);
+    }
+
+    // Fallback: check file content for KDE color scheme markers
+    find_file_in_dir(dir, |path| {
+        let Ok(mut file) = fs::File::open(path) else {
+            return false;
+        };
+        let mut buf = [0u8; 4096];
+        let Ok(n) = file.read(&mut buf) else {
+            return false;
+        };
+        std::str::from_utf8(&buf[..n]).is_ok_and(|text| text.contains("[Colors:"))
     })
 }
 

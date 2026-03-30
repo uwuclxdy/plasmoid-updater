@@ -14,13 +14,14 @@ pub(crate) mod privilege;
 
 use std::{
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
     sync::atomic::AtomicUsize,
 };
 
 use crate::{
     registry,
-    types::{AvailableUpdate, InstalledComponent},
+    types::{AvailableUpdate, ComponentType, InstalledComponent},
     {Error, Result},
 };
 use backup::{backup_component, restore_component};
@@ -156,6 +157,27 @@ fn execute_installation(
     }
 }
 
+/// Checks the first bytes of a file for known archive format signatures.
+fn has_archive_magic(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 6];
+    let Ok(n) = file.read(&mut magic) else {
+        return false;
+    };
+    if n < 2 {
+        return false;
+    }
+    matches!(
+        magic[..2],
+        [0x1f, 0x8b]       // gzip
+        | [b'P', b'K']     // zip
+        | [b'B', b'Z']     // bzip2
+    ) || (n >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd]) // zstd
+        || (n >= 6 && magic[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) // xz
+}
+
 fn install_from_archive(
     downloaded_path: &Path,
     component: &InstalledComponent,
@@ -170,6 +192,22 @@ fn install_from_archive(
     }
 
     if let Err(e) = download::extract_archive(downloaded_path, &extract_dir) {
+        // For single-file types (color schemes, wallpapers), the download might
+        // be the raw file itself served without the expected extension.
+        if matches!(
+            component.component_type,
+            ComponentType::ColorScheme | ComponentType::Wallpaper
+        ) {
+            log::debug!(
+                target: "extract",
+                "extraction failed for {}, trying raw file install: {e}",
+                component.name,
+            );
+            reporter(3);
+            let result = install::install_raw_file(downloaded_path, component);
+            let _ = fs::remove_file(downloaded_path);
+            return result;
+        }
         log::error!(target: "extract", "failed for {}: {e}", component.name);
         let _ = fs::remove_file(downloaded_path);
         return Err(e);
