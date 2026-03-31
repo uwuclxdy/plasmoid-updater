@@ -112,7 +112,7 @@ pub(crate) fn remove_dir_all(path: &Path) -> Result<()> {
 ///
 /// Both `src` and `dest` must be on the same filesystem for the rename to be atomic.
 /// For user-local paths this is guaranteed when `src` is a sibling of `dest`.
-#[allow(dead_code)] // used by forthcoming atomic install helpers
+#[allow(dead_code)] // used by atomic install helpers; callers being migrated in next task
 pub(crate) fn rename(src: &Path, dest: &Path) -> Result<()> {
     if needs_sudo(dest) {
         run_sudo(&["mv", &src.to_string_lossy(), &dest.to_string_lossy()])

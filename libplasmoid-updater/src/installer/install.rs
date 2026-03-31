@@ -89,6 +89,69 @@ where
     action()
 }
 
+fn temp_sibling(path: &Path, suffix: &str) -> PathBuf {
+    use std::ffi::OsString;
+    let name = path.file_name().unwrap_or_default();
+    let mut temp_name = OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(suffix);
+    path.with_file_name(temp_name)
+}
+
+/// Installs a single file to `dest` atomically.
+///
+/// Copies `src` to a hidden sibling path (`.{name}.plasmoid-updater-new`), then
+/// renames it into place. On POSIX this rename is atomic and replaces any existing
+/// `dest` without a window where `dest` is absent.
+#[allow(dead_code)] // used by forthcoming callers migrating from replace_destination
+pub(super) fn atomic_install_file(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        privilege::create_dir_all(parent)?;
+    }
+    let temp = temp_sibling(dest, ".plasmoid-updater-new");
+    // Clean up a leftover from a previous crash
+    if temp.exists() {
+        let _ = privilege::remove_file(&temp);
+    }
+    privilege::copy_file(src, &temp)?;
+    privilege::rename(&temp, dest)?;
+    Ok(())
+}
+
+/// Installs a directory to `dest` atomically.
+///
+/// Copies `src` contents to `.{name}.plasmoid-updater-new/`, renames the existing
+/// `dest` to `.{name}.plasmoid-updater-old/`, renames new into place, then removes old.
+/// All renames are within the same parent directory so they are on the same filesystem.
+#[allow(dead_code)] // used by forthcoming callers migrating from replace_destination
+pub(super) fn atomic_install_dir(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        privilege::create_dir_all(parent)?;
+    }
+    let temp_new = temp_sibling(dest, ".plasmoid-updater-new");
+    let temp_old = temp_sibling(dest, ".plasmoid-updater-old");
+    // Clean up leftovers from a previous crash
+    if temp_new.exists() {
+        privilege::remove_dir_all(&temp_new)?;
+    }
+    if temp_old.exists() {
+        privilege::remove_dir_all(&temp_old)?;
+    }
+    // Write new content to temp
+    privilege::create_dir_all(&temp_new)?;
+    privilege::copy_dir(src, &temp_new)?;
+    // Atomic swap
+    if dest.exists() || dest.symlink_metadata().is_ok() {
+        privilege::rename(dest, &temp_old)?;
+    }
+    privilege::rename(&temp_new, dest)?;
+    // Best-effort cleanup of old
+    if temp_old.exists() {
+        let _ = privilege::remove_dir_all(&temp_old);
+    }
+    Ok(())
+}
+
 // --- Metadata ---
 
 pub(super) fn find_package_dir(extract_dir: &Path) -> Option<PathBuf> {
@@ -514,6 +577,107 @@ pub(super) fn install_raw_file(downloaded: &Path, component: &InstalledComponent
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_install_file_creates_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&src, b"content").unwrap();
+
+        atomic_install_file(&src, &dest).unwrap();
+
+        assert!(src.exists(), "src should not be consumed");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "content");
+        // No temp file leftover
+        let temp = temp_sibling(&dest, ".plasmoid-updater-new");
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn atomic_install_file_replaces_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        atomic_install_file(&src, &dest).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
+    }
+
+    #[test]
+    fn atomic_install_file_cleans_up_leftover_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&src, b"data").unwrap();
+        // Simulate leftover from crashed previous run
+        let leftover = temp_sibling(&dest, ".plasmoid-updater-new");
+        std::fs::write(&leftover, b"garbage").unwrap();
+
+        atomic_install_file(&src, &dest).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "data");
+        assert!(!leftover.exists());
+    }
+
+    #[test]
+    fn atomic_install_dir_creates_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src_dir");
+        let dest = dir.path().join("dest_dir");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("file.txt"), b"hello").unwrap();
+
+        atomic_install_dir(&src, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("file.txt")).unwrap(),
+            "hello"
+        );
+        // No temp leftovers
+        assert!(!temp_sibling(&dest, ".plasmoid-updater-new").exists());
+        assert!(!temp_sibling(&dest, ".plasmoid-updater-old").exists());
+    }
+
+    #[test]
+    fn atomic_install_dir_replaces_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src_dir");
+        let dest = dir.path().join("dest_dir");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("new.txt"), b"new").unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("old.txt"), b"old").unwrap();
+
+        atomic_install_dir(&src, &dest).unwrap();
+
+        assert!(dest.join("new.txt").exists());
+        assert!(!dest.join("old.txt").exists(), "old content must be gone");
+    }
+
+    #[test]
+    fn atomic_install_dir_cleans_up_leftover_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src_dir");
+        let dest = dir.path().join("dest_dir");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), b"x").unwrap();
+
+        // Simulate crash leftovers
+        let t_new = temp_sibling(&dest, ".plasmoid-updater-new");
+        let t_old = temp_sibling(&dest, ".plasmoid-updater-old");
+        std::fs::create_dir_all(&t_new).unwrap();
+        std::fs::create_dir_all(&t_old).unwrap();
+
+        atomic_install_dir(&src, &dest).unwrap();
+
+        assert!(dest.join("f.txt").exists());
+        assert!(!t_new.exists());
+        assert!(!t_old.exists());
+    }
 
     #[test]
     fn patch_metadata_desktop_preserves_crlf() {
