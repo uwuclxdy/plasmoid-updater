@@ -70,25 +70,6 @@ where
 
 // --- Utility Functions ---
 
-fn replace_destination<F>(dest: &Path, action: F) -> Result<()>
-where
-    F: FnOnce() -> Result<()>,
-{
-    if dest.exists() {
-        if dest.is_dir() {
-            privilege::remove_dir_all(dest)?;
-        } else {
-            privilege::remove_file(dest)?;
-        }
-    }
-
-    if let Some(parent) = dest.parent() {
-        privilege::create_dir_all(parent)?;
-    }
-
-    action()
-}
-
 fn temp_sibling(path: &Path, suffix: &str) -> PathBuf {
     use std::ffi::OsString;
     let name = path.file_name().unwrap_or_default();
@@ -103,7 +84,6 @@ fn temp_sibling(path: &Path, suffix: &str) -> PathBuf {
 /// Copies `src` to a hidden sibling path (`.{name}.plasmoid-updater-new`), then
 /// renames it into place. On POSIX this rename is atomic and replaces any existing
 /// `dest` without a window where `dest` is absent.
-#[allow(dead_code)] // used by forthcoming callers migrating from replace_destination
 pub(super) fn atomic_install_file(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         privilege::create_dir_all(parent)?;
@@ -123,7 +103,6 @@ pub(super) fn atomic_install_file(src: &Path, dest: &Path) -> Result<()> {
 /// Copies `src` contents to `.{name}.plasmoid-updater-new/`, renames the existing
 /// `dest` to `.{name}.plasmoid-updater-old/`, renames new into place, then removes old.
 /// All renames are within the same parent directory so they are on the same filesystem.
-#[allow(dead_code)] // used by forthcoming callers migrating from replace_destination
 pub(super) fn atomic_install_dir(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         privilege::create_dir_all(parent)?;
@@ -487,23 +466,18 @@ fn install_color_scheme(extract_dir: &Path, dest_path: &Path) -> Result<()> {
     let color_file = locate_color_scheme_file(extract_dir)
         .ok_or_else(|| Error::install("no color scheme file found in archive"))?;
 
-    replace_destination(dest_path, || {
-        privilege::copy_file(&color_file, dest_path)?;
-        log::debug!(target: "install", "copied color scheme to {}", dest_path.display());
-        Ok(())
-    })
+    atomic_install_file(&color_file, dest_path)?;
+    log::debug!(target: "install", "copied color scheme to {}", dest_path.display());
+    Ok(())
 }
 
 fn install_icon_theme(extract_dir: &Path, dest_dir: &Path) -> Result<()> {
     let source_dir = find_icon_theme_dir(extract_dir)
         .ok_or_else(|| Error::install("no icon theme (index.theme) found in archive"))?;
 
-    replace_destination(dest_dir, || {
-        privilege::create_dir_all(dest_dir)?;
-        privilege::copy_dir(&source_dir, dest_dir)?;
-        log::debug!(target: "install", "copied icon theme to {}", dest_dir.display());
-        Ok(())
-    })
+    atomic_install_dir(&source_dir, dest_dir)?;
+    log::debug!(target: "install", "copied icon theme to {}", dest_dir.display());
+    Ok(())
 }
 
 fn install_wallpaper(extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
@@ -513,19 +487,13 @@ fn install_wallpaper(extract_dir: &Path, component: &InstalledComponent) -> Resu
     let dest = &component.path;
 
     if source.is_file() {
-        replace_destination(dest, || {
-            privilege::copy_file(&source, dest)?;
-            log::debug!(target: "install", "copied wallpaper to {}", dest.display());
-            Ok(())
-        })
+        atomic_install_file(&source, dest)?;
+        log::debug!(target: "install", "copied wallpaper to {}", dest.display());
     } else {
-        replace_destination(dest, || {
-            privilege::create_dir_all(dest)?;
-            privilege::copy_dir(&source, dest)?;
-            log::debug!(target: "install", "copied wallpaper dir to {}", dest.display());
-            Ok(())
-        })
+        atomic_install_dir(&source, dest)?;
+        log::debug!(target: "install", "copied wallpaper dir to {}", dest.display());
     }
+    Ok(())
 }
 
 fn install_theme_dir(
@@ -540,12 +508,9 @@ fn install_theme_dir(
             ))
         })?;
 
-    replace_destination(dest_dir, || {
-        privilege::create_dir_all(dest_dir)?;
-        privilege::copy_dir(&source_dir, dest_dir)?;
-        log::debug!(target: "install", "copied {} to {}", component_type, dest_dir.display());
-        Ok(())
-    })
+    atomic_install_dir(&source_dir, dest_dir)?;
+    log::debug!(target: "install", "copied {} to {}", component_type, dest_dir.display());
+    Ok(())
 }
 
 /// Returns `true` if the path is a single-file component (e.g., color scheme file, image).
@@ -566,12 +531,9 @@ pub(super) fn is_single_file_component(path: &Path, component_type: ComponentTyp
 
 pub(super) fn install_raw_file(downloaded: &Path, component: &InstalledComponent) -> Result<()> {
     let dest = &component.path;
-
-    replace_destination(dest, || {
-        privilege::copy_file(downloaded, dest)?;
-        log::debug!(target: "install", "copied raw file to {}", dest.display());
-        Ok(())
-    })
+    atomic_install_file(downloaded, dest)?;
+    log::debug!(target: "install", "copied raw file to {}", dest.display());
+    Ok(())
 }
 
 #[cfg(test)]
