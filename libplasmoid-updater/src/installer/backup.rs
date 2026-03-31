@@ -70,35 +70,21 @@ pub(crate) fn backup_component(component: &InstalledComponent) -> Result<Option<
     Ok(Some(backup_path))
 }
 
-/// Restores a component from backup.
+/// Restores a component from backup atomically.
+///
+/// Uses `atomic_install_file` / `atomic_install_dir` so the original path is
+/// never absent during the restore — a failed restore leaves the new backup
+/// content in a temp sibling, not an empty destination.
 pub(crate) fn restore_component(backup_path: &Path, original_path: &Path) -> Result<()> {
-    use super::privilege;
+    use super::install::{atomic_install_dir, atomic_install_file};
 
-    // handle single files
     if backup_path.is_file() {
-        if let Some(parent) = original_path.parent() {
-            privilege::create_dir_all(parent)
-                .map_err(|e| Error::backup(format!("create parent dir: {e}")))?;
-        }
-
-        privilege::copy_file(backup_path, original_path)
+        atomic_install_file(backup_path, original_path)
             .map_err(|e| Error::backup(format!("restore file: {e}")))?;
-
-        return Ok(());
+    } else {
+        atomic_install_dir(backup_path, original_path)
+            .map_err(|e| Error::backup(format!("restore dir: {e}")))?;
     }
-
-    if original_path.exists() {
-        privilege::remove_dir_all(original_path)
-            .map_err(|e| Error::backup(format!("remove failed install: {e}")))?;
-    }
-
-    if let Some(parent) = original_path.parent() {
-        privilege::create_dir_all(parent)
-            .map_err(|e| Error::backup(format!("create parent dir: {e}")))?;
-    }
-
-    privilege::copy_dir(backup_path, original_path)
-        .map_err(|e| Error::backup(format!("copy dir: {e}")))?;
 
     Ok(())
 }
@@ -237,6 +223,59 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[test]
+    fn restore_component_file_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.colors");
+        let original = dir.path().join("original.colors");
+        std::fs::write(&backup, b"backup content").unwrap();
+        std::fs::write(&original, b"current content").unwrap();
+
+        restore_component(&backup, &original).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&original).unwrap(),
+            "backup content"
+        );
+        // Backup must still exist (restore only copies, does not move)
+        assert!(backup.exists());
+    }
+
+    #[test]
+    fn restore_component_dir_replaces_partial_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup_pkg");
+        let original_dir = dir.path().join("original_pkg");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("metadata.json"), b"{}").unwrap();
+        // Simulate a partial (broken) install at original
+        std::fs::create_dir_all(&original_dir).unwrap();
+        std::fs::write(original_dir.join("broken.txt"), b"partial").unwrap();
+
+        restore_component(&backup_dir, &original_dir).unwrap();
+
+        assert!(original_dir.join("metadata.json").exists());
+        assert!(
+            !original_dir.join("broken.txt").exists(),
+            "partial install content must be replaced"
+        );
+        // Backup untouched
+        assert!(backup_dir.join("metadata.json").exists());
+    }
+
+    #[test]
+    fn restore_component_dir_creates_original_if_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup_pkg");
+        let original_dir = dir.path().join("original_pkg");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("meta.json"), b"{}").unwrap();
+
+        restore_component(&backup_dir, &original_dir).unwrap();
+
+        assert!(original_dir.join("meta.json").exists());
     }
 
     #[test]
