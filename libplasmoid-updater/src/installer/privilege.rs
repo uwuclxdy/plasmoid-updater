@@ -108,6 +108,20 @@ pub(crate) fn remove_dir_all(path: &Path) -> Result<()> {
     }
 }
 
+/// Renames (moves) a file or directory atomically, using sudo mv if the destination requires it.
+///
+/// Both `src` and `dest` must be on the same filesystem for the rename to be atomic.
+/// For user-local paths this is guaranteed when `src` is a sibling of `dest`.
+#[allow(dead_code)] // used by forthcoming atomic install helpers
+pub(crate) fn rename(src: &Path, dest: &Path) -> Result<()> {
+    if needs_sudo(dest) {
+        run_sudo(&["mv", &src.to_string_lossy(), &dest.to_string_lossy()])
+    } else {
+        std::fs::rename(src, dest)?;
+        Ok(())
+    }
+}
+
 /// Writes content to a file, using sudo tee if the path requires it.
 pub(crate) fn write_file(path: &Path, content: &[u8]) -> Result<()> {
     if needs_sudo(path) {
@@ -252,6 +266,33 @@ mod tests {
         write_file(&f, b"hello world").unwrap();
 
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn rename_non_system_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&src, b"hello").unwrap();
+
+        rename(&src, &dest).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello");
+    }
+
+    #[test]
+    fn rename_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("new.txt");
+        let dest = dir.path().join("old.txt");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        rename(&src, &dest).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
     }
 
     #[test]
