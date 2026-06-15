@@ -1,6 +1,6 @@
 [package]
 name = "plasmoid-updater"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "CLI tool for updating KDE Plasma 6 components from the KDE Store"
@@ -15,7 +15,7 @@ name = "plasmoid-updater"
 path = "src/main.rs"
 
 [dependencies]
-libplasmoid-updater = { path = "../libplasmoid-updater", version = "0.2.0", features = ["cli"] }
+libplasmoid-updater = { path = "../libplasmoid-updater", version = "0.2.1", features = ["cli"] }
 clap = { version = "4.6.1", features = ["derive"] }
 toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }
