@@ -16,6 +16,7 @@ fn config_path() -> Option<PathBuf> {
 #[serde(default)]
 struct TomlConfig {
     excluded_packages: Vec<String>,
+    excluded_patterns: Vec<String>,
     update_all_by_default: bool,
     assume_yes: bool,
     prompt_restart: bool,
@@ -57,6 +58,7 @@ impl CliConfig {
 
         let mut inner = libplasmoid_updater::Config::new()
             .with_excluded_packages(toml_config.excluded_packages)
+            .with_excluded_patterns(toml_config.excluded_patterns)
             .with_restart(if toml_config.prompt_restart {
                 libplasmoid_updater::RestartBehavior::Prompt
             } else {
@@ -148,7 +150,8 @@ fn create_config_directory(path: &Path) -> libplasmoid_updater::Result<()> {
 
 fn create_default_config(path: &Path) -> libplasmoid_updater::Result<()> {
     let default_content = r#"# plasmoid-updater configuration
-# excluded_packages = ["widget-name", "another.widget"]
+# excluded_packages = ["widget-name", "another.widget"]  # exact name or directory match
+# excluded_patterns = ["^org\\.kde\\.", "weather"]  # regex, matched against name and directory
 # update_all_by_default = false
 # assume_yes = false  # automatically confirm all updates without prompting
 # prompt_restart = true

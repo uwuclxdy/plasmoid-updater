@@ -104,7 +104,8 @@ impl CheckResult {
 ///
 /// Runs the full update pipeline: scan installed components, check for updates, select
 /// which to apply, then download and install. Handles plasmashell restart based on
-/// [`Config::restart`]. Components in [`Config::excluded_packages`] are always skipped.
+/// [`Config::restart`]. Components matching [`Config::excluded_packages`] (exact) or
+/// [`Config::excluded_patterns`] (regex) are always skipped.
 ///
 /// With the `cli` feature enabled and [`Config::auto_confirm`] unset, shows an interactive
 /// multi-select menu. Otherwise, all available updates are applied automatically.

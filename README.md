@@ -69,6 +69,24 @@ Options:
 
 ```
 
+## Configuration
+
+Settings live in a TOML file at `$XDG_CONFIG_HOME/plasmoid-updater.toml` (usually
+`~/.config/plasmoid-updater.toml`). Open it with `plasmoid-updater --edit-config`.
+
+```toml
+# exact name or directory match
+excluded_packages = ["widget-name", "another.widget"]
+# regex, matched against both the name and directory of each component
+excluded_patterns = ["^org\\.kde\\.", "weather"]
+update_all_by_default = false
+assume_yes = false        # confirm all updates without prompting
+prompt_restart = true     # ask before restarting plasmashell
+```
+
+Excluded components are skipped during updates. Invalid regex patterns are dropped with a
+warning instead of aborting the run.
+
 ## Topgrade integreation (Preview)
 
 [Topgrade](https://github.com/topgrade-rs/topgrade/) is a CLI tool that updates everything with a single command.

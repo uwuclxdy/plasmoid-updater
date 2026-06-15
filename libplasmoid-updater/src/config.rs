@@ -69,6 +69,14 @@ pub struct Config {
     /// will be skipped during update operations.
     pub excluded_packages: Vec<String>,
 
+    /// Regex patterns to exclude from updates.
+    ///
+    /// Each pattern is matched (unanchored) against both the directory name
+    /// and the display name of every candidate. Complements
+    /// [`excluded_packages`](Self::excluded_packages), which matches exactly.
+    /// Invalid patterns are dropped with a warning rather than aborting the run.
+    pub excluded_patterns: Vec<String>,
+
     /// Widget ID fallback table mapping directory names to KDE Store content IDs.
     ///
     /// This table is used as a fallback when content ID resolution via KNewStuff
@@ -195,6 +203,28 @@ impl Config {
     /// ```
     pub fn with_excluded_packages(mut self, packages: Vec<String>) -> Self {
         self.excluded_packages = packages;
+        self
+    }
+
+    /// Sets the list of regex patterns to exclude from updates.
+    ///
+    /// Each pattern is matched (unanchored) against both the directory name
+    /// and the display name of every candidate. Invalid patterns are dropped
+    /// with a warning when the update run starts.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use libplasmoid_updater::Config;
+    ///
+    /// let config = Config::new()
+    ///     .with_excluded_patterns(vec![
+    ///         r"^org\.kde\.".to_string(),
+    ///         "weather".to_string(),
+    ///     ]);
+    /// ```
+    pub fn with_excluded_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.excluded_patterns = patterns;
         self
     }
 

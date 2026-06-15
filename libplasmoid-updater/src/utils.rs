@@ -57,28 +57,81 @@ pub(crate) fn select_updates<'a>(
     updates: &'a [AvailableUpdate],
     config: &Config,
 ) -> crate::Result<Vec<&'a AvailableUpdate>> {
+    let matcher = ExcludeMatcher::new(&config.excluded_packages, &config.excluded_patterns);
+
     #[cfg(feature = "cli")]
     if !config.auto_confirm && stdin_is_terminal() {
-        return prompt_update_selection(updates, &config.excluded_packages);
+        return prompt_update_selection(updates, &matcher);
     }
 
-    Ok(filter_excluded(updates, &config.excluded_packages))
+    Ok(filter_excluded(updates, &matcher))
 }
 
 pub(crate) fn filter_excluded<'a>(
     updates: &'a [AvailableUpdate],
-    excluded: &[String],
+    matcher: &ExcludeMatcher,
 ) -> Vec<&'a AvailableUpdate> {
-    updates
-        .iter()
-        .filter(|u| !is_excluded(u, excluded))
-        .collect()
+    updates.iter().filter(|u| !matcher.is_excluded(u)).collect()
 }
 
-pub(crate) fn is_excluded(update: &AvailableUpdate, excluded: &[String]) -> bool {
-    excluded
+/// Decides whether a candidate update is excluded from selection.
+///
+/// Combines an exact-match list (matched against directory and display name)
+/// with a set of regex patterns compiled once up front. Mirrors Apdatifier's
+/// two rule types: `name` (exact) and `regex`.
+pub(crate) struct ExcludeMatcher<'a> {
+    exact: &'a [String],
+    patterns: Option<regex::RegexSet>,
+}
+
+impl<'a> ExcludeMatcher<'a> {
+    /// Builds a matcher, compiling `patterns` once. Invalid patterns are
+    /// dropped with a warning rather than aborting the run.
+    pub(crate) fn new(exact: &'a [String], patterns: &[String]) -> Self {
+        Self {
+            exact,
+            patterns: compile_exclude_patterns(patterns),
+        }
+    }
+
+    pub(crate) fn is_excluded(&self, update: &AvailableUpdate) -> bool {
+        let dir = &update.installed.directory_name;
+        let name = &update.installed.name;
+
+        if self.exact.iter().any(|e| e == dir || e == name) {
+            return true;
+        }
+
+        match &self.patterns {
+            Some(set) => set.is_match(dir) || set.is_match(name),
+            None => false,
+        }
+    }
+}
+
+/// Compiles exclusion patterns into a single [`regex::RegexSet`].
+///
+/// Each pattern is validated individually so a single bad pattern only drops
+/// itself (with a warning) instead of discarding the whole set. Returns `None`
+/// when no usable pattern remains, letting the matcher skip regex work entirely.
+fn compile_exclude_patterns(patterns: &[String]) -> Option<regex::RegexSet> {
+    let valid: Vec<&str> = patterns
         .iter()
-        .any(|e| e == &update.installed.directory_name || e == &update.installed.name)
+        .filter(|p| match regex::Regex::new(p) {
+            Ok(_) => true,
+            Err(e) => {
+                log::warn!(target: "config", "ignoring invalid exclude pattern {p:?}: {e}");
+                false
+            }
+        })
+        .map(String::as_str)
+        .collect();
+
+    if valid.is_empty() {
+        return None;
+    }
+
+    regex::RegexSet::new(&valid).ok()
 }
 
 #[cfg(feature = "cli")]
@@ -90,14 +143,14 @@ pub(crate) fn stdin_is_terminal() -> bool {
 #[cfg(feature = "cli")]
 pub(crate) fn prompt_update_selection<'a>(
     updates: &'a [AvailableUpdate],
-    excluded: &[String],
+    matcher: &ExcludeMatcher,
 ) -> crate::Result<Vec<&'a AvailableUpdate>> {
     let options = format_menu_options(updates);
 
     let defaults: Vec<usize> = updates
         .iter()
         .enumerate()
-        .filter(|(_, u)| !is_excluded(u, excluded))
+        .filter(|(_, u)| !matcher.is_excluded(u))
         .map(|(i, _)| i)
         .collect();
 
@@ -287,4 +340,38 @@ pub(crate) fn display_check_results(result: &crate::types::UpdateCheckResult) {
 
     cli::output::print_count_message(result.updates.len(), "update");
     cli::output::print_updates_table(&result.updates);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_exclude_patterns;
+
+    #[test]
+    fn compile_keeps_valid_patterns_and_matches_both_substrings_and_anchors() {
+        let set = compile_exclude_patterns(&[r"^org\.kde\.".to_string(), "weather".to_string()])
+            .expect("two valid patterns should compile");
+
+        assert!(set.is_match("org.kde.plasma.systemmonitor"));
+        assert!(set.is_match("my-weather-widget"));
+        assert!(!set.is_match("com.example.clock"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn compile_drops_only_the_invalid_pattern() {
+        let set = compile_exclude_patterns(&[
+            "valid".to_string(),
+            "(".to_string(), // unbalanced group — invalid
+        ])
+        .expect("the one valid pattern should survive");
+
+        assert_eq!(set.len(), 1);
+        assert!(set.is_match("a valid name"));
+    }
+
+    #[test]
+    fn compile_returns_none_when_empty_or_all_invalid() {
+        assert!(compile_exclude_patterns(&[]).is_none());
+        assert!(compile_exclude_patterns(&["(".to_string()]).is_none());
+    }
 }
