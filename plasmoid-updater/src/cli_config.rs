@@ -7,8 +7,12 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 const CONFIG_FILE_NAME: &str = "plasmoid-updater.toml";
+const CONFIG_DIR_ENV: &str = "PLASMOID_UPDATER_CONFIG_DIR";
 
 fn config_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV).filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir).join(CONFIG_FILE_NAME));
+    }
     dirs::config_dir().map(|d| d.join(CONFIG_FILE_NAME))
 }
 

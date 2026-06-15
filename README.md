@@ -76,7 +76,9 @@ only, on top of the config exclusions. Example: `plasmoid-updater update --ignor
 ## Configuration
 
 Settings live in a TOML file at `$XDG_CONFIG_HOME/plasmoid-updater.toml` (usually
-`~/.config/plasmoid-updater.toml`). Open it with `plasmoid-updater --edit-config`.
+`~/.config/plasmoid-updater.toml`). Open it with `plasmoid-updater --edit-config`. Set
+`PLASMOID_UPDATER_CONFIG_DIR` to point at a different directory (tests, sandboxes, multiple
+profiles).
 
 ```toml
 # exact name or directory match
