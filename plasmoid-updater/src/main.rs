@@ -43,7 +43,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "check for available updates")]
-    Check,
+    Check {
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "NAMES",
+            help = "names to skip for this run (comma-separated or repeatable)"
+        )]
+        ignore: Vec<String>,
+    },
     #[command(about = "list all installed components")]
     ListInstalled,
     #[command(about = "update components")]
@@ -56,6 +64,13 @@ enum Commands {
         no_restart_plasma: bool,
         #[arg(short = 'y', long, help = "automatically confirm all updates")]
         yes: bool,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "NAMES",
+            help = "names to skip for this run (comma-separated or repeatable)"
+        )]
+        ignore: Vec<String>,
     },
 }
 
@@ -65,6 +80,7 @@ struct UpdateArgs {
     restart_plasma: bool,
     no_restart_plasma: bool,
     yes: bool,
+    ignore: Vec<String>,
 }
 
 fn main() {
@@ -98,13 +114,14 @@ fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, libplasmoi
 
     match &cli.command {
         None => do_update(config, UpdateArgs::default()),
-        Some(Commands::Check) => do_check(config),
+        Some(Commands::Check { ignore }) => do_check(config, ignore),
         Some(Commands::ListInstalled) => do_list_installed(config),
         Some(Commands::Update {
             component,
             restart_plasma,
             no_restart_plasma,
             yes,
+            ignore,
         }) => do_update(
             config,
             UpdateArgs {
@@ -112,13 +129,18 @@ fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, libplasmoi
                 restart_plasma: *restart_plasma,
                 no_restart_plasma: *no_restart_plasma,
                 yes: *yes,
+                ignore: ignore.clone(),
             },
         ),
     }
 }
 
-fn do_check(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> {
-    check(&config.inner)?;
+fn do_check(config: &CliConfig, ignore: &[String]) -> Result<ExitCode, libplasmoid_updater::Error> {
+    let mut check_config = config.inner.clone();
+    check_config
+        .excluded_packages
+        .extend(ignore.iter().cloned());
+    check(&check_config)?;
     Ok(ExitCode::Success)
 }
 
@@ -129,6 +151,7 @@ fn do_list_installed(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater
 
 fn do_update(config: &CliConfig, args: UpdateArgs) -> Result<ExitCode, libplasmoid_updater::Error> {
     let mut update_config = config.inner.clone();
+    update_config.excluded_packages.extend(args.ignore);
 
     if args.yes || config.assume_yes || config.update_all_by_default {
         update_config.auto_confirm = true;

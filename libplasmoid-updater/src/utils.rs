@@ -332,14 +332,22 @@ pub(crate) fn prompt_restart() {
 }
 
 #[cfg(feature = "cli")]
-pub(crate) fn display_check_results(result: &crate::types::UpdateCheckResult) {
-    if result.updates.is_empty() {
+pub(crate) fn display_check_results(result: &crate::types::UpdateCheckResult, config: &Config) {
+    let matcher = ExcludeMatcher::new(&config.excluded_packages, &config.excluded_patterns);
+    let visible: Vec<AvailableUpdate> = result
+        .updates
+        .iter()
+        .filter(|u| !matcher.is_excluded(u))
+        .cloned()
+        .collect();
+
+    if visible.is_empty() {
         println!("no updates available");
         return;
     }
 
-    cli::output::print_count_message(result.updates.len(), "update");
-    cli::output::print_updates_table(&result.updates);
+    cli::output::print_count_message(visible.len(), "update");
+    cli::output::print_updates_table(&visible);
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ pub fn check(config: &Config) -> Result<CheckResult> {
     let result = crate::utils::fetch_updates(&api_client, config)?;
 
     #[cfg(feature = "cli")]
-    crate::utils::display_check_results(&result);
+    crate::utils::display_check_results(&result, config);
 
     Ok(CheckResult::from_internal(result))
 }

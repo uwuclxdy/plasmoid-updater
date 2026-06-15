@@ -63,11 +63,15 @@ Options:
       --restart-plasma         automatically restart plasmashell
       --no-restart-plasma      do not restart plasmashell
   -y, --yes                    automatically confirm all updates
+      --ignore <NAMES>         names to skip for this run (comma-separated or repeatable)
       --system                 operate on system-wide components (needs sudo)
       --skip-plasma-detection  skip KDE Plasma detection
   -h, --help                   Print help
 
 ```
+
+`--ignore` works on both `check` and `update` and skips the named components for that run
+only, on top of the config exclusions. Example: `plasmoid-updater update --ignore weather,clock`.
 
 ## Configuration
 
@@ -84,8 +88,8 @@ assume_yes = false        # confirm all updates without prompting
 prompt_restart = true     # ask before restarting plasmashell
 ```
 
-Excluded components are skipped during updates. Invalid regex patterns are dropped with a
-warning instead of aborting the run.
+Excluded components are skipped during updates and hidden from `check`. Invalid regex
+patterns are dropped with a warning instead of aborting the run.
 
 ## Topgrade integreation (Preview)
 
