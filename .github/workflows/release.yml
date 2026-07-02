@@ -10,6 +10,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Release page exists the moment the tag lands; notes are NOT auto-generated
+  # (the release script writes them), the binary attaches when the build finishes.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-linux:
     runs-on: ubuntu-latest
     steps:
@@ -42,7 +53,7 @@ jobs:
           path: release/plasmoid-updater-linux-x64
 
   release:
-    needs: [build-linux]
+    needs: [build-linux, create-release]
     runs-on: ubuntu-latest
     steps:
       - name: Download Linux artifact
@@ -58,6 +69,5 @@ jobs:
             release/plasmoid-updater-linux-x64
           draft: false
           prerelease: false
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
