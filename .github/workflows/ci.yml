@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - wiki/**
+      - docs/**
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - wiki/**
+      - docs/**
+
+# Least-privilege default: read-only token. A job that needs more (e.g. a docker
+# publish job) opts back up with its own `permissions:` block.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so rapid pushes don't stack.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Force HTTP/1.1 for registry downloads: curl's HTTP/2 multiplexing against the
+# crates.io CDN intermittently dies with "[16] Error in the HTTP2 framing layer"
+# on the hosted runners. Extra retries cover the remaining transient blips.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_INCREMENTAL: "0"  # incremental caching is dead weight in CI
+  # CI checks compile at release opt-level but WITHOUT the shipped binary's LTO:
+  # LTO + codegen-units=1 change nothing for clippy/test and roughly double the
+  # compile. release.yml is a separate workflow, so the shipped binary keeps full
+  # LTO; this override only touches CI's throwaway build.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: fmt --check
+        run: cargo fmt --all -- --check
+
+  # clippy → test → release build as sequential steps in ONE job so the dep
+  # compile happens once per OS: clippy builds deps + lints, test (nextest) reuses
+  # target/, the release binary falls out of it, then uploads as a 1-day artifact.
+  # Compile is release opt-level minus LTO (env block drops the LTO tax for CI).
+  # mold self-gates on linux. Trade: a clippy failure aborts before test/build, so
+  # fix clippy first. Workspace crate: clippy/nextest/doctest/build all get
+  # --workspace so both members (lib + bin) are covered.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # mold is the fast linker on linux; self-gates so a matrix mac/windows leg
+      # falls back to the platform default. Runs before rust-cache so RUSTFLAGS is
+      # part of the cache key.
+      - name: fast linker (mold on linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y mold
+          echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets --all-features --release -- -D warnings
+      - name: test
+        run: cargo nextest run --workspace --release --all-targets --all-features
+      # nextest can't run doctests, so cover them with cargo test. Self-gates on
+      # a doctest target so a bin-only crate (no lib) skips instead of erroring
+      # with "no library targets found".
+      - name: doctests
+        shell: bash
+        run: |
+          if cargo metadata --no-deps --format-version 1 | grep -q '"doctest":true'; then
+            cargo test --workspace --release --doc --all-features
+          else
+            echo "no doctest targets; skipping"
+          fi
+      - name: build release binary
+        run: cargo build --workspace --release
+      - name: upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: plasmoid-updater
+          if-no-files-found: error
+          retention-days: 1
+          path: target/release/plasmoid-updater
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@cargo-audit
+      - name: cargo audit
+        run: cargo audit
