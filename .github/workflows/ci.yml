@@ -31,15 +31,22 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
   CARGO_INCREMENTAL: "0"  # incremental caching is dead weight in CI
-  # CI checks compile at release opt-level but WITHOUT the shipped binary's LTO:
-  # LTO + codegen-units=1 change nothing for clippy/test and roughly double the
-  # compile. release.yml is a separate workflow, so the shipped binary keeps full
-  # LTO; this override only touches CI's throwaway build.
+  # CI checks compile at release opt-level but WITHOUT the shipped binary's thin
+  # LTO: the root Cargo.toml carries a [profile.release] with lto = "thin",
+  # codegen-units = 1 and strip = true that released binaries build with. LTO +
+  # codegen-units=1 change nothing for clippy/test and roughly double the
+  # compile, so CI overrides both for speed. release.yml is a separate workflow
+  # and keeps that profile, so released binaries still ship thin LTO; this
+  # override only touches CI's throwaway build.
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
+# A `v*` tag push runs release.yml only, never CI: the `on.push.branches` filter
+# already excludes tag refs, and the per-job `if` keeps checks off tag/release refs
+# even if that trigger is later broadened. PRs (refs/pull/*) and branch pushes run.
 jobs:
   fmt:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,14 +56,17 @@ jobs:
       - name: fmt --check
         run: cargo fmt --all -- --check
 
-  # clippy → test → release build as sequential steps in ONE job so the dep
-  # compile happens once per OS: clippy builds deps + lints, test (nextest) reuses
-  # target/, the release binary falls out of it, then uploads as a 1-day artifact.
-  # Compile is release opt-level minus LTO (env block drops the LTO tax for CI).
-  # mold self-gates on linux. Trade: a clippy failure aborts before test/build, so
-  # fix clippy first. Workspace crate: clippy/nextest/doctest/build all get
-  # --workspace so both members (lib + bin) are covered.
+  # clippy → instrumented test → release build as sequential steps in ONE job:
+  # clippy builds deps + lints, the instrumented run compiles into
+  # target/llvm-cov-target (cargo-llvm-cov's own target dir — the job pays a
+  # second full dep compile for it), and the release binary then reuses clippy's
+  # target/ and uploads as a 1-day artifact. Compile is release opt-level minus
+  # LTO (env block drops the LTO tax for CI). mold self-gates on linux. Trade: a
+  # clippy failure aborts before test/build, so fix clippy first. Workspace
+  # crate: clippy/coverage/doctest/build all get --workspace so both members
+  # (lib + bin) are covered.
   check:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -73,10 +83,20 @@ jobs:
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - name: clippy (-D warnings)
         run: cargo clippy --workspace --all-targets --all-features --release -- -D warnings
-      - name: test
-        run: cargo nextest run --workspace --release --all-targets --all-features
+      # Instrumented suite run: cargo-llvm-cov drives nextest and writes the lcov
+      # report the coverage job below stores. `--no-fail-fast` so a red run
+      # reports every failure instead of a prefix: nextest cancels at the first
+      # one, so you fix what you were shown, push, and are handed more — which
+      # reads like a regression your own fix caused, at a build per round.
+      # Benchmarks compile under clippy's `--all-targets`; they are not executed
+      # here (a `harness = false` benchmark has its own CLI and rejects the
+      # libtest arguments nextest uses to list tests). The step name is load-
+      # bearing: the octocov config's testExecutionTime.steps matches it by name.
+      - name: test (coverage)
+        run: cargo llvm-cov nextest --workspace --release --all-features --no-fail-fast --lcov --output-path lcov.info
       # nextest can't run doctests, so cover them with cargo test. Self-gates on
       # a doctest target so a bin-only crate (no lib) skips instead of erroring
       # with "no library targets found".
@@ -97,8 +117,16 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           path: target/release/plasmoid-updater
+      - name: upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: lcov
+          if-no-files-found: error
+          retention-days: 7
+          path: lcov.info
 
   deny:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -107,9 +135,46 @@ jobs:
           command: check advisories licenses bans sources
 
   audit:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
         run: cargo audit
+
+  # Separate job so the write token never meets build code: job-level
+  # `permissions` would apply to every leg of the check job, where checkout
+  # persists the token in .git/config and any build/test step can write
+  # $GITHUB_ENV, which every later step there inherits. `!cancelled()` so the
+  # job still runs when check fails and reds on the missing lcov artifact (the
+  # download step has no continue-on-error); a red test step writes no lcov,
+  # because cargo-llvm-cov aborts before generating the report. The report lands
+  # on the repo's own `coverage` branch via the Git Data API, so no secret is
+  # involved — the workflow token is enough.
+  coverage:
+    name: Coverage
+    needs: check
+    if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # report store: git-data-API commits on the coverage branch
+      pull-requests: write  # PR comment
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Download coverage report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: lcov
+      - name: Run octocov
+        env:
+          OCTOCOV_GITHUB_TOKEN: ${{ github.token }}
+          BIN_VERSION: v0.83.3
+        run: |
+          curl -fsSL -o octocov.tar.gz "https://github.com/k1LoW/octocov/releases/download/${BIN_VERSION}/octocov_${BIN_VERSION}_linux_amd64.tar.gz"
+          echo "8d6576580d151e785474f193d740f63cb91b70ac767d402410fcd7f187a34202  octocov.tar.gz" | sha256sum -c -
+          tar -xzf octocov.tar.gz octocov
+          ./octocov
