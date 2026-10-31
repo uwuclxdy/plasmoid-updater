@@ -73,7 +73,7 @@ pub(super) fn parse_raw_entries(xml: &str) -> Vec<RawEntry> {
     reader.config_mut().trim_text(true);
 
     let mut entries = Vec::new();
-    let mut current_element = Vec::new();
+    let mut current_element = String::new();
     let mut in_entry = false;
     let mut current = RawEntry::default();
 
@@ -83,14 +83,14 @@ pub(super) fn parse_raw_entries(xml: &str) -> Vec<RawEntry> {
                 let qname = e.name();
                 let name = qname.as_ref();
                 current_element.clear();
-                current_element.extend_from_slice(name);
+                current_element.push_str(name);
 
-                if name == b"stuff" {
+                if name == "stuff" {
                     in_entry = true;
                     current = RawEntry::default();
                 }
             }
-            Ok(Event::End(e)) if e.name().as_ref() == b"stuff" && in_entry => {
+            Ok(Event::End(e)) if e.name().as_ref() == "stuff" && in_entry => {
                 entries.push(std::mem::take(&mut current));
                 in_entry = false;
             }
@@ -99,27 +99,22 @@ pub(super) fn parse_raw_entries(xml: &str) -> Vec<RawEntry> {
                     continue;
                 }
 
-                // Defer the UTF-8 allocation to the field that actually needs it;
-                // the registry format has ~13 ignored fields per entry (providerid,
-                // author, rating, summary, …) so this avoids most allocations.
-                match current_element.as_slice() {
-                    b"name" => current.name = String::from_utf8_lossy(e.as_ref()).into_owned(),
-                    b"version" => {
-                        current.version = String::from_utf8_lossy(e.as_ref()).into_owned();
+                // Allocate only for the fields we keep; the registry format has ~13
+                // ignored fields per entry (providerid, author, rating, summary, …).
+                match current_element.as_str() {
+                    "name" => current.name = e.as_ref().to_owned(),
+                    "version" => {
+                        current.version = e.as_ref().to_owned();
                     }
-                    b"id" => current.id_text = String::from_utf8_lossy(e.as_ref()).into_owned(),
-                    b"releasedate" => {
-                        current.release_date = String::from_utf8_lossy(e.as_ref()).into_owned();
+                    "id" => current.id_text = e.as_ref().to_owned(),
+                    "releasedate" => {
+                        current.release_date = e.as_ref().to_owned();
                     }
-                    b"installedfile" => {
-                        current
-                            .installed_files
-                            .push(String::from_utf8_lossy(e.as_ref()).into_owned());
+                    "installedfile" => {
+                        current.installed_files.push(e.as_ref().to_owned());
                     }
-                    b"uninstalledfile" => {
-                        current
-                            .uninstalled_files
-                            .push(String::from_utf8_lossy(e.as_ref()).into_owned());
+                    "uninstalledfile" => {
+                        current.uninstalled_files.push(e.as_ref().to_owned());
                     }
                     _ => {}
                 }
@@ -247,9 +242,7 @@ fn find_target_index(xml: &str, directory_name: &str) -> Option<usize> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    let dir_bytes = directory_name.as_bytes();
-
-    let mut current_element: Vec<u8> = Vec::new();
+    let mut current_element = String::new();
     let mut entry_index: Option<usize> = None;
     let mut in_entry = false;
     let mut current_matches = false;
@@ -260,9 +253,9 @@ fn find_target_index(xml: &str, directory_name: &str) -> Option<usize> {
                 let qname = e.name();
                 let name = qname.as_ref();
                 current_element.clear();
-                current_element.extend_from_slice(name);
+                current_element.push_str(name);
 
-                if name == b"stuff" {
+                if name == "stuff" {
                     in_entry = true;
                     entry_index = Some(entry_index.map_or(0, |i| i + 1));
                     current_matches = false;
@@ -272,14 +265,13 @@ fn find_target_index(xml: &str, directory_name: &str) -> Option<usize> {
                 if in_entry
                     && !current_matches
                     && matches!(
-                        current_element.as_slice(),
-                        b"installedfile" | b"uninstalledfile"
+                        current_element.as_str(),
+                        "installedfile" | "uninstalledfile"
                     ) =>
             {
-                // Check path segments at byte level — no UTF-8 conversion needed.
-                current_matches = (*e).split(|&b| b == b'/').any(|seg| seg == dir_bytes);
+                current_matches = (*e).split('/').any(|seg| seg == directory_name);
             }
-            Ok(Event::End(e)) if e.name().as_ref() == b"stuff" && in_entry => {
+            Ok(Event::End(e)) if e.name().as_ref() == "stuff" && in_entry => {
                 if current_matches {
                     return entry_index;
                 }
@@ -303,7 +295,7 @@ fn rewrite_with_updates(
     reader.config_mut().trim_text(true);
 
     let mut writer = Writer::new(Vec::new());
-    let mut current_element = Vec::new();
+    let mut current_element = String::new();
     let mut entry_index: Option<usize> = None;
 
     loop {
@@ -312,9 +304,9 @@ fn rewrite_with_updates(
                 let qname = e.name();
                 let name = qname.as_ref();
                 current_element.clear();
-                current_element.extend_from_slice(name);
+                current_element.push_str(name);
 
-                if name == b"stuff" {
+                if name == "stuff" {
                     entry_index = Some(entry_index.map_or(0, |i| i + 1));
                 }
 
@@ -357,17 +349,14 @@ fn rewrite_with_updates(
 /// Returns borrowed slices where possible to avoid allocation for fields that
 /// are already owned by the caller (`version`, `payload`, `releasedate`, `status`).
 /// Only `id` (integer formatting) and `installedfile` (path formatting) allocate.
-fn get_field_replacement<'a>(
-    element_name: &[u8],
-    fields: &'a UpdateFields,
-) -> Option<Cow<'a, str>> {
+fn get_field_replacement<'a>(element_name: &str, fields: &'a UpdateFields) -> Option<Cow<'a, str>> {
     match element_name {
-        b"version" => Some(Cow::Borrowed(fields.new_version)),
-        b"id" => Some(Cow::Owned(fields.content_id.to_string())),
-        b"payload" => Some(Cow::Borrowed(fields.download_url)),
-        b"releasedate" => Some(Cow::Borrowed(fields.release_date)),
-        b"status" => Some(Cow::Borrowed("installed")),
-        b"installedfile" | b"uninstalledfile" => Some(Cow::Owned(
+        "version" => Some(Cow::Borrowed(fields.new_version)),
+        "id" => Some(Cow::Owned(fields.content_id.to_string())),
+        "payload" => Some(Cow::Borrowed(fields.download_url)),
+        "releasedate" => Some(Cow::Borrowed(fields.release_date)),
+        "status" => Some(Cow::Borrowed("installed")),
+        "installedfile" | "uninstalledfile" => Some(Cow::Owned(
             utils::registry_installed_file_path(fields.installed_path),
         )),
         _ => None,

@@ -1,3 +1,28 @@
 [workspace]
 resolver = "3"
 members = ["libplasmoid-updater", "plasmoid-updater"]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/uwuclxdy/plasmoid-updater"
+rust-version = "1.99.1"
+
+[workspace.dependencies]
+libplasmoid-updater = { path = "libplasmoid-updater", version = "0.2.1", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+dirs = "7.0.0"
+nix = { version = "0.31.3", features = ["user"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

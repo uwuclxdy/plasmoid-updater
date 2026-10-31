@@ -64,7 +64,7 @@ fn format_download_size(size: Option<u64>) -> String {
 
 fn print_table<T: TableRow>(items: &[T], headers: &[&str]) {
     let mut table = Table::new();
-    table.load_preset(presets::NOTHING);
+    table.load_style(presets::NOTHING);
     table.set_header(headers.iter().map(|h| header(h)).collect::<Vec<_>>());
 
     for item in items {

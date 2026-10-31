@@ -8,7 +8,8 @@ all-features = true
 # cargo-deny 0.16+ denies every advisory class by default; silence specifics via `ignore`.
 # `unmaintained` re-added in 0.18.2: all | workspace | transitive | none (NOT deny/warn).
 yanked       = "deny"
-unmaintained = "workspace"  # flag unmaintained direct deps, not deep transitives we can't control
+unmaintained = "all"
+unsound      = "all"
 ignore       = []
 
 [licenses]
@@ -24,6 +25,7 @@ allow = [
   "Unicode-DFS-2016",
   "Unicode-3.0",
   "MPL-2.0",
+  "CDLA-Permissive-2.0",  # webpki-root-certs
   "Zlib",
   "GPL-3.0-or-later",  # both workspace members' actual license (see LICENSES/GPL-3.0-or-later.txt)
 ]

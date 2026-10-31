@@ -133,16 +133,23 @@ pub(crate) fn write_file(path: &Path, content: &[u8]) -> Result<()> {
             .spawn()
             .map_err(|e| Error::install(format!("failed to run sudo tee: {e}")))?;
 
-        child
+        #[expect(
+            clippy::expect_used,
+            reason = "stdin was spawned with Stdio::piped(), so the pipe handle always exists"
+        )]
+        let write_result = child
             .stdin
             .as_mut()
             .expect("stdin was piped")
-            .write_all(content)?;
+            .write_all(content);
 
+        // Reap the child even when the write failed: a nonzero exit (e.g. a refused
+        // sudo) is a better error than the broken pipe the write sees.
         let status = child.wait()?;
         if !status.success() {
             return Err(Error::install("sudo tee failed"));
         }
+        write_result?;
         Ok(())
     } else {
         std::fs::write(path, content)?;

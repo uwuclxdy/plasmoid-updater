@@ -1,12 +1,13 @@
 [package]
 name = "plasmoid-updater"
-version = "0.2.1"
-edition = "2024"
-license = "GPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "CLI tool for updating KDE Plasma 6 components from the KDE Store"
 keywords = ["kde", "plasma", "widgets", "updater", "cli"]
 categories = ["command-line-utilities"]
-repository = "https://github.com/uwuclxdy/plasmoid-updater"
 homepage = "https://github.com/uwuclxdy/plasmoid-updater"
 readme = "../README.md"
 
@@ -15,10 +16,12 @@ name = "plasmoid-updater"
 path = "src/main.rs"
 
 [dependencies]
-libplasmoid-updater = { path = "../libplasmoid-updater", version = "0.2.1", features = ["cli"] }
-clap = { version = "4.6.1", features = ["derive"] }
-toml = "1.1.2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-dirs = "6.0.0"
-nix = { version = "0.31.3", features = ["user"] }
+libplasmoid-updater = { workspace = true, features = ["cli", "inhibit"] }
+clap = { version = "4.6.7", features = ["derive"] }
+toml = "1.1.8"
+serde = { workspace = true }
+dirs = { workspace = true }
+nix = { workspace = true }
+
+[lints]
+workspace = true

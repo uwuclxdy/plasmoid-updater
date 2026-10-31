@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 pub(crate) enum InhibitGuard {
     #[cfg(feature = "inhibit")]
     #[allow(dead_code)] // fd kept open intentionally to hold the inhibit lock
-    Dbus(zbus::zvariant::OwnedFd),
+    Dbus(zbus::OwnedFd),
     Subprocess(Child),
     None,
 }
@@ -56,10 +56,10 @@ impl Drop for InhibitGuard {
 
 #[cfg(feature = "inhibit")]
 fn try_dbus_inhibit() -> Option<InhibitGuard> {
-    use zbus::blocking::Connection;
-    use zbus::zvariant::OwnedFd;
+    use zbus::Connection;
+    use zbus::block_on;
 
-    let conn: Connection = match Connection::system() {
+    let conn: Connection = match block_on(Connection::system()) {
         Ok(c) => c,
         Err(e) => {
             log::debug!(target: "inhibit", "DBus connection failed: {e}");
@@ -67,7 +67,7 @@ fn try_dbus_inhibit() -> Option<InhibitGuard> {
         }
     };
 
-    let reply = match conn.call_method(
+    let reply = match block_on(conn.call_method(
         Some("org.freedesktop.login1"),
         "/org/freedesktop/login1",
         Some("org.freedesktop.login1.Manager"),
@@ -78,7 +78,7 @@ fn try_dbus_inhibit() -> Option<InhibitGuard> {
             "Installing updates",
             "block",
         ),
-    ) {
+    )) {
         Ok(r) => r,
         Err(e) => {
             log::debug!(target: "inhibit", "logind Inhibit() call failed: {e}");
@@ -86,7 +86,7 @@ fn try_dbus_inhibit() -> Option<InhibitGuard> {
         }
     };
 
-    match reply.body().deserialize::<OwnedFd>() {
+    match reply.body().deserialize::<zbus::OwnedFd>() {
         Ok(fd) => {
             log::debug!(target: "inhibit", "acquired logind DBus inhibit lock");
             Some(InhibitGuard::Dbus(fd))
