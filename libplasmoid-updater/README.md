@@ -10,15 +10,16 @@ A Rust library for managing KDE Plasma 6 components from the KDE Store.
 Runtime dependencies:
 - `bsdtar` – Archive extraction
 - `kpackagetool6` – KDE package installation
+- `systemctl` – plasmashell restart, when a restart is requested
 
 ## Features
 
 - **Component Discovery** – Detects installed Plasmoids and other Plasma components
 - **Multithreaded** update checking and installation via Rayon
-- **Automatic Backups** with rollback on failure
+- **Automatic Backups** with rollback on failure, kept under `$XDG_CACHE_HOME/plasmoid-updater/backups/` (the 5 most recent per component type are kept)
 - **Registry Integration** – Maintains KNewStuff registry compatibility
 - **Sleep Inhibition** – Prevents system sleep during installs (logind DBus or systemd-inhibit)
-- **Plasma 6 Support** – Compatible with Plasma 6.0 and later
+- **Plasma 6 Support** – Linux and KDE Plasma 6 only
 
 ## Supported Components
 
@@ -44,13 +45,14 @@ Built with a builder pattern via `Config::new()`:
 | --- | --- |
 | `with_system(bool)` | scan system-wide components in `/usr/share` (requires root) |
 | `with_excluded_packages(Vec<String>)` | skip these packages (by dir name or display name) |
+| `with_excluded_patterns(Vec<String>)` | skip packages whose name or dir matches these regexes (invalid ones are dropped with a warning) |
 | `with_widgets_id_table(HashMap<String, u64>)` | override fallback dir-to-content-ID mapping |
 | `with_restart(RestartBehavior)` | plasmashell restart behavior after updates |
 | `with_auto_confirm(bool)` | skip interactive prompts, apply all updates (`cli`) |
 | `with_threads(usize)` | max parallel install threads (default: logical CPU count) |
 | `with_skip_plasma_detection(bool)` | skip KDE environment check (for CI/testing) |
 | `with_inhibit_idle(bool)` | inhibit system sleep during installs (default: `true`) |
-| `Config::parse_widgets_id(&str)` | parse a `widgets-id` file into the fallback table format |
+| `Config::parse_widgets_id(&str)` | parse text in the `widgets-id` format into a fallback table for `with_widgets_id_table` |
 
 ### Types
 
@@ -101,7 +103,7 @@ To use the library without terminal dependencies:
 
 ```toml
 [dependencies]
-libplasmoid-updater = { version = "0.1", default-features = false }
+libplasmoid-updater = { version = "0.2.1", default-features = false }
 ```
 
 ## CLI Tool

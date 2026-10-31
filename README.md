@@ -7,7 +7,7 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 
 ## Requirements
 
-- bsdtar, kpackagetool6
+- bsdtar, kpackagetool6 (`systemctl` too, for the optional plasmashell restart)
 - [Rust](https://rust-lang.org/tools/install/)
 
 ## Installation
@@ -70,8 +70,13 @@ Options:
 
 ```
 
-`--ignore` works on both `check` and `update` and skips the named components for that run
-only, on top of the config exclusions. Example: `plasmoid-updater update --ignore weather,clock`.
+`--ignore` works on both `check` and `update` and skips the named components for that run only, on top of the config exclusions. Example: `plasmoid-updater update --ignore weather,clock`.
+
+Running `plasmoid-updater` without a subcommand is the same as `update`. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; without a TTY it applies all non-excluded updates. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing.
+
+By default a run restarts nothing. After updates to widgets, plasma styles, global themes, splash screens or KWin switchers, `--restart-plasma` restarts plasmashell, `prompt_restart = true` in the config asks first (on a terminal only), and `--no-restart-plasma` skips it (when both flags are given, `--restart-plasma` wins).
+
+Components that fail to update don't stop the run: failures (and installs whose post-install version could not be verified) are summarized at the end, and the CLI exits 1 when any component failed.
 
 ## Configuration
 
@@ -90,10 +95,9 @@ assume_yes = false        # confirm all updates without prompting
 prompt_restart = true     # ask before restarting plasmashell
 ```
 
-Excluded components are skipped during updates and hidden from `check`. Invalid regex
-patterns are dropped with a warning instead of aborting the run.
+`--edit-config` creates the file with commented examples if it does not exist and opens it in `$EDITOR` (`nano` when unset). Excluded components are skipped during updates and hidden from `check`. Invalid regex patterns are dropped instead of aborting the run.
 
-## Topgrade integreation (Preview)
+## Topgrade integration (preview)
 
 [Topgrade](https://github.com/topgrade-rs/topgrade/) is a CLI tool that updates everything with a single command.
 
@@ -117,12 +121,17 @@ Run `topgrade --edit-config` and add the following under `[commands]`:
 | Wallpaper Plugins          | 715                |
 | KWin Effects               | 719                |
 | KWin Scripts               | 720                |
+| KWin Switchers             | 721                |
 | Global Themes              | 722                |
 | Plasma Styles              | 709                |
 | Aurorae Window Decorations | 114                |
 | Color Schemes              | 112                |
 | Splash Screens             | 708                |
-| SDDM Themes                | 101                |
+| SDDM Themes                | 101 (system only)  |
+| Icon Themes                | 132                |
+| Wallpapers                 | 299                |
+
+SDDM themes live under `/usr/share/sddm/themes` and are only handled with `--system` (needs root). Installs and scans respect `$XDG_DATA_HOME` (default `~/.local/share`).
 
 ---
 
