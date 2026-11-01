@@ -125,6 +125,31 @@ jobs:
           retention-days: 7
           path: lcov.info
 
+  # Proves the MSRV claim: builds on exactly the toolchain [workspace.package]
+  # rust-version declares, read from the manifest so the manifest and this job
+  # can never drift. No `--ignore-rust-version`: code or a dependency that needs
+  # a newer toolchain than the declared one must red here.
+  msrv:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The extraction needs some cargo on PATH before the pinned toolchain is
+      # installed; the runner image ships one.
+      - name: read rust-version from the manifest
+        id: msrv
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -e -r '([.packages[].rust_version] | unique) as $v | if ($v | length) == 1 and $v[0] != null and $v[0] != "" then $v[0] else error("expected every member to declare the same rust_version, got: \($v)") end')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # `+<version>` so the check cannot fall back to the image's default
+      # toolchain if the action's `rustup default` fails.
+      - name: check on the declared toolchain
+        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --all-features --locked
+
   deny:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
