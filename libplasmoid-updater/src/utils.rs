@@ -1,39 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#[cfg(feature = "cli")]
-use crate::cli::{self, progress::create_fetch_spinner};
-#[cfg(feature = "cli")]
-use inquire::InquireError;
-
-use crate::{FailedUpdate, UnverifiedUpdate};
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use std::sync::Arc;
-
 use crate::{
-    Config, Error, RestartBehavior, UpdateResult,
+    Config, Error, Event, Failure, FailureKind, Reporter, UpdateResult,
     api::ApiClient,
     checker::{check_with_components, find_installed},
-    installer,
+    installer::{self, ComponentFailure, InstallOutcome},
     types::{AvailableUpdate, InstalledComponent, UpdateCheckResult},
 };
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 pub(crate) fn validate_environment(skip_plasma_detection: bool) -> crate::Result<()> {
     if cfg!(not(target_os = "linux")) {
-        return Err(Error::UnsupportedOS(std::env::consts::OS.to_string()));
+        return Err(Error::UnsupportedOs);
     }
     let plasma_found = skip_plasma_detection || crate::paths::is_kde();
     if !plasma_found {
-        return Err(Error::NotKDE);
+        return Err(Error::NotKde);
     }
     check_dependency("bsdtar")?;
     Ok(())
 }
 
-fn check_dependency(name: &str) -> crate::Result<()> {
+fn check_dependency(name: &'static str) -> crate::Result<()> {
     use std::process::Command;
     match Command::new("which").arg(name).output() {
         Ok(output) if output.status.success() => Ok(()),
-        _ => Err(Error::MissingDependency(name.to_string())),
+        _ => Err(Error::MissingTool { tool: name }),
     }
 }
 
@@ -41,37 +33,8 @@ pub(crate) fn fetch_updates(
     api_client: &ApiClient,
     config: &Config,
 ) -> crate::Result<UpdateCheckResult> {
-    #[cfg(feature = "cli")]
-    let spinner = create_fetch_spinner();
-
     let components = find_installed(config.system)?;
-    let result = check_with_components(config, api_client, components)?;
-
-    #[cfg(feature = "cli")]
-    spinner.finish_and_clear();
-
-    Ok(result)
-}
-
-pub(crate) fn select_updates<'a>(
-    updates: &'a [AvailableUpdate],
-    config: &Config,
-) -> crate::Result<Vec<&'a AvailableUpdate>> {
-    let matcher = ExcludeMatcher::new(&config.excluded_packages, &config.excluded_patterns);
-
-    #[cfg(feature = "cli")]
-    if !config.auto_confirm && stdin_is_terminal() {
-        return prompt_update_selection(updates, &matcher);
-    }
-
-    Ok(filter_excluded(updates, &matcher))
-}
-
-pub(crate) fn filter_excluded<'a>(
-    updates: &'a [AvailableUpdate],
-    matcher: &ExcludeMatcher,
-) -> Vec<&'a AvailableUpdate> {
-    updates.iter().filter(|u| !matcher.is_excluded(u)).collect()
+    check_with_components(config, api_client, components)
 }
 
 /// Decides whether a candidate update is excluded from selection.
@@ -87,7 +50,7 @@ pub(crate) struct ExcludeMatcher<'a> {
 impl<'a> ExcludeMatcher<'a> {
     /// Builds a matcher, compiling `patterns` once. Invalid patterns are
     /// dropped with a warning rather than aborting the run.
-    pub(crate) fn new(exact: &'a [String], patterns: &[String]) -> Self {
+    pub(crate) fn new(exact: &'a [String], patterns: &'a [String]) -> ExcludeMatcher<'a> {
         Self {
             exact,
             patterns: compile_exclude_patterns(patterns),
@@ -134,92 +97,41 @@ fn compile_exclude_patterns(patterns: &[String]) -> Option<regex::RegexSet> {
     regex::RegexSet::new(&valid).ok()
 }
 
-#[cfg(feature = "cli")]
-pub(crate) fn stdin_is_terminal() -> bool {
-    use is_terminal::IsTerminal;
-    std::io::stdin().is_terminal()
-}
-
-#[cfg(feature = "cli")]
-pub(crate) fn prompt_update_selection<'a>(
-    updates: &'a [AvailableUpdate],
-    matcher: &ExcludeMatcher,
-) -> crate::Result<Vec<&'a AvailableUpdate>> {
-    let options = format_menu_options(updates);
-
-    let defaults: Vec<usize> = updates
-        .iter()
-        .enumerate()
-        .filter(|(_, u)| !matcher.is_excluded(u))
-        .map(|(i, _)| i)
-        .collect();
-
-    let plural = if updates.len() == 1 { "" } else { "s" };
-    let prompt = format!(
-        "{} update{plural} available, select to apply:",
-        updates.len()
-    );
-
-    match inquire::MultiSelect::new(&prompt, options)
-        .with_default(&defaults)
-        .with_page_size(15)
-        .raw_prompt()
-    {
-        Ok(selected) => {
-            let result: Vec<&AvailableUpdate> = selected
-                .into_iter()
-                .map(|opt| &updates[opt.index])
-                .collect();
-
-            use std::io::Write;
-            print!("{}", cli::CLEAR_LINE_SEQUENCE);
-            std::io::stdout().flush().ok();
-
-            Ok(result)
+/// Applies `config`'s exclusion rules to a check result: excluded components
+/// leave `updates` and their names land in `skipped`. This is the one place
+/// exclusions are applied; every later stage works on the filtered list.
+pub(crate) fn apply_exclusions(
+    mut result: UpdateCheckResult,
+    config: &Config,
+) -> UpdateCheckResult {
+    let matcher = ExcludeMatcher::new(&config.excluded_packages, &config.excluded_patterns);
+    let mut selected = Vec::new();
+    for update in result.updates.drain(..) {
+        if matcher.is_excluded(&update) {
+            result.skipped.push(update.installed.name);
+        } else {
+            selected.push(update);
         }
-        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => Ok(vec![]),
-        Err(e) => Err(crate::Error::other(format!("prompt failed: {e}"))),
     }
+    result.updates = selected;
+    result
 }
 
-#[cfg(feature = "cli")]
-pub(crate) fn format_menu_options(updates: &[AvailableUpdate]) -> Vec<String> {
-    let name_width = updates
-        .iter()
-        .map(|u| u.installed.name.len())
-        .max()
-        .unwrap_or(10)
-        .max(10);
-
-    updates
-        .iter()
-        .map(|u| {
-            format!(
-                "{:<name_width$} {} \u{2192} {}",
-                u.installed.name,
-                cli::output::format_version(&u.installed.version),
-                cli::output::format_version(&u.latest_version),
-            )
-        })
-        .collect()
-}
-
-pub(crate) fn install_selected_updates(
-    updates: &[&AvailableUpdate],
+/// Installs `updates` (already exclusion-filtered) on a rayon pool, emitting
+/// progress through `reporter` and collecting per-component outcomes into an
+/// [`UpdateResult`].
+pub(crate) fn install_updates(
+    updates: &[AvailableUpdate],
     api_client: &ApiClient,
     config: &Config,
-) -> crate::Result<(UpdateResult, Vec<InstalledComponent>)> {
-    let result = Arc::new(parking_lot::Mutex::new(UpdateResult::default()));
-    let restarted_components = Arc::new(parking_lot::Mutex::new(Vec::new()));
-
+    reporter: &dyn Reporter,
+    skipped: Vec<String>,
+) -> crate::Result<UpdateResult> {
     let _inhibit = if config.inhibit_idle {
         installer::InhibitGuard::acquire()
     } else {
         installer::InhibitGuard::None
     };
-
-    #[cfg(feature = "cli")]
-    let ui = cli::update_ui::UpdateUi::new(updates);
 
     let mut pool_builder = rayon::ThreadPoolBuilder::new();
     if let Some(thread_count) = config.threads {
@@ -227,127 +139,84 @@ pub(crate) fn install_selected_updates(
     }
     let pool = pool_builder
         .build()
-        .map_err(|e| Error::other(format!("failed to build rayon thread pool: {e}")))?;
+        .map_err(|e| Error::Config(format!("failed to build install thread pool: {e}")))?;
 
-    let counter = api_client.request_counter();
-
-    pool.install(|| {
-        updates.par_iter().enumerate().for_each(|(index, update)| {
-            #[cfg(not(feature = "cli"))]
-            let _ = index;
-            let name = update.installed.name.clone();
-
-            #[cfg(feature = "cli")]
-            let reporter = ui.reporter(index);
-            #[cfg(not(feature = "cli"))]
-            let reporter = |_: u8| {};
-
-            match installer::update_component(update, api_client.http_client(), reporter, &counter)
-            {
-                Ok(outcome) => {
-                    #[cfg(feature = "cli")]
-                    ui.complete_task(index, true);
-                    restarted_components.lock().push(update.installed.clone());
-                    let mut r = result.lock();
-                    if !outcome.verified {
-                        r.unverified.push(UnverifiedUpdate {
-                            name: name.clone(),
-                            expected_version: outcome.expected_version,
-                            actual_version: outcome.actual_version,
-                        });
-                    }
-                    r.succeeded.push(name);
-                }
-                Err(e) => {
-                    #[cfg(feature = "cli")]
-                    ui.complete_task(index, false);
-                    result.lock().failed.push(FailedUpdate {
-                        name,
-                        error: e.to_string(),
-                    });
-                }
-            }
+    let outcomes: Vec<(InstalledComponent, Result<InstallOutcome, ComponentFailure>)> = pool
+        .install(|| {
+            updates
+                .par_iter()
+                .map(|update| {
+                    let component = update.installed.clone();
+                    let outcome =
+                        installer::update_component(update, api_client.http_client(), reporter);
+                    report_outcome(&component, &outcome, reporter);
+                    (component, outcome)
+                })
+                .collect()
         });
-    });
 
-    #[cfg(feature = "cli")]
-    ui.finish();
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
 
-    let result = Arc::into_inner(result).ok_or_else(|| {
-        Error::other("install result still had multiple owners after thread pool completion")
-    })?;
-    let updated_components = Arc::into_inner(restarted_components).ok_or_else(|| {
-        Error::other(
-            "updated component list still had multiple owners after thread pool completion",
-        )
-    })?;
+    for (component, outcome) in outcomes {
+        match outcome {
+            Ok(outcome) if outcome.verified => succeeded.push(component),
+            Ok(outcome) => failed.push(Failure {
+                component,
+                kind: FailureKind::Unverified,
+                message: unverified_message(&outcome),
+            }),
+            Err(e) => failed.push(e.into_failure(component)),
+        }
+    }
 
-    Ok((result.into_inner(), updated_components.into_inner()))
+    Ok(UpdateResult {
+        succeeded,
+        failed,
+        skipped,
+    })
 }
 
-pub(crate) fn handle_restart(config: &Config, updated_components: &[InstalledComponent]) {
-    if updated_components.is_empty() {
-        return;
-    }
-
-    if !installer::any_requires_restart(updated_components) {
-        return;
-    }
-
-    match config.restart {
-        RestartBehavior::Never => {}
-        RestartBehavior::Always => {
-            if let Err(e) = installer::restart_plasmashell() {
-                log::warn!(target: "restart", "failed to restart plasmashell: {e}");
-            }
+/// Emits the per-component [`Event::Installed`] / [`Event::Failed`] for a
+/// finished component. Called inside the install pool, as each component
+/// finishes, so progress is not held back by slower siblings.
+fn report_outcome(
+    component: &InstalledComponent,
+    outcome: &Result<InstallOutcome, ComponentFailure>,
+    reporter: &dyn Reporter,
+) {
+    let id = component.event_id();
+    match outcome {
+        Ok(outcome) if outcome.verified => {
+            reporter.event(&Event::Installed {
+                name: component.name.clone(),
+                id,
+            });
         }
-        #[cfg(feature = "cli")]
-        RestartBehavior::Prompt => {
-            if stdin_is_terminal() {
-                prompt_restart();
-            }
+        Ok(outcome) => {
+            reporter.event(&Event::Failed {
+                name: component.name.clone(),
+                id,
+                message: unverified_message(outcome),
+            });
         }
-        #[cfg(not(feature = "cli"))]
-        RestartBehavior::Prompt => {
-            // Without CLI, cannot prompt — fall back to not restarting
-            log::info!(target: "restart", "prompt restart requested but no CLI available, skipping");
+        Err(e) => {
+            log::error!(target: "update", "failed for {}: {}", component.name, e.message);
+            reporter.event(&Event::Failed {
+                name: component.name.clone(),
+                id,
+                message: e.message.clone(),
+            });
         }
-    }
-}
-
-#[cfg(feature = "cli")]
-pub(crate) fn prompt_restart() {
-    match inquire::Confirm::new("Restart plasmashell now?")
-        .with_default(false)
-        .prompt()
-    {
-        Ok(true) => {
-            if let Err(e) = installer::restart_plasmashell() {
-                log::warn!(target: "restart", "failed to restart plasmashell: {e}");
-            }
-        }
-        Ok(false) | Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {}
-        Err(e) => log::warn!(target: "restart", "prompt failed: {e}"),
     }
 }
 
-#[cfg(feature = "cli")]
-pub(crate) fn display_check_results(result: &crate::types::UpdateCheckResult, config: &Config) {
-    let matcher = ExcludeMatcher::new(&config.excluded_packages, &config.excluded_patterns);
-    let visible: Vec<AvailableUpdate> = result
-        .updates
-        .iter()
-        .filter(|u| !matcher.is_excluded(u))
-        .cloned()
-        .collect();
-
-    if visible.is_empty() {
-        println!("no updates available");
-        return;
-    }
-
-    cli::output::print_count_message(visible.len(), "update");
-    cli::output::print_updates_table(&visible);
+fn unverified_message(outcome: &InstallOutcome) -> String {
+    let actual = outcome.actual_version.as_deref().unwrap_or("(unreadable)");
+    format!(
+        "installed, but expected version {}, found {}",
+        outcome.expected_version, actual
+    )
 }
 
 #[cfg(test)]

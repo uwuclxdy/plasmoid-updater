@@ -1,168 +1,71 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/// Errors that can occur during plasmoid-updater operations.
+use std::path::PathBuf;
+
+/// Errors that mean a run could not start or finish.
+///
+/// A problem with one component (a failed download, a checksum mismatch, a
+/// failed install) is not an [`Error`]: it is a [`Failure`](crate::Failure)
+/// row inside the returned [`UpdateResult`](crate::UpdateResult), and the rest
+/// of the run continues.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
-    #[error("unsupported operating system: {0}")]
-    UnsupportedOS(String),
+    /// The host is not Linux, the only platform this library supports.
+    #[error("unsupported operating system: linux only")]
+    UnsupportedOs,
 
+    /// No KDE Plasma installation was detected.
     #[error("KDE Plasma desktop environment not detected")]
-    NotKDE,
+    NotKde,
 
+    /// Another instance of this library holds the update lock.
+    #[error("another plasmoid-updater instance is already running")]
+    AlreadyRunning,
+
+    /// A required external tool is not installed or not on `PATH`.
+    #[error("missing required tool: {tool}")]
+    MissingTool {
+        /// Name of the missing executable (e.g. `bsdtar`).
+        tool: &'static str,
+    },
+
+    /// A network request to the KDE Store or a download server failed.
     #[error("network request failed: {0}")]
     Network(#[from] reqwest::Error),
 
+    /// The KDE Store asked the caller to slow down (HTTP 429) and no
+    /// `Retry-After` hint was available.
     #[error("api rate limited, retry after backoff")]
     RateLimited,
 
-    #[error("api returned error status: {0}")]
-    ApiError(u16),
-
-    #[error("failed to parse xml: {0}")]
-    XmlParse(String),
-
-    #[error("failed to parse metadata.json: {0}")]
-    MetadataParse(#[from] serde_json::Error),
-
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("component not found: {0}")]
-    ComponentNotFound(String),
-
-    #[error("extraction failed: {0}")]
-    ExtractionFailed(String),
-
-    #[error("installation failed: {0}")]
-    InstallFailed(String),
-
-    #[error("could not resolve content id for: {0}")]
-    IdResolutionFailed(String),
-
-    #[error("config error: {0}")]
-    Config(String),
-
-    #[error("invalid version: {0}")]
-    InvalidVersion(String),
-
-    #[error("download failed: {0}")]
-    DownloadFailed(String),
-
-    #[error("checksum mismatch: expected {expected}, got {actual}")]
-    ChecksumMismatch { expected: String, actual: String },
-
-    #[error("metadata not found in package")]
-    MetadataNotFound,
-
-    #[error("backup failed: {0}")]
-    BackupFailed(String),
-
-    #[error("restart failed: {0}")]
-    RestartFailed(String),
-
-    #[error(
-        "installation failed ({install_error}) and backup restore also failed ({restore_error})"
-    )]
-    InstallAndRestoreFailed {
-        install_error: String,
-        restore_error: String,
+    /// The KDE Store returned a non-success status.
+    #[error("kde store returned error status {status}")]
+    Api {
+        /// The HTTP or OCS status code.
+        status: u16,
     },
 
-    #[error("missing required dependency: {0}")]
-    MissingDependency(String),
+    /// A payload could not be parsed.
+    #[error("failed to parse {what}: {detail}")]
+    Parse {
+        /// What failed to parse (e.g. `"ocs response"`).
+        what: &'static str,
+        /// The underlying parse error.
+        detail: String,
+    },
 
-    #[error("{0}")]
-    Other(String),
+    /// A filesystem operation failed. Both the path and the underlying
+    /// `std::io::Error` (with its errno) are preserved.
+    #[error("{path}: {source}")]
+    Io {
+        /// The path the operation touched.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
 
-    #[error("no updates available")]
-    NoUpdatesAvailable,
-
-    #[error("another plasmoid-updater instance is already running")]
-    AlreadyRunning,
-}
-
-impl Error {
-    /// Returns `true` for expected, non-error conditions (e.g., no updates found).
-    pub fn is_skippable(&self) -> bool {
-        matches!(
-            self,
-            Self::NoUpdatesAvailable | Self::ComponentNotFound(_) | Self::AlreadyRunning
-        )
-    }
-
-    /// Returns `true` for temporary failures that may succeed on retry.
-    pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Network(_) | Self::RateLimited)
-    }
-
-    /// Returns `true` for permanent failures that require user intervention.
-    pub fn is_fatal(&self) -> bool {
-        !self.is_skippable() && !self.is_transient()
-    }
-}
-
-macro_rules! error_ctor {
-    ($($name:ident => $variant:ident),* $(,)?) => {
-        $(
-            pub(crate) fn $name(msg: impl Into<String>) -> Self {
-                Self::$variant(msg.into())
-            }
-        )*
-    };
-}
-
-impl Error {
-    error_ctor!(
-        xml_parse => XmlParse,
-        extraction => ExtractionFailed,
-        install => InstallFailed,
-        download => DownloadFailed,
-        backup => BackupFailed,
-        restart => RestartFailed,
-    );
-
-    pub fn other(msg: impl Into<String>) -> Self {
-        Self::Other(msg.into())
-    }
-
-    pub(crate) fn checksum(expected: impl Into<String>, actual: impl Into<String>) -> Self {
-        Self::ChecksumMismatch {
-            expected: expected.into(),
-            actual: actual.into(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn install_and_restore_failed_displays_both_errors() {
-        let err = Error::InstallAndRestoreFailed {
-            install_error: "extraction failed".to_string(),
-            restore_error: "permission denied".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("extraction failed"));
-        assert!(msg.contains("permission denied"));
-    }
-
-    #[test]
-    fn missing_dependency_is_fatal() {
-        let err = Error::MissingDependency("bsdtar".to_string());
-        assert!(err.is_fatal());
-        assert!(err.to_string().contains("bsdtar"));
-    }
-
-    #[test]
-    fn install_and_restore_failed_is_fatal() {
-        let err = Error::InstallAndRestoreFailed {
-            install_error: "x".to_string(),
-            restore_error: "y".to_string(),
-        };
-        assert!(err.is_fatal());
-        assert!(!err.is_transient());
-        assert!(!err.is_skippable());
-    }
+    /// A configuration or environment problem the caller can fix.
+    #[error("configuration error: {0}")]
+    Config(String),
 }

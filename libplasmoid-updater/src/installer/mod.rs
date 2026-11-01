@@ -16,13 +16,11 @@ use std::{
     fs,
     io::Read as _,
     path::{Path, PathBuf},
-    sync::atomic::AtomicUsize,
 };
 
 use crate::{
-    registry,
+    Failure, FailureKind, Reporter, registry,
     types::{AvailableUpdate, ComponentType, InstalledComponent},
-    {Error, Result},
 };
 use backup::{backup_component, restore_component};
 
@@ -30,7 +28,37 @@ use crate::version::normalize_version;
 
 pub(crate) use inhibit::InhibitGuard;
 pub(crate) use lock::UpdateLock;
-pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
+pub(crate) use plasmashell::{requires_restart, restart_plasmashell};
+
+/// A single component's failure: the [`FailureKind`] naming the failed stage
+/// plus a human-readable message. The run-level [`crate::Error`] is never
+/// used for a per-component problem.
+#[derive(Debug)]
+pub(crate) struct ComponentFailure {
+    pub kind: FailureKind,
+    pub message: String,
+}
+
+impl ComponentFailure {
+    pub(crate) fn new(kind: FailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn io(kind: FailureKind, path: &Path, source: std::io::Error) -> Self {
+        Self::new(kind, format!("{}: {source}", path.display()))
+    }
+
+    pub(crate) fn into_failure(self, component: InstalledComponent) -> Failure {
+        Failure {
+            component,
+            kind: self.kind,
+            message: self.message,
+        }
+    }
+}
 
 /// Outcome of a single component update, including post-install verification.
 pub(crate) struct InstallOutcome {
@@ -44,33 +72,27 @@ pub(crate) struct InstallOutcome {
 
 /// Updates a single component using the provided HTTP client.
 ///
-/// `reporter` is called with a stage number as each phase completes:
-/// - `1` --- backup done, download starting
-/// - `2` --- download done, extraction starting
-/// - `3` --- extraction done, install starting
-///
-/// `counter` is incremented once for each HTTP request made.
+/// Emits [`Event::Downloading`](crate::Event::Downloading) through `reporter`
+/// as the download progresses. On failure the original component is restored
+/// from its backup; if the restore itself fails, the returned
+/// [`ComponentFailure`] carries kind
+/// [`FailureKind::RestoreFailed`] and both messages.
 pub(crate) fn update_component(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
-    reporter: impl Fn(u8),
-    counter: &AtomicUsize,
-) -> Result<InstallOutcome> {
+    reporter: &dyn Reporter,
+) -> Result<InstallOutcome, ComponentFailure> {
     let component = &update.installed;
     let temp = download::create_temp_dir()?;
 
     let backup_path = create_backup(component)?;
-    reporter(1);
 
-    match perform_installation(update, client, &reporter, counter, temp.path()) {
+    match perform_installation(update, client, temp.path(), reporter) {
         Ok(()) => {
-            post_install_tasks(update)?;
-            let outcome = verify_installed_version(update);
-            log::info!(target: "update", "updated {}", component.name);
-            Ok(outcome)
+            post_install_tasks(update);
+            Ok(verify_installed_version(update))
         }
         Err(e) => {
-            log::error!(target: "install", "failed for {}: {e}", component.name);
             if let Some(ref backup) = backup_path {
                 handle_installation_failure(backup, &component.path, &e)?;
             }
@@ -80,56 +102,31 @@ pub(crate) fn update_component(
     // temp is dropped here, auto-cleanup
 }
 
-fn create_backup(component: &InstalledComponent) -> Result<Option<PathBuf>> {
-    let backup_path = backup_component(component)?;
-    if let Some(ref path) = backup_path {
-        log::debug!(target: "backup", "created at {}", path.display());
-    }
-    Ok(backup_path)
+fn create_backup(component: &InstalledComponent) -> Result<Option<PathBuf>, ComponentFailure> {
+    backup_component(component)
 }
 
 fn perform_installation(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
-    reporter: &dyn Fn(u8),
-    counter: &AtomicUsize,
     temp_path: &Path,
-) -> Result<()> {
+    reporter: &dyn Reporter,
+) -> Result<(), ComponentFailure> {
     let component = &update.installed;
-    let downloaded_path = download_with_error_handling(
+    let downloaded_path = download::download_package(
         client,
         &update.download_url,
         update.checksum.as_deref(),
-        &component.name,
-        &component.directory_name,
-        counter,
+        component,
         temp_path,
+        reporter,
     )?;
-    reporter(2);
 
     execute_installation(
         &downloaded_path,
         component,
         &update.latest_version,
-        reporter,
         temp_path,
-    )
-}
-
-fn download_with_error_handling(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    checksum: Option<&str>,
-    component_name: &str,
-    directory_name: &str,
-    counter: &AtomicUsize,
-    temp_path: &Path,
-) -> Result<PathBuf> {
-    download::download_package(client, url, checksum, directory_name, counter, temp_path).map_err(
-        |e| {
-            log::error!(target: "download", "failed for {}: {e}", component_name);
-            e
-        },
     )
 }
 
@@ -137,9 +134,8 @@ fn execute_installation(
     downloaded_path: &Path,
     component: &InstalledComponent,
     new_version: &str,
-    reporter: &dyn Fn(u8),
     temp_path: &Path,
-) -> Result<()> {
+) -> Result<(), ComponentFailure> {
     let is_single_file_type = matches!(
         component.component_type,
         ComponentType::ColorScheme | ComponentType::Wallpaper,
@@ -150,10 +146,9 @@ fn execute_installation(
     if is_raw_file {
         let result = install::install_raw_file(downloaded_path, component);
         let _ = fs::remove_file(downloaded_path);
-        reporter(3);
         result
     } else {
-        install_from_archive(downloaded_path, component, new_version, reporter, temp_path)
+        install_from_archive(downloaded_path, component, new_version, temp_path)
     }
 }
 
@@ -182,13 +177,13 @@ fn install_from_archive(
     downloaded_path: &Path,
     component: &InstalledComponent,
     new_version: &str,
-    reporter: &dyn Fn(u8),
     temp_path: &Path,
-) -> Result<()> {
+) -> Result<(), ComponentFailure> {
     let extract_dir = temp_path.join(format!("extract-{}", component.directory_name));
 
     if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir)?;
+        fs::remove_dir_all(&extract_dir)
+            .map_err(|e| ComponentFailure::io(FailureKind::Extract, &extract_dir, e))?;
     }
 
     if let Err(e) = download::extract_archive(downloaded_path, &extract_dir) {
@@ -200,21 +195,19 @@ fn install_from_archive(
         ) {
             log::debug!(
                 target: "extract",
-                "extraction failed for {}, trying raw file install: {e}",
+                "extraction failed for {}, trying raw file install: {}",
                 component.name,
+                e.message,
             );
-            reporter(3);
             let result = install::install_raw_file(downloaded_path, component);
             let _ = fs::remove_file(downloaded_path);
             return result;
         }
-        log::error!(target: "extract", "failed for {}: {e}", component.name);
         let _ = fs::remove_file(downloaded_path);
         return Err(e);
     }
 
     let _ = fs::remove_file(downloaded_path);
-    reporter(3);
 
     let result = if component.component_type.kpackage_type().is_some() {
         match install::install_via_kpackage(&extract_dir, component, new_version) {
@@ -222,8 +215,9 @@ fn install_from_archive(
             Err(e) if component.component_type.has_direct_fallback() => {
                 log::warn!(
                     target: "install",
-                    "kpackagetool6 failed for {}, falling back to direct install: {e}",
+                    "kpackagetool6 failed for {}, falling back to direct install: {}",
                     component.name,
+                    e.message,
                 );
                 install::install_direct(&extract_dir, component)
             }
@@ -237,7 +231,7 @@ fn install_from_archive(
     result
 }
 
-fn post_install_tasks(update: &AvailableUpdate) -> Result<()> {
+fn post_install_tasks(update: &AvailableUpdate) {
     let component = &update.installed;
 
     let installed_json = component.path.join("metadata.json");
@@ -249,19 +243,17 @@ fn post_install_tasks(update: &AvailableUpdate) -> Result<()> {
             component.component_type,
             &update.latest_version,
         ) {
-            log::warn!(target: "patch", "failed to update installed metadata: {e}");
+            log::warn!(target: "patch", "failed to update installed metadata: {}", e.message);
         }
     } else if installed_desktop.exists()
         && let Err(e) = install::patch_metadata_desktop(&installed_desktop, &update.latest_version)
     {
-        log::warn!(target: "patch", "failed to update installed metadata.desktop: {e}");
+        log::warn!(target: "patch", "failed to update installed metadata.desktop: {}", e.message);
     }
 
     if let Err(e) = registry::update_registry_after_install(update) {
         log::warn!(target: "registry", "failed to update: {e}");
     }
-
-    Ok(())
 }
 
 fn verify_installed_version(update: &AvailableUpdate) -> InstallOutcome {
@@ -348,14 +340,17 @@ fn read_version_from_registry(component: &InstalledComponent) -> Option<String> 
 fn handle_installation_failure(
     backup_path: &Path,
     component_path: &Path,
-    original_error: &Error,
-) -> Result<()> {
+    original_error: &ComponentFailure,
+) -> Result<(), ComponentFailure> {
     if let Err(restore_err) = restore_component(backup_path, component_path) {
-        log::error!(target: "restore", "failed: {restore_err}");
-        Err(Error::InstallAndRestoreFailed {
-            install_error: original_error.to_string(),
-            restore_error: restore_err.to_string(),
-        })
+        log::error!(target: "restore", "failed: {}", restore_err.message);
+        Err(ComponentFailure::new(
+            FailureKind::RestoreFailed,
+            format!(
+                "install failed ({}) and backup restore also failed ({})",
+                original_error.message, restore_err.message
+            ),
+        ))
     } else {
         log::info!(target: "restore", "restored component from backup");
         Ok(())

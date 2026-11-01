@@ -5,66 +5,76 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
-use crate::{Error, Result};
+use super::ComponentFailure;
+use crate::{Event, FailureKind, Reporter, types::InstalledComponent};
 
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const DOWNLOAD_BUFFER_SIZE: usize = 8192;
 
 /// Creates a temporary directory that is automatically cleaned up on drop.
-pub(crate) fn create_temp_dir() -> Result<tempfile::TempDir> {
+pub(crate) fn create_temp_dir() -> Result<tempfile::TempDir, ComponentFailure> {
     let base = std::env::var("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"));
     tempfile::Builder::new()
         .prefix("plasmoid-updater-")
-        .tempdir_in(base)
-        .map_err(|e| Error::other(format!("failed to create temp dir: {e}")))
+        .tempdir_in(&base)
+        .map_err(|e| {
+            ComponentFailure::new(FailureKind::Install, format!("{}: {e}", base.display()))
+        })
 }
 
-/// Downloads a package with optional checksum verification.
+/// Downloads a package with optional checksum verification, emitting
+/// [`Event::Downloading`] through `reporter` as chunks arrive: the event's
+/// `name` is the component's display name and its `id` the installed path.
 ///
-/// `directory_name` is used to namespace the download file, preventing
+/// The component's directory name namespaces the download file, preventing
 /// filename collisions when multiple components download in parallel.
 pub(crate) fn download_package(
     client: &reqwest::blocking::Client,
     url: &str,
     expected_checksum: Option<&str>,
-    directory_name: &str,
-    counter: &AtomicUsize,
+    component: &InstalledComponent,
     temp_path: &Path,
-) -> Result<PathBuf> {
+    reporter: &dyn Reporter,
+) -> Result<PathBuf, ComponentFailure> {
     let file_name = url.rsplit('/').next().unwrap_or("package.tar.gz");
 
-    let dest = temp_path.join(format!("{directory_name}_{file_name}"));
+    let dest = temp_path.join(format!("{}_{file_name}", component.directory_name));
 
-    counter.fetch_add(1, Ordering::Relaxed);
     let response = client
         .get(url)
         .timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
         .send()
-        .map_err(|e| Error::download(format!("request failed: {e}")))?;
+        .map_err(|e| {
+            ComponentFailure::new(FailureKind::Download, format!("request failed: {e}"))
+        })?;
 
     if !response.status().is_success() {
-        return Err(Error::download(format!(
-            "http status {}",
-            response.status()
-        )));
+        return Err(ComponentFailure::new(
+            FailureKind::Download,
+            format!("http status {}", response.status()),
+        ));
     }
 
-    let mut file = File::create(&dest)?;
+    let total = response.content_length();
+
+    let mut file =
+        File::create(&dest).map_err(|e| ComponentFailure::io(FailureKind::Download, &dest, e))?;
     let mut hasher = md5::Context::new();
 
     let mut reader = response;
     let mut buffer = [0u8; DOWNLOAD_BUFFER_SIZE];
+    let mut received: u64 = 0;
+    let id = component.event_id();
 
     loop {
-        let bytes_read = reader
-            .read(&mut buffer)
-            .map_err(|e| Error::download(format!("read error: {e}")))?;
+        let bytes_read = reader.read(&mut buffer).map_err(|e| {
+            ComponentFailure::new(FailureKind::Download, format!("read error: {e}"))
+        })?;
 
         if bytes_read == 0 {
             break;
@@ -72,7 +82,16 @@ pub(crate) fn download_package(
 
         let chunk = &buffer[..bytes_read];
         hasher.consume(chunk);
-        file.write_all(chunk)?;
+        file.write_all(chunk)
+            .map_err(|e| ComponentFailure::io(FailureKind::Download, &dest, e))?;
+
+        received += bytes_read as u64;
+        reporter.event(&Event::Downloading {
+            name: component.name.clone(),
+            id: id.clone(),
+            bytes: received,
+            total,
+        });
     }
 
     // verify checksum if provided
@@ -80,7 +99,10 @@ pub(crate) fn download_package(
         let actual = format!("{:x}", hasher.finalize());
         if actual != expected.to_lowercase() {
             fs::remove_file(&dest).ok();
-            return Err(Error::checksum(expected, actual));
+            return Err(ComponentFailure::new(
+                FailureKind::Checksum,
+                format!("checksum mismatch: expected {expected}, got {actual}"),
+            ));
         }
         log::debug!(target: "checksum", "verified md5 for {file_name}");
     }
@@ -89,8 +111,8 @@ pub(crate) fn download_package(
 }
 
 /// Extracts a package archive to the destination directory using `bsdtar`.
-pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest)?;
+pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), ComponentFailure> {
+    fs::create_dir_all(dest).map_err(|e| ComponentFailure::io(FailureKind::Extract, dest, e))?;
 
     let output = Command::new("bsdtar")
         .args([
@@ -100,7 +122,9 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
             &dest.to_string_lossy(),
         ])
         .output()
-        .map_err(|e| Error::extraction(format!("failed to run bsdtar: {e}")))?;
+        .map_err(|e| {
+            ComponentFailure::new(FailureKind::Extract, format!("failed to run bsdtar: {e}"))
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -109,7 +133,7 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
         } else {
             stderr.trim().to_string()
         };
-        return Err(Error::extraction(detail));
+        return Err(ComponentFailure::new(FailureKind::Extract, detail));
     }
 
     Ok(())

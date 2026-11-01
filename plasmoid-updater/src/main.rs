@@ -4,11 +4,14 @@
 mod cli_config;
 mod exit_code;
 
+use std::io::{IsTerminal, Write as _};
+
 use clap::{Parser, Subcommand};
 
 use cli_config::CliConfig;
 use exit_code::ExitCode;
-use libplasmoid_updater::{check, show_installed, update};
+use libplasmoid_updater as lib;
+use libplasmoid_updater::Reporter as _;
 
 #[derive(Parser)]
 #[command(name = "plasmoid-updater")]
@@ -74,6 +77,13 @@ enum Commands {
     },
 }
 
+#[derive(Clone, Copy)]
+enum RestartDecision {
+    Always,
+    Never,
+    Prompt,
+}
+
 #[derive(Default)]
 struct UpdateArgs {
     component: Option<String>,
@@ -94,7 +104,7 @@ fn main() {
     std::process::exit(exit_code.into());
 }
 
-fn run(cli: Cli) -> Result<ExitCode, libplasmoid_updater::Error> {
+fn run(cli: Cli) -> Result<ExitCode, lib::Error> {
     if cli.edit_config {
         CliConfig::edit_config()?;
         return Ok(ExitCode::Success);
@@ -107,7 +117,7 @@ fn run(cli: Cli) -> Result<ExitCode, libplasmoid_updater::Error> {
     execute_command(&cli, &config)
 }
 
-fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> {
+fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, lib::Error> {
     if cli.system && !is_root_user() {
         validate_sudo()?;
     }
@@ -135,103 +145,233 @@ fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, libplasmoi
     }
 }
 
-fn do_check(config: &CliConfig, ignore: &[String]) -> Result<ExitCode, libplasmoid_updater::Error> {
+fn do_check(config: &CliConfig, ignore: &[String]) -> Result<ExitCode, lib::Error> {
     let mut check_config = config.inner.clone();
     check_config
         .excluded_packages
         .extend(ignore.iter().cloned());
-    check(&check_config)?;
+
+    let reporter = lib::cli::ProgressReporter::new();
+    reporter.event(&lib::Event::Checking);
+
+    let result = lib::check(&check_config)?;
+
+    if result.available_updates.is_empty() {
+        println!("no updates available");
+        return Ok(ExitCode::Success);
+    }
+
+    println!(
+        "{} update{} available.",
+        result.available_updates.len(),
+        if result.available_updates.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    lib::cli::print_updates_table(&result.available_updates);
     Ok(ExitCode::Success)
 }
 
-fn do_list_installed(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> {
-    show_installed(&config.inner)?;
+fn do_list_installed(config: &CliConfig) -> Result<ExitCode, lib::Error> {
+    let components = lib::get_installed(&config.inner)?;
+
+    if components.is_empty() {
+        println!("no components installed");
+        return Ok(ExitCode::Success);
+    }
+
+    println!(
+        "{} installed component{}.",
+        components.len(),
+        if components.len() == 1 { "" } else { "s" }
+    );
+    lib::cli::print_components_table(&components);
     Ok(ExitCode::Success)
 }
 
-fn do_update(config: &CliConfig, args: UpdateArgs) -> Result<ExitCode, libplasmoid_updater::Error> {
+fn do_update(config: &CliConfig, args: UpdateArgs) -> Result<ExitCode, lib::Error> {
     let mut update_config = config.inner.clone();
     update_config.excluded_packages.extend(args.ignore);
 
-    if args.yes || config.assume_yes || config.update_all_by_default {
-        update_config.auto_confirm = true;
-    }
+    let auto = args.yes || config.assume_yes || config.update_all_by_default;
 
-    if args.restart_plasma {
-        update_config.restart = libplasmoid_updater::RestartBehavior::Always;
+    let restart = if args.restart_plasma {
+        RestartDecision::Always
     } else if args.no_restart_plasma {
-        update_config.restart = libplasmoid_updater::RestartBehavior::Never;
-    }
+        RestartDecision::Never
+    } else if config.prompt_restart {
+        RestartDecision::Prompt
+    } else {
+        RestartDecision::Never
+    };
 
     if let Some(ref name) = args.component {
-        return do_update_single(name, update_config);
+        return do_update_single(name, update_config, restart);
     }
 
-    do_full_update(update_config)
+    let reporter = lib::cli::ProgressReporter::new();
+
+    let result = if auto || !std::io::stdin().is_terminal() {
+        lib::update(&update_config, &reporter)?
+    } else {
+        reporter.event(&lib::Event::Checking);
+        let check_result = lib::check(&update_config)?;
+        // The summary must count the same universe the update() path counts:
+        // everything check() set aside (exclusions, unresolved components)
+        // rides along as skipped, including on the branch that installs nothing.
+        let mut skipped = check_result.skipped;
+        skipped.extend(check_result.diagnostics.iter().map(|d| d.name.clone()));
+        if check_result.available_updates.is_empty() {
+            return Ok(finish_update(
+                lib::UpdateResult {
+                    skipped,
+                    ..lib::UpdateResult::default()
+                },
+                restart,
+            ));
+        }
+        let selected = lib::cli::select(&check_result.available_updates)?;
+        if selected.is_empty() {
+            println!("nothing to update");
+            return Ok(ExitCode::Success);
+        }
+        let mut result = lib::install(&selected, &update_config, &reporter)?;
+        result.skipped.extend(skipped);
+        result
+    };
+
+    Ok(finish_update(result, restart))
 }
 
 fn do_update_single(
     name: &str,
-    mut config: libplasmoid_updater::Config,
-) -> Result<ExitCode, libplasmoid_updater::Error> {
-    let check_result = check(&config)?;
+    config: lib::Config,
+    restart: RestartDecision,
+) -> Result<ExitCode, lib::Error> {
+    let reporter = lib::cli::ProgressReporter::new();
+    reporter.event(&lib::Event::Checking);
 
-    let matched = check_result
+    let check_result = lib::check(&config)?;
+
+    let excluded = excluded_by_configuration(name, &config, &check_result.skipped);
+
+    let matched: Vec<lib::AvailableUpdate> = check_result
         .available_updates
-        .iter()
-        .any(|u| u.installed.name == name || u.installed.directory_name == name);
-
-    if !matched {
-        println!("no update available for '{name}'");
-        return Ok(ExitCode::Success);
-    }
-
-    let excluded: Vec<String> = check_result
-        .available_updates
-        .iter()
-        .filter(|u| u.installed.name != name && u.installed.directory_name != name)
-        .map(|u| u.installed.directory_name.clone())
+        .into_iter()
+        .filter(|u| u.installed.name == name || u.installed.directory_name == name)
         .collect();
 
-    config.excluded_packages.extend(excluded);
-    config.auto_confirm = true;
-
-    do_full_update(config)
-}
-
-fn do_full_update(
-    config: libplasmoid_updater::Config,
-) -> Result<ExitCode, libplasmoid_updater::Error> {
-    let result = update(&config)?;
-
-    if result.is_empty() {
+    if matched.is_empty() {
+        if excluded {
+            println!("'{name}' is excluded by configuration");
+        } else {
+            println!("no update available for '{name}'");
+        }
         return Ok(ExitCode::Success);
     }
 
-    result.print_summary();
-    if result.has_failures() {
-        result.print_error_table();
-        Ok(ExitCode::PartialFailure)
-    } else {
-        Ok(ExitCode::Success)
+    let result = lib::install(&matched, &config, &reporter)?;
+    Ok(finish_update(result, restart))
+}
+
+/// Prints the summary and failure table, applies the restart decision and
+/// maps the outcome to today's exit codes.
+fn finish_update(result: lib::UpdateResult, restart: RestartDecision) -> ExitCode {
+    if result.succeeded.is_empty() && result.failed.is_empty() && result.skipped.is_empty() {
+        println!("no updates available");
+        return ExitCode::Success;
     }
+
+    println!(
+        "Update Summary: {} succeeded, {} failed, {} skipped ({} total)",
+        result.succeeded.len(),
+        result.failed.len(),
+        result.skipped.len(),
+        result.succeeded.len() + result.failed.len() + result.skipped.len(),
+    );
+
+    if !result.failed.is_empty() {
+        lib::cli::print_failures(&result);
+    }
+
+    maybe_restart(result.needs_restart(), restart);
+
+    if result.failed.is_empty() {
+        ExitCode::Success
+    } else {
+        ExitCode::PartialFailure
+    }
+}
+
+fn maybe_restart(needs: bool, decision: RestartDecision) {
+    if !needs {
+        return;
+    }
+    let confirmed = match decision {
+        RestartDecision::Always => true,
+        RestartDecision::Prompt => std::io::stdin().is_terminal() && prompt_restart(),
+        RestartDecision::Never => false,
+    };
+    if confirmed && let Err(e) = lib::restart_plasmashell() {
+        eprintln!("warning: failed to restart plasmashell: {e}");
+    }
+}
+
+fn prompt_restart() -> bool {
+    let mut err = std::io::stderr();
+    let _ = write!(err, "Restart plasmashell now? [y/N] ");
+    let _ = err.flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// True when `name` matches a configured exclusion, so an empty `update
+/// <name>` match is the exclusion rather than a component that does not exist.
+///
+/// The check's `skipped` list holds the excluded components' display names;
+/// `excluded_packages` holds the exact names and directories configured,
+/// `--ignore` included. A name matched only by an `excluded_patterns` regex is
+/// not detected here — the bin holds no regex engine.
+fn excluded_by_configuration(name: &str, config: &lib::Config, skipped: &[String]) -> bool {
+    skipped.iter().any(|excluded| excluded == name)
+        || config
+            .excluded_packages
+            .iter()
+            .any(|excluded| excluded == name)
 }
 
 fn is_root_user() -> bool {
     nix::unistd::Uid::effective().is_root()
 }
 
-fn validate_sudo() -> Result<(), libplasmoid_updater::Error> {
+fn validate_sudo() -> Result<(), lib::Error> {
     let status = std::process::Command::new("sudo")
         .args(["-v"])
         .status()
-        .map_err(|e| libplasmoid_updater::Error::other(format!("failed to run sudo: {e}")))?;
+        .map_err(|e| spawn_error("sudo", &e))?;
 
     if !status.success() {
-        return Err(libplasmoid_updater::Error::other(
-            "sudo authentication failed",
-        ));
+        return Err(lib::Error::Config(format!(
+            "sudo authentication failed: {status}"
+        )));
     }
 
     Ok(())
+}
+
+/// Maps a failed spawn of `command` to the error that names the real cause: a
+/// missing binary is [`lib::Error::MissingTool`], anything else a
+/// [`lib::Error::Config`] message naming the command. `Error::Io` carries a
+/// touched path, which a command name is not.
+fn spawn_error(command: &'static str, e: &std::io::Error) -> lib::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        lib::Error::MissingTool { tool: command }
+    } else {
+        lib::Error::Config(format!("failed to run {command}: {e}"))
+    }
 }

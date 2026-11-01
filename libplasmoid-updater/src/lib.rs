@@ -10,6 +10,36 @@
 // approach are derived from Apdatifier's shell scripts. The KNewStuff registry format
 // and installation process knowledge comes from KDE Discover's source code.
 
+//! Library for updating KDE Plasma 6 components from the KDE Store.
+//!
+//! The core entry points ([`check`], [`update`], [`install`]) never print,
+//! prompt, read stdin or restart plasmashell; progress leaves only through a
+//! [`Reporter`], and the opt-in [`cli`] feature provides the terminal pieces
+//! ([`cli::ProgressReporter`], [`cli::select`], [`cli::print_failures`]) the
+//! caller wires in explicitly.
+//!
+//! ```no_run
+//! # #[cfg(feature = "cli")]
+//! # fn main() -> Result<(), libplasmoid_updater::Error> {
+//! use libplasmoid_updater::{Config, cli, update};
+//!
+//! let config = Config::new();
+//! let reporter = cli::ProgressReporter::new();
+//! let result = update(&config, &reporter)?;
+//! if !result.failed.is_empty() {
+//!     cli::print_failures(&result);
+//! }
+//! if result.needs_restart() {
+//!     libplasmoid_updater::restart_plasmashell()?;
+//! }
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "cli"))]
+//! # fn main() {}
+//! ```
+
+#![warn(missing_docs)]
+
 pub(crate) mod api;
 pub(crate) mod checker;
 pub(crate) mod config;
@@ -17,6 +47,7 @@ pub(crate) mod error;
 pub(crate) mod installer;
 pub(crate) mod paths;
 pub(crate) mod registry;
+pub(crate) mod reporter;
 pub(crate) mod types;
 pub(crate) mod utils;
 pub(crate) mod version;
@@ -24,48 +55,68 @@ pub(crate) mod version;
 #[cfg(feature = "cli")]
 pub mod cli;
 
-use api::ApiClient;
 use serde::Serialize;
 use types::UpdateCheckResult;
 
-pub use config::{Config, RestartBehavior};
+pub use config::Config;
 pub use error::Error;
-pub use types::{AvailableUpdate, ComponentType, Diagnostic, InstalledComponent};
+pub use reporter::{Event, Reporter};
+pub use types::{
+    AvailableUpdate, ComponentType, Diagnostic, Failure, FailureKind, InstalledComponent,
+};
 
 /// A specialized `Result` type for libplasmoid-updater operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Checks for available updates to installed KDE Plasma components.
 ///
-/// Scans the local filesystem for installed KDE components and queries the KDE Store API
-/// for newer versions. Returns an empty [`CheckResult`] when no updates are found — not an error.
+/// Scans the local filesystem for installed KDE components and queries the
+/// store at [`Config::store_url`] for newer versions.
 ///
-/// With the `cli` feature enabled, displays a spinner during fetch and a summary table of updates.
+/// Components matching [`Config::excluded_packages`] or
+/// [`Config::excluded_patterns`] leave `available_updates` and are listed in
+/// [`CheckResult::skipped`] — this is the one place exclusions apply.
+///
+/// `available_updates` is empty when every checked component is current —
+/// that is not an error. `diagnostics` can still list components that could
+/// not be checked, so use [`CheckResult::has_updates`] for "is there anything
+/// to install" and [`CheckResult::is_empty`] for "nothing found at all".
 ///
 /// # Errors
 ///
-/// - [`Error::UnsupportedOS`] — not running on Linux
-/// - [`Error::NotKDE`] — KDE Plasma not detected
+/// - [`Error::UnsupportedOs`] — not running on Linux
+/// - [`Error::NotKde`] — KDE Plasma not detected and
+///   [`Config::skip_plasma_detection`] is unset
+/// - [`Error::MissingTool`] — a required tool (e.g. `bsdtar`) is missing
+/// - [`Error::Network`] — a store request failed
+/// - [`Error::RateLimited`] — the store asked the caller to back off
+/// - [`Error::Api`] — the store returned a non-success status
+/// - [`Error::Parse`] — a store response could not be parsed
+/// - [`Error::Io`] — a filesystem scan failed
+/// - [`Error::Config`] — the configuration is unusable
 pub fn check(config: &Config) -> Result<CheckResult> {
     crate::utils::validate_environment(config.skip_plasma_detection)?;
 
-    let api_client = ApiClient::new()?;
+    let api_client = api::ApiClient::new(config)?;
     let result = crate::utils::fetch_updates(&api_client, config)?;
 
-    #[cfg(feature = "cli")]
-    crate::utils::display_check_results(&result, config);
-
-    Ok(CheckResult::from_internal(result))
+    Ok(CheckResult::from_internal(crate::utils::apply_exclusions(
+        result, config,
+    )))
 }
 
 /// Result of checking for available updates.
 ///
-/// Returned by [`check()`](crate::check). Contains the full [`AvailableUpdate`] data
+/// Returned by [`check`]. Contains the full [`AvailableUpdate`] data
 /// for each pending update, plus diagnostics for components that could not be checked.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     /// Available updates found during the check.
     pub available_updates: Vec<AvailableUpdate>,
+    /// Names of components excluded by the [`Config`]'s exclusion rules.
+    /// Exclusions are applied once, here: excluded components never appear in
+    /// `available_updates`.
+    pub skipped: Vec<String>,
     /// Components that could not be checked, with the reason for each failure.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -80,6 +131,7 @@ impl CheckResult {
 
         Self {
             available_updates: result.updates,
+            skipped: result.skipped,
             diagnostics,
         }
     }
@@ -94,138 +146,138 @@ impl CheckResult {
         self.available_updates.len()
     }
 
-    /// Returns `true` if there are no updates and no diagnostics.
+    /// Returns `true` if there are no updates, no diagnostics and no
+    /// excluded components.
     pub fn is_empty(&self) -> bool {
-        self.available_updates.is_empty() && self.diagnostics.is_empty()
+        self.available_updates.is_empty() && self.diagnostics.is_empty() && self.skipped.is_empty()
     }
 }
 
-/// Downloads and installs all available updates for installed KDE Plasma components.
+/// Downloads and installs every available update left after the check's
+/// exclusions.
 ///
-/// Runs the full update pipeline: scan installed components, check for updates, select
-/// which to apply, then download and install. Handles plasmashell restart based on
-/// [`Config::restart`]. Components matching [`Config::excluded_packages`] (exact) or
-/// [`Config::excluded_patterns`] (regex) are always skipped.
+/// Runs the full pipeline: scan installed components, check the store, apply
+/// [`Config`]'s exclusions (the same single filtering [`check`] does), then
+/// download and install the rest on a thread pool. The names of excluded
+/// components and of components the check could not resolve land in
+/// [`UpdateResult::skipped`].
 ///
-/// With the `cli` feature enabled and [`Config::auto_confirm`] unset, shows an interactive
-/// multi-select menu. Otherwise, all available updates are applied automatically.
+/// Progress and per-component outcomes are reported through `reporter`.
+/// This function never prompts and never restarts plasmashell; call
+/// [`restart_plasmashell`] when [`UpdateResult::needs_restart`] says so.
 ///
 /// # Errors
 ///
-/// Returns an [`Error`] if environment validation, network requests, or installation fails.
+/// Returns an [`Error`] when the run cannot start or finish:
+/// - [`Error::AlreadyRunning`] — another run holds the update lock
+/// - the environment and store errors [`check`] documents
 ///
-/// For components installed via `kpackagetool6`, a failed update currently triggers a
-/// recovery path that removes the existing package registration and retries installation.
-/// This is intended to recover from stale KPackage database entries, but the retry is not
-/// yet limited to stale-entry failures. If the reinstall also fails, the library restores
-/// files from backup, but the KPackage registration may still be left out of sync.
-pub fn update(config: &Config) -> Result<UpdateResult> {
+/// A component that fails to download, extract or install is not an `Error` —
+/// it becomes a [`Failure`] row in [`UpdateResult::failed`] and the remaining
+/// components are still attempted.
+pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> {
     let _lock = installer::UpdateLock::acquire()?;
     crate::utils::validate_environment(config.skip_plasma_detection)?;
 
-    let api_client = ApiClient::new()?;
-    let check_result = crate::utils::fetch_updates(&api_client, config)?;
+    reporter.event(&Event::Checking);
+
+    let api_client = api::ApiClient::new(config)?;
+    let check_result =
+        crate::utils::apply_exclusions(crate::utils::fetch_updates(&api_client, config)?, config);
+
+    let mut skipped = check_result.skipped;
+    skipped.extend(
+        check_result
+            .unresolved
+            .iter()
+            .chain(check_result.check_failures.iter())
+            .map(|d| d.name.clone()),
+    );
 
     if check_result.updates.is_empty() {
-        #[cfg(feature = "cli")]
-        println!("no updates available");
-
-        return Ok(UpdateResult::default());
+        return Ok(UpdateResult {
+            succeeded: Vec::new(),
+            failed: Vec::new(),
+            skipped,
+        });
     }
 
-    let selected = crate::utils::select_updates(&check_result.updates, config)?;
-
-    if selected.is_empty() {
-        #[cfg(feature = "cli")]
-        println!("nothing to update");
-
-        return Ok(UpdateResult::default());
-    }
-
-    let (result, updated_components) =
-        crate::utils::install_selected_updates(&selected, &api_client, config)?;
-
-    #[cfg(feature = "debug")]
-    {
-        let n = api_client.request_count();
-        let plural = if n == 1 { "" } else { "s" };
-        println!("{n} web request{plural}");
-    }
-
-    crate::utils::handle_restart(config, &updated_components);
-
-    Ok(result)
+    crate::utils::install_updates(
+        &check_result.updates,
+        &api_client,
+        config,
+        reporter,
+        skipped,
+    )
 }
 
-/// A component that failed to update, with the error message.
-#[derive(Debug, Clone, Serialize)]
-pub struct FailedUpdate {
-    /// Display name of the component that failed.
-    pub name: String,
-    /// Human-readable error description.
-    pub error: String,
-}
-
-/// A component that installed successfully but whose post-install version
-/// could not be verified to match the expected version.
-#[derive(Debug, Clone, Serialize)]
-pub struct UnverifiedUpdate {
-    /// Display name of the component.
-    pub name: String,
-    /// The version that was expected after install.
-    pub expected_version: String,
-    /// The version actually found on disk, if readable.
-    pub actual_version: Option<String>,
-}
-
-/// Result of performing updates.
+/// Downloads and installs a caller-chosen selection, such as the output of
+/// [`check`] filtered by a prompt or a flag.
 ///
-/// Returned by [`update()`](crate::update). Tracks which components succeeded,
-/// failed, or were skipped during the update run.
+/// Installs exactly the selection it is given: [`Config`]'s exclusions do not
+/// apply here. They are applied once, in [`check`] — a selection built from
+/// [`CheckResult::available_updates`] already has the excluded components
+/// removed. Passing an empty selection returns an empty result and changes
+/// nothing. Like [`update`], this never prompts and never restarts
+/// plasmashell.
+///
+/// # Errors
+///
+/// Returns an [`Error`] when the run cannot start or finish:
+/// - [`Error::AlreadyRunning`] — another run holds the update lock
+/// - the environment and store errors [`check`] documents
+///
+/// Per-component problems become [`Failure`] rows in [`UpdateResult::failed`].
+pub fn install(
+    updates: &[AvailableUpdate],
+    config: &Config,
+    reporter: &dyn Reporter,
+) -> Result<UpdateResult> {
+    if updates.is_empty() {
+        return Ok(UpdateResult::default());
+    }
+
+    let _lock = installer::UpdateLock::acquire()?;
+    crate::utils::validate_environment(config.skip_plasma_detection)?;
+
+    let api_client = api::ApiClient::new(config)?;
+
+    crate::utils::install_updates(updates, &api_client, config, reporter, Vec::new())
+}
+
+/// The outcome of an [`update`] or [`install`] run.
+///
+/// [`Failure`] rows keep the full [`InstalledComponent`]; `skipped` lists the
+/// names of excluded and unresolvable components.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UpdateResult {
-    pub succeeded: Vec<String>,
-    pub failed: Vec<FailedUpdate>,
+    /// Components that installed successfully and whose post-install version
+    /// was verified.
+    pub succeeded: Vec<InstalledComponent>,
+    /// Components that failed, with the failed stage and the reason.
+    pub failed: Vec<Failure>,
+    /// Names of components not attempted: excluded by [`Config`], or
+    /// unresolvable during the check.
     pub skipped: Vec<String>,
-    /// Components that installed successfully but whose post-install version
-    /// could not be verified to match the expected version.
-    pub unverified: Vec<UnverifiedUpdate>,
 }
 
 impl UpdateResult {
-    /// Returns `true` if any component failed to update.
-    pub fn has_failures(&self) -> bool {
-        !self.failed.is_empty()
-    }
-
-    /// Returns `true` if no update actions were attempted.
-    pub fn is_empty(&self) -> bool {
-        self.succeeded.is_empty()
-            && self.failed.is_empty()
-            && self.skipped.is_empty()
-            && self.unverified.is_empty()
-    }
-
-    /// Returns the number of successfully updated components.
-    pub fn success_count(&self) -> usize {
-        self.succeeded.len()
-    }
-
-    /// Returns the number of components that failed to update.
-    pub fn failure_count(&self) -> usize {
-        self.failed.len()
-    }
-
-    /// Prints a formatted table of failed updates to stdout.
-    #[cfg(feature = "cli")]
-    pub fn print_error_table(&self) {
-        crate::cli::output::print_error_table(self);
-    }
-
-    /// Prints a one-line summary of the update outcome to stdout.
-    #[cfg(feature = "cli")]
-    pub fn print_summary(&self) {
-        crate::cli::output::print_summary(self);
+    /// Returns `true` when any touched component's type needs a plasmashell
+    /// restart to pick up the new files: everything that installed
+    /// successfully, plus failures whose files may still have changed
+    /// ([`FailureKind::Unverified`], [`FailureKind::RestoreFailed`]).
+    pub fn needs_restart(&self) -> bool {
+        self.succeeded
+            .iter()
+            .chain(
+                self.failed
+                    .iter()
+                    .filter(|f| {
+                        matches!(f.kind, FailureKind::Unverified | FailureKind::RestoreFailed)
+                    })
+                    .map(|f| &f.component),
+            )
+            .any(|c| crate::installer::requires_restart(c.component_type))
     }
 }
 
@@ -236,54 +288,19 @@ impl UpdateResult {
 ///
 /// # Errors
 ///
-/// Returns an error if the filesystem scan fails.
+/// Returns [`Error::Io`] if the filesystem scan fails.
 pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
     checker::find_installed(config.system)
 }
 
-/// Downloads and installs a single component update with automatic backup and rollback.
-///
-/// On failure, the original component is restored from backup. Does not handle
-/// plasmashell restart — the caller is responsible for restarting if needed.
-///
-/// Respects [`Config::inhibit_idle`] to optionally prevent system sleep during install.
+/// Restarts the plasmashell service via systemd. The core never calls this;
+/// the caller decides when (and whether) to, typically when
+/// [`UpdateResult::needs_restart`] returns `true`.
 ///
 /// # Errors
 ///
-/// Returns an error if download, installation, or backup operations fail.
-pub fn install_update(update: &AvailableUpdate, config: &Config) -> Result<()> {
-    let _lock = installer::UpdateLock::acquire()?;
-    let _inhibit = if config.inhibit_idle {
-        installer::InhibitGuard::acquire()
-    } else {
-        installer::InhibitGuard::None
-    };
-
-    let api_client = ApiClient::new()?;
-    let counter = api_client.request_counter();
-    installer::update_component(update, api_client.http_client(), |_| {}, &counter).map(|_| ())
-}
-
-/// Discovers and prints all installed KDE components as a formatted table.
-///
-/// Scans the filesystem and KNewStuff registry without making network requests.
-/// Prints a count header followed by a table of all discovered components.
-///
-/// # Errors
-///
-/// Returns an error if the filesystem scan fails.
-#[cfg(feature = "cli")]
-#[doc(hidden)]
-pub fn show_installed(config: &Config) -> Result<()> {
-    let components = checker::find_installed(config.system)?;
-
-    if components.is_empty() {
-        println!("no components installed");
-        return Ok(());
-    }
-
-    cli::output::print_count_message(components.len(), "installed component");
-    cli::output::print_components_table(&components);
-
-    Ok(())
+/// Returns [`Error::Io`] with the `systemctl` path when the command cannot be
+/// spawned or exits nonzero.
+pub fn restart_plasmashell() -> Result<()> {
+    installer::restart_plasmashell()
 }

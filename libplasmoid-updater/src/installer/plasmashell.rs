@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::path::PathBuf;
 use std::process::Command;
 
-use crate::{
-    types::{ComponentType, InstalledComponent},
-    {Error, Result},
-};
+use crate::{Error, Result, types::ComponentType};
 
 fn get_user_id() -> String {
     std::env::var("UID").unwrap_or_else(|_| nix::unistd::Uid::current().as_raw().to_string())
 }
 
-/// Restarts the plasmashell service via systemd.
-pub(crate) fn restart_plasmashell() -> Result<()> {
+/// Restarts the plasmashell service via systemd. The core never calls this;
+/// the caller decides when (and whether) to.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] with the `systemctl` path when the command cannot be
+/// spawned or exits nonzero.
+pub fn restart_plasmashell() -> Result<()> {
     let mut cmd = Command::new("systemctl");
     cmd.args(["--user", "restart", "plasma-plasmashell.service"]);
 
@@ -29,32 +33,32 @@ pub(crate) fn restart_plasmashell() -> Result<()> {
         cmd.env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
     }
 
-    let status = cmd
-        .status()
-        .map_err(|e| Error::restart(format!("failed to run systemctl: {e}")))?;
+    let systemctl = PathBuf::from("systemctl");
+    let status = cmd.status().map_err(|e| Error::Io {
+        path: systemctl.clone(),
+        source: e,
+    })?;
 
     if !status.success() {
-        return Err(Error::restart(format!(
-            "systemctl exited with status {status}"
-        )));
+        return Err(Error::Io {
+            path: systemctl,
+            source: std::io::Error::other(format!("systemctl exited with status {status}")),
+        });
     }
 
     Ok(())
 }
 
-/// Returns `true` if the component type requires a plasmashell restart after updating.
-fn requires_plasmashell_restart(component: &InstalledComponent) -> bool {
+/// Returns `true` if this component type needs a plasmashell restart after
+/// an update (widgets, plasma styles, global themes, splash screens and
+/// KWin switchers).
+pub(crate) fn requires_restart(component_type: ComponentType) -> bool {
     matches!(
-        component.component_type,
+        component_type,
         ComponentType::PlasmaWidget
             | ComponentType::PlasmaStyle
             | ComponentType::GlobalTheme
             | ComponentType::SplashScreen
             | ComponentType::KWinSwitcher
     )
-}
-
-/// Returns `true` if any of the updated components require a plasmashell restart.
-pub(crate) fn any_requires_restart(updated_components: &[InstalledComponent]) -> bool {
-    updated_components.iter().any(requires_plasmashell_restart)
 }

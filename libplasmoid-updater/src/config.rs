@@ -12,18 +12,9 @@ const DEFAULT_WIDGETS_ID: &str = include_str!("../widgets-id");
 static DEFAULT_WIDGETS_TABLE: LazyLock<HashMap<String, u64>> =
     LazyLock::new(|| Config::parse_widgets_id(DEFAULT_WIDGETS_ID));
 
-/// Controls plasmashell restart behavior after updates.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum RestartBehavior {
-    /// Never restart plasmashell (default).
-    #[default]
-    Never,
-    /// Always restart plasmashell after successful updates that require it.
-    Always,
-    /// Prompt the user interactively. Falls back to [`Never`](Self::Never) if
-    /// stdin is not a terminal.
-    Prompt,
-}
+/// The OCS base URL every store request uses unless
+/// [`Config::with_store_url`] overrides it.
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kde-look.org/ocs/v1";
 
 /// Configuration for libplasmoid-updater operations.
 ///
@@ -44,7 +35,7 @@ pub enum RestartBehavior {
 /// ## With Custom Settings
 ///
 /// ```rust
-/// use libplasmoid_updater::{Config, RestartBehavior};
+/// use libplasmoid_updater::Config;
 /// use std::collections::HashMap;
 ///
 /// let mut widgets_table = HashMap::new();
@@ -53,9 +44,9 @@ pub enum RestartBehavior {
 /// let config = Config::new()
 ///     .with_excluded_packages(vec!["problematic-widget".to_string()])
 ///     .with_widgets_id_table(widgets_table)
-///     .with_restart(RestartBehavior::Always);
+///     .with_store_url("https://mirror.example.org/ocs/v1");
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// If `true`, operate on system-wide components (in `/usr/share`).
     /// If `false` (default), operate on user components (in `~/.local/share`).
@@ -65,8 +56,13 @@ pub struct Config {
     /// Packages to exclude from updates.
     ///
     /// Can match either directory names (e.g., "org.kde.plasma.systemmonitor")
-    /// or display names (e.g., "System Monitor"). Components in this list
-    /// will be skipped during update operations.
+    /// or display names (e.g., "System Monitor"). Exclusions are applied once,
+    /// by [`check`](crate::check) — and so by [`update`](crate::update), which
+    /// checks first: an excluded component leaves
+    /// [`CheckResult::available_updates`](crate::CheckResult::available_updates)
+    /// and is listed in [`CheckResult::skipped`](crate::CheckResult::skipped).
+    /// [`install`](crate::install) applies no exclusions: it installs the
+    /// selection it is given as-is.
     pub excluded_packages: Vec<String>,
 
     /// Regex patterns to exclude from updates.
@@ -74,7 +70,9 @@ pub struct Config {
     /// Each pattern is matched (unanchored) against both the directory name
     /// and the display name of every candidate. Complements
     /// [`excluded_packages`](Self::excluded_packages), which matches exactly.
-    /// Invalid patterns are dropped with a warning rather than aborting the run.
+    /// Invalid patterns are dropped with a warning rather than aborting the
+    /// run. Applied in the same one place as `excluded_packages`:
+    /// [`check`](crate::check), never [`install`](crate::install).
     pub excluded_patterns: Vec<String>,
 
     /// Widget ID fallback table mapping directory names to KDE Store content IDs.
@@ -96,12 +94,12 @@ pub struct Config {
     /// consumers can provide it programmatically or leave it empty.
     pub widgets_id_table: HashMap<String, u64>,
 
-    /// Controls plasmashell restart behavior after successful updates.
-    pub restart: RestartBehavior,
-
-    /// When `true`, skip interactive prompts and apply all non-excluded updates
-    /// automatically. Has no effect without the `cli` feature.
-    pub auto_confirm: bool,
+    /// The OCS base URL every store request (listing and per-id lookup)
+    /// targets.
+    ///
+    /// Defaults to `https://api.kde-look.org/ocs/v1`. Point it at a mirror or
+    /// a local fake store with [`Config::with_store_url`].
+    pub store_url: String,
 
     /// Maximum number of parallel installation threads.
     ///
@@ -119,6 +117,21 @@ pub struct Config {
     pub inhibit_idle: bool,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            system: false,
+            excluded_packages: Vec::new(),
+            excluded_patterns: Vec::new(),
+            widgets_id_table: HashMap::new(),
+            store_url: DEFAULT_BASE_URL.to_string(),
+            threads: None,
+            skip_plasma_detection: false,
+            inhibit_idle: true,
+        }
+    }
+}
+
 impl Config {
     /// Creates a new configuration with default values.
     ///
@@ -126,7 +139,7 @@ impl Config {
     /// - `system`: false (user components)
     /// - `excluded_packages`: empty
     /// - `widgets_id_table`: loaded from embedded widgets-id file
-    /// - `restart`: [`RestartBehavior::Never`]
+    /// - `store_url`: `https://api.kde-look.org/ocs/v1`
     ///
     /// The embedded widgets-id table provides fallback content ID mappings
     /// for components that cannot be resolved via KNewStuff registry or
@@ -134,7 +147,6 @@ impl Config {
     pub fn new() -> Self {
         Self {
             widgets_id_table: DEFAULT_WIDGETS_TABLE.clone(),
-            inhibit_idle: true,
             ..Default::default()
         }
     }
@@ -183,8 +195,12 @@ impl Config {
 
     /// Sets the list of Plasmoids to exclude from updates.
     ///
-    /// Components in this list will be skipped during updates.
-    /// The list can contain either directory names or display names.
+    /// Exclusions are applied once, by [`check`](crate::check) (and by
+    /// [`update`](crate::update), which checks first): an excluded component
+    /// leaves `available_updates` and is listed in `skipped`.
+    /// [`install`](crate::install) ignores these rules and installs the
+    /// selection it is given. The list can contain either directory names or
+    /// display names.
     ///
     /// # Arguments
     ///
@@ -210,7 +226,10 @@ impl Config {
     ///
     /// Each pattern is matched (unanchored) against both the directory name
     /// and the display name of every candidate. Invalid patterns are dropped
-    /// with a warning when the update run starts.
+    /// with a warning when the update run starts. Like
+    /// [`with_excluded_packages`](Self::with_excluded_packages), these apply
+    /// in [`check`](crate::check) (and so in [`update`](crate::update)), never
+    /// in [`install`](crate::install).
     ///
     /// # Example
     ///
@@ -228,17 +247,20 @@ impl Config {
         self
     }
 
-    /// Sets the plasmashell restart behavior after updates.
+    /// Sets the OCS base URL every store request (listing and per-id lookup)
+    /// targets. Defaults to `https://api.kde-look.org/ocs/v1`.
+    ///
+    /// Useful against a mirror or a local fake store in tests.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use libplasmoid_updater::{Config, RestartBehavior};
+    /// use libplasmoid_updater::Config;
     ///
-    /// let config = Config::new().with_restart(RestartBehavior::Always);
+    /// let config = Config::new().with_store_url("https://mirror.example.org/ocs/v1");
     /// ```
-    pub fn with_restart(mut self, restart: RestartBehavior) -> Self {
-        self.restart = restart;
+    pub fn with_store_url(mut self, url: impl Into<String>) -> Self {
+        self.store_url = url.into();
         self
     }
 
@@ -254,23 +276,6 @@ impl Config {
             }
         }
         table
-    }
-
-    /// Sets whether to skip interactive prompts and apply all non-excluded
-    /// updates automatically.
-    ///
-    /// Has no effect without the `cli` feature enabled.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use libplasmoid_updater::Config;
-    ///
-    /// let config = Config::new().with_auto_confirm(true);
-    /// ```
-    pub fn with_auto_confirm(mut self, auto_confirm: bool) -> Self {
-        self.auto_confirm = auto_confirm;
-        self
     }
 
     /// Sets the maximum number of parallel installation threads.

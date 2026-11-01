@@ -2,7 +2,8 @@
 
 use std::{path::Path, process::Command};
 
-use crate::{Error, Result};
+use super::ComponentFailure;
+use crate::FailureKind;
 
 /// Checks if the current process is running as root (UID 0).
 pub(crate) fn is_root() -> bool {
@@ -21,18 +22,17 @@ pub(crate) fn needs_sudo(path: &Path) -> bool {
 
 // --- Privileged Command Execution ---
 
-fn run_sudo(args: &[&str]) -> Result<()> {
-    let output = Command::new("sudo")
-        .args(args)
-        .output()
-        .map_err(|e| Error::install(format!("failed to run sudo: {e}")))?;
+fn run_sudo(args: &[&str]) -> Result<(), ComponentFailure> {
+    let output = Command::new("sudo").args(args).output().map_err(|e| {
+        ComponentFailure::new(FailureKind::Install, format!("failed to run sudo: {e}"))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::install(format!(
-            "sudo command failed: {}",
-            stderr.trim()
-        )));
+        return Err(ComponentFailure::new(
+            FailureKind::Install,
+            format!("sudo command failed: {}", stderr.trim()),
+        ));
     }
 
     Ok(())
@@ -52,11 +52,12 @@ pub(crate) fn sudo_command(program: &str) -> Command {
 // --- Privileged File Operations ---
 
 /// Copies a file, using sudo if the destination requires it.
-pub(crate) fn copy_file(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_file(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
     if needs_sudo(dest) {
         run_sudo(&["cp", "-f", &src.to_string_lossy(), &dest.to_string_lossy()])
     } else {
-        std::fs::copy(src, dest)?;
+        std::fs::copy(src, dest)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, dest, e))?;
         Ok(())
     }
 }
@@ -65,7 +66,7 @@ pub(crate) fn copy_file(src: &Path, dest: &Path) -> Result<()> {
 ///
 /// Uses `cp -rfT` for sudo to avoid creating a nested subdirectory when the
 /// destination already exists.
-pub(crate) fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_dir(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
     if needs_sudo(dest) {
         run_sudo(&[
             "cp",
@@ -79,31 +80,34 @@ pub(crate) fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Creates directories recursively, using sudo if the path requires it.
-pub(crate) fn create_dir_all(path: &Path) -> Result<()> {
+pub(crate) fn create_dir_all(path: &Path) -> Result<(), ComponentFailure> {
     if needs_sudo(path) {
         run_sudo(&["mkdir", "-p", &path.to_string_lossy()])
     } else {
-        std::fs::create_dir_all(path)?;
+        std::fs::create_dir_all(path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
         Ok(())
     }
 }
 
 /// Removes a file, using sudo if the path requires it.
-pub(crate) fn remove_file(path: &Path) -> Result<()> {
+pub(crate) fn remove_file(path: &Path) -> Result<(), ComponentFailure> {
     if needs_sudo(path) {
         run_sudo(&["rm", "-f", &path.to_string_lossy()])
     } else {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
         Ok(())
     }
 }
 
 /// Removes a directory recursively, using sudo if the path requires it.
-pub(crate) fn remove_dir_all(path: &Path) -> Result<()> {
+pub(crate) fn remove_dir_all(path: &Path) -> Result<(), ComponentFailure> {
     if needs_sudo(path) {
         run_sudo(&["rm", "-rf", &path.to_string_lossy()])
     } else {
-        std::fs::remove_dir_all(path)?;
+        std::fs::remove_dir_all(path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
         Ok(())
     }
 }
@@ -112,18 +116,18 @@ pub(crate) fn remove_dir_all(path: &Path) -> Result<()> {
 ///
 /// Both `src` and `dest` must be on the same filesystem for the rename to be atomic.
 /// For user-local paths this is guaranteed when `src` is a sibling of `dest`.
-#[allow(dead_code)] // used by atomic install helpers; callers being migrated in next task
-pub(crate) fn rename(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn rename(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
     if needs_sudo(dest) {
         run_sudo(&["mv", &src.to_string_lossy(), &dest.to_string_lossy()])
     } else {
-        std::fs::rename(src, dest)?;
+        std::fs::rename(src, dest)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, dest, e))?;
         Ok(())
     }
 }
 
 /// Writes content to a file, using sudo tee if the path requires it.
-pub(crate) fn write_file(path: &Path, content: &[u8]) -> Result<()> {
+pub(crate) fn write_file(path: &Path, content: &[u8]) -> Result<(), ComponentFailure> {
     if needs_sudo(path) {
         use std::io::Write;
         let mut child = Command::new("sudo")
@@ -131,7 +135,9 @@ pub(crate) fn write_file(path: &Path, content: &[u8]) -> Result<()> {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| Error::install(format!("failed to run sudo tee: {e}")))?;
+            .map_err(|e| {
+                ComponentFailure::new(FailureKind::Install, format!("failed to run sudo tee: {e}"))
+            })?;
 
         #[expect(
             clippy::expect_used,
@@ -145,14 +151,20 @@ pub(crate) fn write_file(path: &Path, content: &[u8]) -> Result<()> {
 
         // Reap the child even when the write failed: a nonzero exit (e.g. a refused
         // sudo) is a better error than the broken pipe the write sees.
-        let status = child.wait()?;
+        let status = child
+            .wait()
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
         if !status.success() {
-            return Err(Error::install("sudo tee failed"));
+            return Err(ComponentFailure::new(
+                FailureKind::Install,
+                "sudo tee failed",
+            ));
         }
-        write_result?;
+        write_result.map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
         Ok(())
     } else {
-        std::fs::write(path, content)?;
+        std::fs::write(path, content)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
         Ok(())
     }
 }

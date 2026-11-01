@@ -11,10 +11,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::ComponentFailure;
 use crate::installer::privilege;
 use crate::{
+    FailureKind,
     types::{ComponentType, InstalledComponent},
-    {Error, Result},
 };
 
 const COLOR_SCHEME_EXTENSIONS: &[&str] = &[".colors", ".colorscheme"];
@@ -84,7 +85,7 @@ fn temp_sibling(path: &Path, suffix: &str) -> PathBuf {
 /// Copies `src` to a hidden sibling path (`.{name}.plasmoid-updater-new`), then
 /// renames it into place. On POSIX this rename is atomic and replaces any existing
 /// `dest` without a window where `dest` is absent.
-pub(super) fn atomic_install_file(src: &Path, dest: &Path) -> Result<()> {
+pub(super) fn atomic_install_file(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
     if let Some(parent) = dest.parent() {
         privilege::create_dir_all(parent)?;
     }
@@ -103,7 +104,7 @@ pub(super) fn atomic_install_file(src: &Path, dest: &Path) -> Result<()> {
 /// Copies `src` contents to `.{name}.plasmoid-updater-new/`, renames the existing
 /// `dest` to `.{name}.plasmoid-updater-old/`, renames new into place, then removes old.
 /// All renames are within the same parent directory so they are on the same filesystem.
-pub(super) fn atomic_install_dir(src: &Path, dest: &Path) -> Result<()> {
+pub(super) fn atomic_install_dir(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
     if let Some(parent) = dest.parent() {
         privilege::create_dir_all(parent)?;
     }
@@ -146,10 +147,15 @@ pub(super) fn patch_metadata(
     metadata_path: &Path,
     component_type: ComponentType,
     new_version: &str,
-) -> Result<()> {
-    let content = fs::read_to_string(metadata_path)?;
-    let mut json: serde_json::Value =
-        serde_json::from_str(&content).map_err(Error::MetadataParse)?;
+) -> Result<(), ComponentFailure> {
+    let content = fs::read_to_string(metadata_path)
+        .map_err(|e| ComponentFailure::io(FailureKind::Install, metadata_path, e))?;
+    let mut json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        ComponentFailure::new(
+            FailureKind::Install,
+            format!("failed to parse {}: {e}", metadata_path.display()),
+        )
+    })?;
 
     if let Some(kpackage_type) = component_type.kpackage_type() {
         json["KPackageStructure"] = serde_json::Value::String(kpackage_type.to_string());
@@ -159,15 +165,24 @@ pub(super) fn patch_metadata(
         kplugin["Version"] = serde_json::Value::String(new_version.to_string());
     }
 
-    let patched = serde_json::to_string_pretty(&json)?;
+    let patched = serde_json::to_string_pretty(&json).map_err(|e| {
+        ComponentFailure::new(
+            FailureKind::Install,
+            format!("failed to serialize {}: {e}", metadata_path.display()),
+        )
+    })?;
     privilege::write_file(metadata_path, patched.as_bytes())?;
 
     Ok(())
 }
 
 /// Patches a `metadata.desktop` file to update the `X-KDE-PluginInfo-Version` field.
-pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) -> Result<()> {
-    let content = fs::read_to_string(metadata_path)?;
+pub(super) fn patch_metadata_desktop(
+    metadata_path: &Path,
+    new_version: &str,
+) -> Result<(), ComponentFailure> {
+    let content = fs::read_to_string(metadata_path)
+        .map_err(|e| ComponentFailure::io(FailureKind::Install, metadata_path, e))?;
     let line_ending = if content.contains("\r\n") {
         "\r\n"
     } else {
@@ -201,6 +216,10 @@ pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) ->
 
     privilege::write_file(metadata_path, patched.as_bytes())?;
     Ok(())
+}
+
+fn install_failure(message: impl Into<String>) -> ComponentFailure {
+    ComponentFailure::new(FailureKind::Install, message)
 }
 
 // --- Plugin ID Resolution ---
@@ -245,9 +264,9 @@ fn install_via_kpackagetool(
     package_dir: &Path,
     component: &InstalledComponent,
     global: bool,
-) -> Result<()> {
+) -> Result<(), ComponentFailure> {
     let kpackage_type = component.component_type.kpackage_type().ok_or_else(|| {
-        Error::install(format!(
+        install_failure(format!(
             "{} does not support kpackagetool6",
             component.component_type
         ))
@@ -258,8 +277,7 @@ fn install_via_kpackagetool(
         .arg("-u")
         .arg(package_dir)
         .output()
-        .map_err(|e| Error::install(format!("failed to run kpackagetool6: {e}")))?;
-
+        .map_err(|e| install_failure(format!("failed to run kpackagetool6: {e}")))?;
     if output.status.success() {
         return Ok(());
     }
@@ -294,11 +312,11 @@ fn install_via_kpackagetool(
         .arg("-i")
         .arg(package_dir)
         .output()
-        .map_err(|e| Error::install(format!("failed to run kpackagetool6: {e}")))?;
+        .map_err(|e| install_failure(format!("failed to run kpackagetool6: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::install(format!(
+        return Err(install_failure(format!(
             "kpackagetool6 failed: {}",
             stderr.trim()
         )));
@@ -312,8 +330,9 @@ pub(super) fn install_via_kpackage(
     extract_dir: &Path,
     component: &InstalledComponent,
     new_version: &str,
-) -> Result<()> {
-    let package_dir = find_package_dir(extract_dir).ok_or(Error::MetadataNotFound)?;
+) -> Result<(), ComponentFailure> {
+    let package_dir = find_package_dir(extract_dir)
+        .ok_or_else(|| install_failure("no metadata.json or metadata.desktop found in package"))?;
 
     let metadata_json = package_dir.join("metadata.json");
     let metadata_desktop = package_dir.join("metadata.desktop");
@@ -321,13 +340,18 @@ pub(super) fn install_via_kpackage(
     if metadata_json.exists()
         && let Err(e) = patch_metadata(&metadata_json, component.component_type, new_version)
     {
-        log::warn!(target: "patch", "failed for {}: {e}", component.name);
+        log::warn!(target: "patch", "failed for {}: {}", component.name, e.message);
     }
 
     if metadata_desktop.exists()
         && let Err(e) = patch_metadata_desktop(&metadata_desktop, new_version)
     {
-        log::warn!(target: "patch", "failed to patch metadata.desktop for {}: {e}", component.name);
+        log::warn!(
+            target: "patch",
+            "failed to patch metadata.desktop for {}: {}",
+            component.name,
+            e.message
+        );
     }
 
     let is_global = privilege::is_system_path(&component.path);
@@ -445,7 +469,10 @@ fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
 // --- Direct Installation Methods ---
 
 /// Installs a component using direct file operations (not kpackagetool).
-pub(super) fn install_direct(extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
+pub(super) fn install_direct(
+    extract_dir: &Path,
+    component: &InstalledComponent,
+) -> Result<(), ComponentFailure> {
     match component.component_type {
         ComponentType::ColorScheme => install_color_scheme(extract_dir, &component.path),
         ComponentType::IconTheme => install_icon_theme(extract_dir, &component.path),
@@ -457,34 +484,37 @@ pub(super) fn install_direct(extract_dir: &Path, component: &InstalledComponent)
         | ComponentType::SddmTheme => {
             install_theme_dir(extract_dir, &component.path, component.component_type)
         }
-        _ => Err(Error::install(format!(
+        _ => Err(install_failure(format!(
             "{} should use kpackagetool",
             component.component_type
         ))),
     }
 }
 
-fn install_color_scheme(extract_dir: &Path, dest_path: &Path) -> Result<()> {
+fn install_color_scheme(extract_dir: &Path, dest_path: &Path) -> Result<(), ComponentFailure> {
     let color_file = locate_color_scheme_file(extract_dir)
-        .ok_or_else(|| Error::install("no color scheme file found in archive"))?;
+        .ok_or_else(|| install_failure("no color scheme file found in archive"))?;
 
     atomic_install_file(&color_file, dest_path)?;
     log::debug!(target: "install", "copied color scheme to {}", dest_path.display());
     Ok(())
 }
 
-fn install_icon_theme(extract_dir: &Path, dest_dir: &Path) -> Result<()> {
+fn install_icon_theme(extract_dir: &Path, dest_dir: &Path) -> Result<(), ComponentFailure> {
     let source_dir = find_icon_theme_dir(extract_dir)
-        .ok_or_else(|| Error::install("no icon theme (index.theme) found in archive"))?;
+        .ok_or_else(|| install_failure("no icon theme (index.theme) found in archive"))?;
 
     atomic_install_dir(&source_dir, dest_dir)?;
     log::debug!(target: "install", "copied icon theme to {}", dest_dir.display());
     Ok(())
 }
 
-fn install_wallpaper(extract_dir: &Path, component: &InstalledComponent) -> Result<()> {
+fn install_wallpaper(
+    extract_dir: &Path,
+    component: &InstalledComponent,
+) -> Result<(), ComponentFailure> {
     let source = find_wallpaper_source(extract_dir)
-        .ok_or_else(|| Error::install("no wallpaper found in archive"))?;
+        .ok_or_else(|| install_failure("no wallpaper found in archive"))?;
 
     let dest = &component.path;
 
@@ -502,10 +532,10 @@ fn install_theme_dir(
     extract_dir: &Path,
     dest_dir: &Path,
     component_type: ComponentType,
-) -> Result<()> {
+) -> Result<(), ComponentFailure> {
     let source_dir =
         find_component_root_in_archive(extract_dir, component_type).ok_or_else(|| {
-            Error::install(format!(
+            install_failure(format!(
                 "no valid {component_type} structure found in archive"
             ))
         })?;
@@ -531,7 +561,10 @@ pub(super) fn is_single_file_component(path: &Path, component_type: ComponentTyp
     }
 }
 
-pub(super) fn install_raw_file(downloaded: &Path, component: &InstalledComponent) -> Result<()> {
+pub(super) fn install_raw_file(
+    downloaded: &Path,
+    component: &InstalledComponent,
+) -> Result<(), ComponentFailure> {
     let dest = &component.path;
     atomic_install_file(downloaded, dest)?;
     log::debug!(target: "install", "copied raw file to {}", dest.display());

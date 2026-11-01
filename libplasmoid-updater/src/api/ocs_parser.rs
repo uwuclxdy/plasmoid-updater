@@ -220,15 +220,19 @@ impl ContentXml {
 }
 
 pub(crate) fn parse_ocs_response(xml: &str) -> Result<(Vec<StoreEntry>, Meta)> {
-    let response: Response =
-        from_str(xml).map_err(|e| Error::xml_parse(format!("xml parse error: {e}")))?;
+    let response: Response = from_str(xml).map_err(|e| Error::Parse {
+        what: "ocs response",
+        detail: e.to_string(),
+    })?;
 
     if response.meta.status_code.is_rate_limited() {
         return Err(Error::RateLimited);
     }
 
     if !response.meta.status_code.is_success() {
-        return Err(Error::ApiError(response.meta.status_code.as_u16()));
+        return Err(Error::Api {
+            status: response.meta.status_code.as_u16(),
+        });
     }
 
     let entries = response

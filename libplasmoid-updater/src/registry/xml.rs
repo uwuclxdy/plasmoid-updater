@@ -298,6 +298,15 @@ fn rewrite_with_updates(
     let mut current_element = String::new();
     let mut entry_index: Option<usize> = None;
 
+    // a fn, not a closure: Event borrows from the caller's locals, and a
+    // closure would pin one lifetime across all call sites
+    fn write(writer: &mut Writer<Vec<u8>>, event: quick_xml::events::Event<'_>) -> Result<()> {
+        writer.write_event(event).map_err(|e| Error::Parse {
+            what: "knewstuff registry",
+            detail: format!("serialization failed: {e}"),
+        })
+    }
+
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
@@ -310,10 +319,10 @@ fn rewrite_with_updates(
                     entry_index = Some(entry_index.map_or(0, |i| i + 1));
                 }
 
-                writer.write_event(Event::Start(e.clone()))?;
+                write(&mut writer, Event::Start(e.clone()))?;
             }
             Ok(Event::End(e)) => {
-                writer.write_event(Event::End(e))?;
+                write(&mut writer, Event::End(e))?;
             }
             Ok(Event::Text(e)) => {
                 let in_target = entry_index == Some(target_index);
@@ -321,26 +330,32 @@ fn rewrite_with_updates(
                 if in_target
                     && let Some(replacement) = get_field_replacement(&current_element, fields)
                 {
-                    writer.write_event(Event::Text(quick_xml::events::BytesText::new(
-                        &replacement,
-                    )))?;
+                    write(
+                        &mut writer,
+                        Event::Text(quick_xml::events::BytesText::new(&replacement)),
+                    )?;
                     continue;
                 }
 
-                writer.write_event(Event::Text(e))?;
+                write(&mut writer, Event::Text(e))?;
             }
             Ok(Event::Eof) => break,
             Ok(e) => {
-                writer.write_event(e)?;
+                write(&mut writer, e)?;
             }
             Err(e) => {
-                return Err(Error::xml_parse(format!("registry xml parse error: {e}")));
+                return Err(Error::Parse {
+                    what: "knewstuff registry",
+                    detail: e.to_string(),
+                });
             }
         }
     }
 
-    let result = String::from_utf8(writer.into_inner())
-        .map_err(|e| Error::xml_parse(format!("invalid utf8 in registry: {e}")))?;
+    let result = String::from_utf8(writer.into_inner()).map_err(|e| Error::Parse {
+        what: "knewstuff registry",
+        detail: format!("invalid utf8: {e}"),
+    })?;
     Ok(Some(result))
 }
 

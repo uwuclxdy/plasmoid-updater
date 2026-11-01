@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
+    Error,
     api::ApiClient,
     types::{Diagnostic, InstalledComponent, StoreEntry, UpdateCheckResult},
 };
@@ -16,7 +17,7 @@ pub(crate) fn check_components(
     store_entries: &[StoreEntry],
     lookup: &IdLookup,
     result: &mut UpdateCheckResult,
-) {
+) -> crate::Result<()> {
     let resolved: Vec<(&InstalledComponent, u64)> = registry_components
         .iter()
         .filter_map(|c| resolution::resolve_content_id(c, store_entries, lookup).map(|id| (c, id)))
@@ -33,23 +34,36 @@ pub(crate) fn check_components(
             .collect()
     };
 
-    let fetched: HashMap<u64, StoreEntry> = client
-        .fetch_details(&missing_ids)
-        .into_iter()
-        .zip(missing_ids.iter())
-        .filter_map(|(r, &id)| match r {
-            Ok(e) => Some((id, e)),
-            Err(e) => {
-                log::warn!(
-                    target: "resolver",
-                    "failed to fetch store entry {}: {}",
-                    id,
-                    e
-                );
-                None
+    // A per-id lookup failure (a gone entry, a bad status, a timeout, a
+    // dropped connection) degrades that component to a diagnostic below.
+    // Only a lookup that could not connect to the store at all proves the
+    // store unreachable, and only when every lookup failed that way and no
+    // store entry is available from anywhere else — then the run fails.
+    let mut fetched: HashMap<u64, StoreEntry> = HashMap::new();
+    let mut connect_failures = 0usize;
+    let mut last_connect_error: Option<Error> = None;
+    for (id, result) in missing_ids.iter().zip(client.fetch_details(&missing_ids)) {
+        match result {
+            Ok(entry) => {
+                fetched.insert(*id, entry);
             }
-        })
-        .collect();
+            Err(e) => {
+                log::warn!(target: "resolver", "store entry {id} unavailable: {e}");
+                if matches!(&e, Error::Network(err) if err.is_connect()) {
+                    connect_failures += 1;
+                    last_connect_error = Some(e);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = last_connect_error
+        && connect_failures == missing_ids.len()
+        && fetched.is_empty()
+        && store_entries.is_empty()
+    {
+        return Err(err);
+    }
 
     for (component, content_id) in &resolved {
         let entry = resolution::find_store_entry(store_entries, *content_id)
@@ -64,8 +78,8 @@ pub(crate) fn check_components(
                     result.add_check_failure(diagnostic);
                 }
                 evaluation::ComponentCheckResult::UpToDate => {}
-                evaluation::ComponentCheckResult::Unresolved(_) => {
-                    unreachable!("evaluate_store_entry never returns Unresolved")
+                evaluation::ComponentCheckResult::Unresolved(diagnostic) => {
+                    result.add_check_failure(diagnostic);
                 }
             },
             None => {
@@ -91,4 +105,6 @@ pub(crate) fn check_components(
             result.add_unresolved(diagnostic);
         }
     }
+
+    Ok(())
 }

@@ -5,10 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{
-    types::InstalledComponent,
-    {Error, Result},
-};
+use super::ComponentFailure;
+use crate::{FailureKind, types::InstalledComponent};
 
 const MAX_BACKUPS_PER_TYPE: usize = 5;
 
@@ -25,7 +23,9 @@ fn timestamp() -> String {
 /// Creates a backup of the component before updating.
 /// Returns the path to the backup, or `None` if the component path
 /// does not exist on disk (nothing to back up).
-pub(crate) fn backup_component(component: &InstalledComponent) -> Result<Option<PathBuf>> {
+pub(crate) fn backup_component(
+    component: &InstalledComponent,
+) -> Result<Option<PathBuf>, ComponentFailure> {
     if !component.path.exists() {
         log::debug!(
             target: "backup",
@@ -43,11 +43,12 @@ pub(crate) fn backup_component(component: &InstalledComponent) -> Result<Option<
     // handle single files (e.g., color schemes, static wallpapers)
     if component.path.is_file() {
         let backup_dir = base.join(&timestamp).join(type_dir);
-        fs::create_dir_all(&backup_dir).map_err(|e| Error::backup(format!("create dir: {e}")))?;
+        fs::create_dir_all(&backup_dir)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, &backup_dir, e))?;
 
         let backup_path = backup_dir.join(&component.directory_name);
         fs::copy(&component.path, &backup_path)
-            .map_err(|e| Error::backup(format!("copy file: {e}")))?;
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, &component.path, e))?;
 
         // Prune old backups for this component type
         cleanup_old_backups(component.component_type);
@@ -60,7 +61,8 @@ pub(crate) fn backup_component(component: &InstalledComponent) -> Result<Option<
         .join(type_dir)
         .join(&component.directory_name);
 
-    fs::create_dir_all(&backup_path).map_err(|e| Error::backup(format!("create dir: {e}")))?;
+    fs::create_dir_all(&backup_path)
+        .map_err(|e| ComponentFailure::io(FailureKind::Install, &backup_path, e))?;
 
     copy_dir_recursive(&component.path, &backup_path)?;
 
@@ -75,35 +77,48 @@ pub(crate) fn backup_component(component: &InstalledComponent) -> Result<Option<
 /// Uses `atomic_install_file` / `atomic_install_dir` so the original path is
 /// never absent during the restore — a failed restore leaves the new backup
 /// content in a temp sibling, not an empty destination.
-pub(crate) fn restore_component(backup_path: &Path, original_path: &Path) -> Result<()> {
+pub(crate) fn restore_component(
+    backup_path: &Path,
+    original_path: &Path,
+) -> Result<(), ComponentFailure> {
     use super::install::{atomic_install_dir, atomic_install_file};
 
     if backup_path.is_file() {
-        atomic_install_file(backup_path, original_path)
-            .map_err(|e| Error::backup(format!("restore file: {e}")))?;
+        atomic_install_file(backup_path, original_path).map_err(|e| {
+            ComponentFailure::new(
+                FailureKind::RestoreFailed,
+                format!("restore file: {}", e.message),
+            )
+        })?;
     } else {
-        atomic_install_dir(backup_path, original_path)
-            .map_err(|e| Error::backup(format!("restore dir: {e}")))?;
+        atomic_install_dir(backup_path, original_path).map_err(|e| {
+            ComponentFailure::new(
+                FailureKind::RestoreFailed,
+                format!("restore dir: {}", e.message),
+            )
+        })?;
     }
 
     Ok(())
 }
 
-pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ComponentFailure> {
     if !src.is_dir() {
-        return Err(Error::backup(format!(
-            "source is not a directory: {}",
-            src.display()
-        )));
+        return Err(ComponentFailure::new(
+            FailureKind::Install,
+            format!("source is not a directory: {}", src.display()),
+        ));
     }
 
-    fs::create_dir_all(dst).map_err(|e| Error::backup(format!("create dir: {e}")))?;
+    fs::create_dir_all(dst).map_err(|e| ComponentFailure::io(FailureKind::Install, dst, e))?;
 
     let options = fs_extra::dir::CopyOptions::new()
         .content_only(true)
         .overwrite(true);
 
-    fs_extra::dir::copy(src, dst, &options).map_err(|e| Error::backup(format!("copy dir: {e}")))?;
+    fs_extra::dir::copy(src, dst, &options).map_err(|e| {
+        ComponentFailure::new(FailureKind::Install, format!("{}: {e}", dst.display()))
+    })?;
 
     Ok(())
 }

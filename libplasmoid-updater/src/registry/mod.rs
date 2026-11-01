@@ -12,7 +12,7 @@ pub(crate) use manager::{RegistryEntry, RegistryManager};
 use std::{collections::HashMap, fs, path::PathBuf};
 
 use crate::{
-    Result,
+    Error, Result,
     types::{AvailableUpdate, ComponentType, InstalledComponent},
 };
 
@@ -135,11 +135,17 @@ pub(crate) fn update_registry_after_install(update: &AvailableUpdate) -> Result<
     let release_date = utils::extract_date_from_iso(&update.release_date);
 
     if let Some(parent) = reg_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| Error::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
 
     let content = if reg_path.exists() {
-        fs::read_to_string(&reg_path)?
+        fs::read_to_string(&reg_path).map_err(|e| Error::Io {
+            path: reg_path.clone(),
+            source: e,
+        })?
     } else {
         xml::create_empty_registry()
     };
@@ -156,7 +162,10 @@ pub(crate) fn update_registry_after_install(update: &AvailableUpdate) -> Result<
     let updated = xml::update_entry(&content, &fields)?;
 
     if let Some(new_content) = updated {
-        fs::write(&reg_path, new_content)?;
+        fs::write(&reg_path, new_content).map_err(|e| Error::Io {
+            path: reg_path.clone(),
+            source: e,
+        })?;
         log::debug!(
             target: "registry",
             "updated {} for {}",
@@ -174,7 +183,10 @@ pub(crate) fn update_registry_after_install(update: &AvailableUpdate) -> Result<
             release_date: &release_date,
         };
         let new_content = xml::add_entry(&content, &entry);
-        fs::write(&reg_path, new_content)?;
+        fs::write(&reg_path, new_content).map_err(|e| Error::Io {
+            path: reg_path.clone(),
+            source: e,
+        })?;
         log::debug!(
             target: "registry",
             "added {} to {}",

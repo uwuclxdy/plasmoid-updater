@@ -26,18 +26,31 @@ const CATEGORY_WALLPAPER: u16 = 299;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentType {
+    /// A Plasma applet (`metadata.json` `Plasma/Applet`).
     PlasmaWidget,
+    /// A Plasma wallpaper plugin (`Plasma/Wallpaper`).
     WallpaperPlugin,
+    /// A KWin effect (`KWin/Effect`).
     KWinEffect,
+    /// A KWin script (`KWin/Script`).
     KWinScript,
+    /// A KWin window switcher (`KWin/WindowSwitcher`).
     KWinSwitcher,
+    /// A global theme (`Plasma/LookAndFeel`).
     GlobalTheme,
+    /// A Plasma desktop theme (`Plasma/Theme`).
     PlasmaStyle,
+    /// An Aurorae window decoration theme.
     AuroraeDecoration,
+    /// A colour scheme file (`.colors`).
     ColorScheme,
+    /// A Plasma splash screen (`Plasma/LookAndFeel`).
     SplashScreen,
+    /// An SDDM login theme (system-wide only).
     SddmTheme,
+    /// An icon theme.
     IconTheme,
+    /// A wallpaper package or image.
     Wallpaper,
 }
 
@@ -220,6 +233,7 @@ impl ComponentType {
 
     // -- Enumeration --
 
+    /// Every supported component type, system- and user-local ones alike.
     pub const fn all() -> &'static [ComponentType] {
         &[
             Self::PlasmaWidget,
@@ -238,6 +252,8 @@ impl ComponentType {
         ]
     }
 
+    /// The component types a user-local scan covers ([`all`](Self::all)
+    /// without the system-only types).
     pub const fn all_user() -> &'static [ComponentType] {
         &[
             Self::PlasmaWidget,
@@ -281,29 +297,107 @@ impl std::fmt::Display for ComponentType {
 /// A KDE component installed on the local system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledComponent {
+    /// Display name from the component's metadata, or the directory name when
+    /// the metadata has none.
     pub name: String,
+    /// Directory (or, for single-file components, file) name on disk. This is
+    /// what the widgets-id table keys on and what most store entries match.
     pub directory_name: String,
+    /// Installed version as recorded in the metadata or the KNewStuff
+    /// registry; `"0.0.0"` when unknown.
     pub version: String,
+    /// Which kind of Plasma component this is.
     pub component_type: ComponentType,
+    /// Root directory of the component, or the file itself for single-file
+    /// components such as color schemes.
     #[serde(with = "pathbuf_serde")]
     pub path: PathBuf,
+    /// `true` when the component lives in a system-wide directory.
     pub is_system: bool,
+    /// Release date as recorded by the store or the KNewStuff registry: an
+    /// ISO 8601 date (`YYYY-MM-DD`) when known, empty otherwise.
     pub release_date: String,
+}
+
+impl InstalledComponent {
+    /// The installed path as a string: unique per component within a run,
+    /// unlike the directory name, so progress events key their rows on it.
+    pub(crate) fn event_id(&self) -> String {
+        self.path.display().to_string()
+    }
 }
 
 /// An available update for an installed component, with download metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailableUpdate {
+    /// The component this update would replace.
     pub installed: InstalledComponent,
+    /// KDE Store content id of the newer entry.
     pub content_id: u64,
+    /// Version the store advertises.
     pub latest_version: String,
+    /// URL the archive or file downloads from.
     pub download_url: String,
+    /// Human-facing store page (`https://store.kde.org/p/<id>`).
     pub store_url: String,
+    /// Store change date of the newer entry (ISO 8601 when known).
     pub release_date: String,
+    /// MD5 checksum the store advertises, when it advertises one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+    /// Advertised download size in bytes, when advertised.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_size: Option<u64>,
+}
+
+/// One component that failed inside an otherwise successful run.
+#[derive(Debug, Clone, Serialize)]
+pub struct Failure {
+    /// The component the failure is about.
+    pub component: InstalledComponent,
+    /// Which stage failed.
+    pub kind: FailureKind,
+    /// Human-readable description of what went wrong.
+    pub message: String,
+}
+
+/// Which stage of an install failed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// The store entry had no download link matching its own version.
+    NoMatchingDownload,
+    /// Downloading the archive or file failed.
+    Download,
+    /// The downloaded archive's checksum did not match the advertised one.
+    Checksum,
+    /// Extracting the downloaded archive failed.
+    Extract,
+    /// Installing the extracted files (kpackagetool6, direct copy) failed.
+    Install,
+    /// The install failed and restoring the backup failed too, so the
+    /// component may be left in a partial state.
+    RestoreFailed,
+    /// The files were installed, but the post-install version could not be
+    /// verified to match the expected version. The component still counts
+    /// toward [`UpdateResult::needs_restart`](crate::UpdateResult::needs_restart).
+    Unverified,
+}
+
+impl std::fmt::Display for FailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::NoMatchingDownload => "no matching download",
+            Self::Download => "download",
+            Self::Checksum => "checksum",
+            Self::Extract => "extract",
+            Self::Install => "install",
+            Self::RestoreFailed => "restore",
+            Self::Unverified => "unverified",
+        };
+        f.write_str(label)
+    }
 }
 
 /// Builder for constructing [`AvailableUpdate`] instances with optional fields.
@@ -416,15 +510,19 @@ impl PackageMetadata {
 /// Diagnostic information about a component that could not be checked or updated.
 ///
 /// Returned as part of [`CheckResult::diagnostics`](crate::CheckResult::diagnostics).
-/// Contains the component name, the reason it was skipped, and optional version/ID metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
+    /// Display name of the component.
     pub name: String,
+    /// Why the component could not be checked.
     pub reason: String,
+    /// Installed version when one could be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
+    /// Version the store advertises, when the entry was found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_version: Option<String>,
+    /// Store content id, when one was resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_id: Option<u64>,
 }
@@ -462,6 +560,8 @@ pub(crate) struct UpdateCheckResult {
     pub updates: Vec<AvailableUpdate>,
     pub unresolved: Vec<Diagnostic>,
     pub check_failures: Vec<Diagnostic>,
+    /// Names of components dropped by the configuration's exclusion rules.
+    pub skipped: Vec<String>,
 }
 
 impl UpdateCheckResult {

@@ -38,7 +38,10 @@ impl RegistryManager {
         if !self.file_path.exists() {
             return Ok(Vec::new());
         }
-        let content = fs::read_to_string(&self.file_path)?;
+        let content = fs::read_to_string(&self.file_path).map_err(|e| crate::Error::Io {
+            path: self.file_path.clone(),
+            source: e,
+        })?;
         Ok(xml::parse_registry_entries(&content))
     }
 

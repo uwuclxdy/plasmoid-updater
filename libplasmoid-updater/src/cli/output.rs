@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::io::Write as _;
+
 use bytesize::ByteSize;
 use comfy_table::{Attribute, Cell, CellAlignment, Table, presets};
 
 use crate::{
-    FailedUpdate, UpdateResult,
+    UpdateResult,
     types::{AvailableUpdate, InstalledComponent},
 };
 
-pub fn format_version(version: &str) -> &str {
+pub(crate) fn format_version(version: &str) -> &str {
     if version.is_empty() || version == "0.0.0" {
         "N/A"
     } else {
@@ -51,10 +53,30 @@ impl TableRow for InstalledComponent {
     }
 }
 
-impl TableRow for FailedUpdate {
-    fn to_row(&self) -> Vec<Cell> {
-        vec![Cell::new(&self.name), Cell::new(&self.error)]
+/// Prints a table of failed components to **stderr**: one row per failure
+/// with the component name, the failed stage and the message.
+pub fn print_failures(result: &UpdateResult) {
+    if result.failed.is_empty() {
+        return;
     }
+
+    // The table goes to stderr, so comfy-table must decide styling from the
+    // stderr stream's TTY state, not stdout's.
+    let mut table = Table::new();
+    table.use_stderr().load_style(presets::NOTHING);
+    table.set_header(vec![header("NAME"), header("KIND"), header("ERROR")]);
+
+    for failure in &result.failed {
+        table.add_row(vec![
+            Cell::new(&failure.component.name),
+            Cell::new(failure.kind.to_string()),
+            Cell::new(&failure.message),
+        ]);
+    }
+
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{table}");
+    let _ = err.flush();
 }
 
 fn format_download_size(size: Option<u64>) -> String {
@@ -62,7 +84,7 @@ fn format_download_size(size: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn print_table<T: TableRow>(items: &[T], headers: &[&str]) {
+fn print_stdout_table<T: TableRow>(items: &[T], headers: &[&str]) {
     let mut table = Table::new();
     table.load_style(presets::NOTHING);
     table.set_header(headers.iter().map(|h| header(h)).collect::<Vec<_>>());
@@ -74,53 +96,15 @@ fn print_table<T: TableRow>(items: &[T], headers: &[&str]) {
     println!("{table}");
 }
 
+/// Prints the table of available updates (check output) to stdout.
 pub fn print_updates_table(updates: &[AvailableUpdate]) {
-    let headers = vec!["NAME", "CURRENT", "AVAILABLE", "ID", "SIZE", "TYPE"];
-    print_table(updates, &headers);
+    let headers = ["NAME", "CURRENT", "AVAILABLE", "ID", "SIZE", "TYPE"];
+    print_stdout_table(updates, &headers);
 }
 
+/// Prints the table of installed components (`list-installed` output) to
+/// stdout.
 pub fn print_components_table(components: &[InstalledComponent]) {
-    let headers = vec!["NAME", "VERSION", "TYPE"];
-    print_table(components, &headers);
-}
-
-pub fn print_error_table(update_result: &UpdateResult) {
-    let headers = vec!["NAME", "ERROR"];
-    print_table(&update_result.failed, &headers);
-}
-
-pub fn print_summary(update_result: &UpdateResult) {
-    let total =
-        update_result.succeeded.len() + update_result.failed.len() + update_result.skipped.len();
-
-    if update_result.unverified.is_empty() {
-        println!(
-            "Update Summary: {} succeeded, {} failed, {} skipped ({} total)",
-            update_result.succeeded.len(),
-            update_result.failed.len(),
-            update_result.skipped.len(),
-            total,
-        );
-    } else {
-        println!(
-            "Update Summary: {} succeeded ({} unverified), {} failed, {} skipped ({} total)",
-            update_result.succeeded.len(),
-            update_result.unverified.len(),
-            update_result.failed.len(),
-            update_result.skipped.len(),
-            total,
-        );
-        for u in &update_result.unverified {
-            let actual = u.actual_version.as_deref().unwrap_or("(unreadable)");
-            println!(
-                "  unverified: {} — expected {}, found {}",
-                u.name, u.expected_version, actual,
-            );
-        }
-    }
-}
-
-pub fn print_count_message(count: usize, item_type: &str) {
-    let plural = if count == 1 { "" } else { "s" };
-    println!("{} {}{} available.", count, item_type, plural);
+    let headers = ["NAME", "VERSION", "TYPE"];
+    print_stdout_table(components, &headers);
 }

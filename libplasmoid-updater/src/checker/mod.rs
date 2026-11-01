@@ -71,7 +71,7 @@ pub(crate) fn check_with_components(
         &store_entries,
         &lookup,
         &mut result,
-    );
+    )?;
 
     Ok(result)
 }
