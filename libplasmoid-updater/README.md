@@ -34,7 +34,7 @@ Plasma Widgets, Wallpaper Plugins, KWin Effects/Scripts/Switchers, Global Themes
 | --- | --- |
 | `check(&Config) -> Result<CheckResult>` | scan for available updates to installed KDE components |
 | `update(&Config, &dyn Reporter) -> Result<UpdateResult>` | install every non-excluded available update |
-| `install(&[AvailableUpdate], &Config, &dyn Reporter) -> Result<UpdateResult>` | install a caller-chosen selection exactly as given (exclusions apply once, in `check`; an empty selection changes nothing) |
+| `install(&[AvailableUpdate], &Config, &dyn Reporter) -> Result<UpdateResult>` | install a caller-chosen selection exactly as given (exclusions apply once, in `check`; an empty selection takes the run lock and repairs what a killed run left stranded, or returns an empty result when another run already holds the lock) |
 | `restart_plasmashell() -> Result<()>` | restart plasmashell via systemd; the caller decides when |
 | `get_installed(&Config) -> Result<Vec<InstalledComponent>>` | return all installed KDE components; no network calls |
 
@@ -68,7 +68,9 @@ Built with a builder table via `Config::new()`:
 - `available_updates: Vec<AvailableUpdate>` — empty when the store has nothing newer (not an error); `diagnostics` may still list components that could not be checked, so `has_updates()` answers "anything to install" and `is_empty()` answers "nothing found at all" — no updates, no diagnostics and nothing skipped
 - `skipped: Vec<String>` — names of components excluded by the config's exclusion rules; exclusions apply once, in `check()`, so excluded components never appear in `available_updates` (and `install()` installs its selection exactly as given)
 - `diagnostics: Vec<Diagnostic>`
+- `unavailable: Vec<Failure>` — components whose store entry offers no download link for its version, each a `NoMatchingDownload` failure row to report the way `update()` does; the same components are also listed in `diagnostics`
 - `has_updates() -> bool`, `update_count() -> usize`, `is_empty() -> bool`
+- `unavailable_diagnostics() -> impl Iterator<Item = &Diagnostic>` — the `diagnostics` entries carrying the no-download reason, one per `unavailable` row, so a caller reporting those as failures keeps them out of `skipped` and out of the plain diagnostic output
 
 `Diagnostic` : a component that could not be checked:
 - fields: `name`, `reason`, `installed_version: Option<String>`, `available_version: Option<String>`, `content_id: Option<u64>`
