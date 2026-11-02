@@ -488,6 +488,405 @@ fn verbose_and_debug_flags_are_accepted() {
 }
 
 #[test]
+fn a_bare_run_prints_help_and_installs_nothing() {
+    let (sandbox, store) = pending_update();
+    let run = run(&sandbox, store.url(), &[]);
+    assert_eq!(run.code, 0, "{run}");
+    assert!(run.stdout.contains("Usage:"), "{run}");
+    common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
+#[test]
+fn update_without_yes_on_a_non_tty_stdin_is_refused_naming_yes() {
+    let (sandbox, store) = pending_update();
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update"],
+    );
+    assert_eq!(run.code, 2, "{run}");
+    assert!(run.stderr.contains("-y"), "{run}");
+    common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
+#[test]
+fn update_of_a_named_component_on_a_non_tty_stdin_needs_no_yes() {
+    let (sandbox, store) = pending_update();
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update", common::SCHEME_FILE],
+    );
+    assert_eq!(run.code, 0, "{run}");
+    common::assert_content(&sandbox.scheme_path(), common::NEW_CONTENT);
+}
+
+#[test]
+fn assume_yes_in_the_config_still_installs_on_a_non_tty_stdin() {
+    let (sandbox, store) = pending_update();
+    write_config(&sandbox, "assume_yes = true\n");
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update"],
+    );
+    assert_eq!(run.code, 0, "{run}");
+    common::assert_content(&sandbox.scheme_path(), common::NEW_CONTENT);
+}
+
+#[test]
+fn update_all_by_default_in_the_config_still_installs_on_a_non_tty_stdin() {
+    let (sandbox, store) = pending_update();
+    write_config(&sandbox, "update_all_by_default = true\n");
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update"],
+    );
+    assert_eq!(run.code, 0, "{run}");
+    common::assert_content(&sandbox.scheme_path(), common::NEW_CONTENT);
+}
+
+#[test]
+fn restart_and_no_restart_flags_conflict() {
+    let (sandbox, store) = pending_update();
+    let run = run(
+        &sandbox,
+        store.url(),
+        &[
+            "--skip-plasma-detection",
+            "update",
+            "-y",
+            "--restart-plasma",
+            "--no-restart-plasma",
+        ],
+    );
+    assert_eq!(run.code, 2, "{run}");
+    common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
+/// A fake `sudo` that records each call in `sudo-calls` beside it and fails,
+/// so a read-only command that authenticates is caught either way.
+fn fake_sudo_dir(sandbox: &Sandbox) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = sandbox.tmp_dir().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sudo = bin.join("sudo");
+    std::fs::write(
+        &sudo,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n",
+            bin.join("sudo-calls").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn run_with_fake_sudo(sandbox: &Sandbox, api_url: &str, args: &[&str]) -> (Run, Vec<String>) {
+    let bin = fake_sudo_dir(sandbox);
+    let mut path = std::ffi::OsString::from(&bin);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let output = sandbox
+        .command(self::bin())
+        .env("PATH", path)
+        .env(API_URL_VAR, api_url)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let run = Run {
+        code: output.status.code().expect("killed by a signal"),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    let calls = std::fs::read_to_string(bin.join("sudo-calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (run, calls)
+}
+
+#[test]
+fn system_check_does_not_authenticate() {
+    let (sandbox, store) = pending_update();
+    let (run, calls) = run_with_fake_sudo(
+        &sandbox,
+        store.url(),
+        &["--system", "--skip-plasma-detection", "check"],
+    );
+    assert!(calls.is_empty(), "check ran sudo {calls:?}: {run}");
+    assert!(!run.stderr.contains("sudo authentication failed"), "{run}");
+}
+
+#[test]
+fn system_update_dry_run_does_not_authenticate() {
+    let (sandbox, store) = pending_update();
+    let (run, calls) = run_with_fake_sudo(
+        &sandbox,
+        store.url(),
+        &[
+            "--system",
+            "--skip-plasma-detection",
+            "update",
+            "-y",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        calls.is_empty(),
+        "update --dry-run ran sudo {calls:?}: {run}"
+    );
+    common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
+#[test]
+fn system_list_installed_does_not_authenticate() {
+    let (sandbox, store) = pending_update();
+    let (run, calls) = run_with_fake_sudo(
+        &sandbox,
+        store.url(),
+        &["--system", "--skip-plasma-detection", "list-installed"],
+    );
+    assert!(calls.is_empty(), "list-installed ran sudo {calls:?}: {run}");
+    assert_eq!(run.code, 0, "{run}");
+}
+
+#[test]
+fn system_update_of_a_named_component_authenticates() {
+    let (sandbox, store) = pending_update();
+    let (run, calls) = run_with_fake_sudo(
+        &sandbox,
+        store.url(),
+        &[
+            "--system",
+            "--skip-plasma-detection",
+            "update",
+            common::SCHEME_FILE,
+        ],
+    );
+    assert_eq!(
+        calls,
+        ["-v"],
+        "a named system update did not authenticate: {run}"
+    );
+    assert_ne!(run.code, 0, "{run}");
+    common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
+/// Runs `check` with the config directory pointed at `config_dir`.
+fn check_with_config_dir(sandbox: &Sandbox, api_url: &str, config_dir: &std::path::Path) -> Run {
+    let output = sandbox
+        .command(bin())
+        .env(API_URL_VAR, api_url)
+        .env("PLASMOID_UPDATER_CONFIG_DIR", config_dir)
+        .args(["--skip-plasma-detection", "check"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    Run {
+        code: output.status.code().expect("killed by a signal"),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn a_config_dir_below_a_regular_file_is_a_usage_error_naming_it() {
+    let (sandbox, store) = pending_update();
+    let file = sandbox.tmp_dir().join("not-a-dir");
+    std::fs::write(&file, "").unwrap();
+    let config_dir = file.join("sub");
+    let run = check_with_config_dir(&sandbox, store.url(), &config_dir);
+    assert_eq!(run.code, 2, "{run}");
+    assert!(
+        run.stderr.contains(&config_dir.display().to_string()),
+        "{run}"
+    );
+}
+
+#[test]
+fn a_dangling_config_dir_symlink_is_a_usage_error_naming_it() {
+    let (sandbox, store) = pending_update();
+    let link = sandbox.tmp_dir().join("dangling-config");
+    std::os::unix::fs::symlink(sandbox.tmp_dir().join("missing"), &link).unwrap();
+    let run = check_with_config_dir(&sandbox, store.url(), &link);
+    assert_eq!(run.code, 2, "{run}");
+    assert!(run.stderr.contains(&link.display().to_string()), "{run}");
+}
+
+#[test]
+fn the_config_dir_usage_error_quotes_a_path_that_needs_escaping() {
+    let (sandbox, store) = pending_update();
+    let not_a_dir = sandbox.tmp_dir().join("not-a-dir\nname");
+    std::fs::write(&not_a_dir, "").unwrap();
+    let run = check_with_config_dir(&sandbox, store.url(), &not_a_dir);
+    assert_eq!(run.code, 2, "{run}");
+    assert!(
+        run.stderr.contains(r"not-a-dir\nname"),
+        "the path is not quoted in stderr: {run}"
+    );
+    assert!(
+        !run.stderr.contains("not-a-dir\nname"),
+        "the raw newline reached stderr: {run}"
+    );
+}
+
+#[test]
+fn a_config_dir_that_is_a_regular_file_is_a_usage_error_naming_it() {
+    let (sandbox, store) = pending_update();
+    let not_a_dir = sandbox.tmp_dir().join("not-a-dir");
+    std::fs::write(&not_a_dir, "").unwrap();
+    let output = sandbox
+        .command(bin())
+        .env(API_URL_VAR, store.url())
+        .env("PLASMOID_UPDATER_CONFIG_DIR", &not_a_dir)
+        .args(["--skip-plasma-detection", "check"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(&not_a_dir.display().to_string()),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// Runs `--edit-config` with `EDITOR` set to `editor`.
+fn edit_config(sandbox: &Sandbox, editor: &str) -> Run {
+    let output = sandbox
+        .command(bin())
+        .env("EDITOR", editor)
+        .arg("--edit-config")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    Run {
+        code: output.status.code().expect("killed by a signal"),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn edit_config_fails_when_the_editor_fails() {
+    let sandbox = Sandbox::new();
+    let run = edit_config(&sandbox, "false");
+    assert_ne!(run.code, 0, "{run}");
+    assert!(
+        has_word(&run.stderr, "false") || run.stderr.contains("\"false\""),
+        "{run}"
+    );
+}
+
+#[test]
+fn edit_config_of_a_missing_editor_says_it_was_not_found() {
+    let sandbox = Sandbox::new();
+    let run = edit_config(&sandbox, "definitely-not-a-real-editor-xyz");
+    assert_eq!(run.code, 3, "{run}");
+    assert!(
+        run.stderr
+            .contains("editor 'definitely-not-a-real-editor-xyz' not found on PATH"),
+        "{run}"
+    );
+}
+
+#[test]
+fn edit_config_error_names_the_editor_without_repeating_status() {
+    let sandbox = Sandbox::new();
+    let run = edit_config(&sandbox, "false");
+    assert_eq!(run.code, 3, "{run}");
+    assert!(
+        run.stderr
+            .contains("editor 'false' exited with exit status: 1"),
+        "{run}"
+    );
+}
+
+#[test]
+fn a_missing_editor_given_by_path_says_it_could_not_be_run() {
+    let sandbox = Sandbox::new();
+    let run = edit_config(&sandbox, "/opt/plasmoid-updater-no-such-editor");
+    assert_eq!(run.code, 3, "{run}");
+    assert!(
+        run.stderr.contains(
+            "editor '/opt/plasmoid-updater-no-such-editor' could not be run \
+             (exit 127: not found or not executable)"
+        ),
+        "{run}"
+    );
+    assert!(!run.stderr.contains("on PATH"), "{run}");
+}
+
+/// `EDITOR` set to an empty string counts as unset, so the default editor runs
+/// rather than the shell trying to execute the config file itself.
+#[test]
+fn a_blank_editor_falls_back_to_the_default_editor() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new();
+    let bin_dir = sandbox.tmp_dir().join("default-editor-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let args_file = sandbox.tmp_dir().join("default-editor-args");
+    let nano = bin_dir.join("nano");
+    std::fs::write(
+        &nano,
+        format!("#!/bin/sh\necho \"$@\" > '{}'\n", args_file.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&nano, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = std::ffi::OsString::from(&bin_dir);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    let output = sandbox
+        .command(bin())
+        .env("PATH", path)
+        .env("EDITOR", "")
+        .arg("--edit-config")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr:\n{stderr}");
+    let config = sandbox.config_dir().join("plasmoid-updater.toml");
+    let args = std::fs::read_to_string(&args_file).unwrap_or_default();
+    assert_eq!(
+        args.trim_end(),
+        config.display().to_string(),
+        "the default editor did not get the config path; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn edit_config_splits_an_editor_command_with_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new();
+    let editor = sandbox.tmp_dir().join("fake-editor");
+    let args_file = sandbox.tmp_dir().join("editor-args");
+    std::fs::write(
+        &editor,
+        format!("#!/bin/sh\necho \"$@\" > '{}'\n", args_file.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = edit_config(&sandbox, &format!("{} --wait", editor.display()));
+
+    assert_eq!(run.code, 0, "{run}");
+    let args = std::fs::read_to_string(&args_file).unwrap_or_default();
+    let config = sandbox.config_dir().join("plasmoid-updater.toml");
+    assert_eq!(
+        args.trim_end(),
+        format!("--wait {}", config.display()),
+        "{run}"
+    );
+}
+
+#[test]
 fn completions_print_a_shell_script_on_stdout() {
     let sandbox = Sandbox::new();
     let run = run(

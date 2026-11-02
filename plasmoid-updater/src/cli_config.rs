@@ -12,10 +12,31 @@ const CONFIG_DIR_ENV: &str = "PLASMOID_UPDATER_CONFIG_DIR";
 const API_URL_ENV: &str = "PLASMOID_UPDATER_API_URL";
 
 fn config_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV).filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir).join(CONFIG_FILE_NAME));
+    config_dir().map(|dir| dir.join(CONFIG_FILE_NAME))
+}
+
+/// The directory holding the config file, from the environment override or the
+/// platform's config dir.
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os(CONFIG_DIR_ENV)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+}
+
+/// The config directory when a path component that would have to be a
+/// directory is not one. That is the caller's mistake, not a failure of the run.
+pub fn unusable_config_dir() -> Option<PathBuf> {
+    let dir = config_dir()?;
+    match fs::metadata(&dir) {
+        Ok(metadata) if !metadata.is_dir() => Some(dir),
+        Ok(_) => None,
+        // A path below a regular file can never resolve to a directory.
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => Some(dir),
+        // A path whose last component exists but does not resolve is a dangling
+        // symlink, not a missing directory: the run still cannot use it.
+        Err(_) => fs::symlink_metadata(&dir).ok().map(|_| dir),
     }
-    dirs::config_dir().map(|d| d.join(CONFIG_FILE_NAME))
 }
 
 /// Points the config at [`API_URL_ENV`]'s store base URL when it is set and
@@ -127,16 +148,45 @@ fn create_default_config(path: &Path) -> libplasmoid_updater::Result<()> {
     fs::write(path, default_content).map_err(|e| config_error(path, e))
 }
 
+/// Opens the config in `$EDITOR`, the way git does: the variable may hold a
+/// command with its own arguments (`code --wait`), so the shell splits it and
+/// the config path arrives as the command's positional argument.
 fn open_in_editor(path: &Path) -> libplasmoid_updater::Result<()> {
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
-    std::process::Command::new(&editor)
+    let editor = std::env::var("EDITOR")
+        .ok()
+        .filter(|editor| !editor.trim().is_empty())
+        .unwrap_or_else(|| "nano".to_string());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg("sh")
         .arg(path)
         .status()
-        .map(|_| ())
-        .map_err(|e| editor_spawn_error(&editor, &e))
+        .map_err(|e| editor_spawn_error(&editor, &e))?;
+
+    if status.success() {
+        Ok(())
+    } else if status.code() == Some(127) {
+        // `sh` reports 127 when the command it would run does not exist or is
+        // not executable. Only a bare name was looked up on PATH; an absolute
+        // path names one file, so claiming PATH would misname the search.
+        Err(libplasmoid_updater::Error::Config(
+            if editor.contains('/') {
+                format!(
+                    "editor '{editor}' could not be run (exit 127: not found or not executable)"
+                )
+            } else {
+                format!("editor '{editor}' not found on PATH (exit 127)")
+            },
+        ))
+    } else {
+        Err(libplasmoid_updater::Error::Config(format!(
+            "editor '{editor}' exited with {status}"
+        )))
+    }
 }
 
-/// A failed editor spawn names the editor. `Error::MissingTool` holds only a
+/// A failed shell spawn names the editor. `Error::MissingTool` holds only a
 /// `&'static str`, and `Error::Io` a touched path, so a runtime editor name
 /// goes into a [`libplasmoid_updater::Error::Config`] message.
 fn editor_spawn_error(editor: &str, e: &std::io::Error) -> libplasmoid_updater::Error {

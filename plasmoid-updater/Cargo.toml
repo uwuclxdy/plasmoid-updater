@@ -27,6 +27,7 @@ nix = { workspace = true }
 
 [dev-dependencies]
 md5 = "0.8.1"
+nix = { workspace = true, features = ["term", "signal"] }
 tempfile = "3.27.0"
 
 [lints]

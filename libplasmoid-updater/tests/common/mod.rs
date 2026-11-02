@@ -250,6 +250,9 @@ pub struct Listing {
     /// Whether the first catalog page answers `200 OK` with a body that is
     /// not OCS XML.
     pub catalog_garbage: bool,
+    /// Whether a download request is held open for a minute before any byte
+    /// of the answer is sent.
+    pub download_stalls: bool,
     /// A widget entry the category listing serves when the query names its
     /// subcategory id.
     pub widget: Option<CatalogWidget>,
@@ -288,6 +291,7 @@ impl Default for Listing {
             per_id_drops_mid_body: false,
             catalog_connects_nowhere: false,
             catalog_garbage: false,
+            download_stalls: false,
             widget: None,
             total_items: TotalItems::Default,
             link_version: None,
@@ -377,6 +381,7 @@ impl FakeStore {
             per_id_drops_mid_body: listing.per_id_drops_mid_body,
             catalog_connects_nowhere: listing.catalog_connects_nowhere,
             catalog_garbage: listing.catalog_garbage,
+            download_stalls: listing.download_stalls,
             total_items: listing.total_items,
             dead_port,
             catalog_requests: AtomicUsize::new(0),
@@ -426,6 +431,7 @@ struct Served {
     per_id_drops_mid_body: bool,
     catalog_connects_nowhere: bool,
     catalog_garbage: bool,
+    download_stalls: bool,
     total_items: TotalItems,
     dead_port: u16,
     catalog_requests: AtomicUsize,
@@ -453,6 +459,9 @@ fn serve(mut stream: TcpStream, served: &Served) {
     {
         ("200 OK", widget_archive.clone())
     } else if target.starts_with("/dl/") {
+        if served.download_stalls {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
         ("200 OK", served.archive.clone())
     } else if target == format!("/ocs/v1/content/data/{SCHEME_ID}") {
         let fail_now = served

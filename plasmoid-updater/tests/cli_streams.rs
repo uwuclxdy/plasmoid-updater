@@ -611,7 +611,7 @@ fn the_system_pre_flight_runs_sudo_from_path() {
         &sandbox,
         &common::dead_store_url(),
         &sudo,
-        &["--skip-plasma-detection", "--system", "check"],
+        &["--skip-plasma-detection", "--system", "update", "-y"],
     );
     assert_eq!(run.code, 3, "{run}");
     assert!(run.stderr.contains("sudo authentication failed"), "{run}");

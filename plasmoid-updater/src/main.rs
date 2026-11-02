@@ -74,7 +74,11 @@ enum Commands {
     Update {
         #[arg(help = "component name or directory to update")]
         component: Option<String>,
-        #[arg(long, help = "automatically restart plasmashell")]
+        #[arg(
+            long,
+            help = "automatically restart plasmashell",
+            conflicts_with = "no_restart_plasma"
+        )]
         restart_plasma: bool,
         #[arg(long, help = "do not restart plasmashell")]
         no_restart_plasma: bool,
@@ -104,6 +108,35 @@ enum RestartDecision {
     Prompt,
 }
 
+/// What a run that may need a restart does about it.
+#[derive(Debug, PartialEq, Eq)]
+enum RestartPlan {
+    /// Restart without asking.
+    Restart,
+    /// Ask first.
+    Prompt,
+    /// Leave plasmashell alone.
+    Skip,
+    /// Leave it alone, and say why on stderr.
+    SkipWarn(&'static str),
+}
+
+const RESTART_PROMPT_SKIPPED: &str = "restart prompt skipped: stdin is not a terminal; \
+     pass --restart-plasma to restart plasmashell anyway";
+
+/// Whether and how this run restarts plasmashell.
+fn restart_plan(decision: RestartDecision, needs_restart: bool, stdin_is_tty: bool) -> RestartPlan {
+    if !needs_restart {
+        return RestartPlan::Skip;
+    }
+    match decision {
+        RestartDecision::Always => RestartPlan::Restart,
+        RestartDecision::Never => RestartPlan::Skip,
+        RestartDecision::Prompt if stdin_is_tty => RestartPlan::Prompt,
+        RestartDecision::Prompt => RestartPlan::SkipWarn(RESTART_PROMPT_SKIPPED),
+    }
+}
+
 #[derive(Default)]
 struct UpdateArgs {
     component: Option<String>,
@@ -118,6 +151,8 @@ struct UpdateArgs {
 enum Stop {
     /// stdout's reader went away, so the payload has nowhere to go.
     PipeClosed,
+    /// The command line names something the run cannot act on.
+    Usage(String),
     /// The run could not start or finish.
     Fatal(lib::Error),
     /// Writing the payload to stdout failed; the bin's own stream, so the bin
@@ -138,6 +173,10 @@ fn main() {
     let exit_code = match run(cli) {
         Ok(code) => code,
         Err(Stop::PipeClosed) => ExitCode::Success,
+        Err(Stop::Usage(message)) => {
+            log::error!("{message}");
+            ExitCode::Usage
+        }
         Err(Stop::Fatal(error)) => {
             log::error!("{error}");
             ExitCode::Fatal
@@ -153,13 +192,16 @@ fn main() {
 
 fn run(cli: Cli) -> Result<ExitCode, Stop> {
     if cli.edit_config {
+        reject_unusable_config_dir()?;
         CliConfig::edit_config()?;
         return Ok(ExitCode::Success);
     }
 
     match &cli.command {
         Some(Commands::Completions { shell }) => completions(*shell),
-        None => do_update(&configured(&cli)?, UpdateArgs::default(), cli.quiet),
+        // A bare run is a request for the help, not for an update: it reads
+        // no config and makes no store request.
+        None => print_help(),
         Some(Commands::Check { ignore }) => do_check(&configured(&cli)?, ignore, cli.quiet),
         Some(Commands::ListInstalled) => do_list_installed(&configured(&cli)?),
         Some(Commands::Update {
@@ -184,17 +226,31 @@ fn run(cli: Cli) -> Result<ExitCode, Stop> {
     }
 }
 
-/// The config every command but `completions` runs with, after the
-/// system-wide pre-flight that `completions` must not trigger.
+fn print_help() -> Result<ExitCode, Stop> {
+    let help = Cli::command().render_help();
+    payload(format_args!("{}", help.to_string().trim_end_matches('\n')))?;
+    Ok(ExitCode::Success)
+}
+
+/// The config every command but `completions` runs with.
 fn configured(cli: &Cli) -> Result<CliConfig, Stop> {
-    if cli.system && !is_root_user() {
-        validate_sudo()?;
-    }
+    reject_unusable_config_dir()?;
 
     let mut config = CliConfig::load()?;
     config.inner.system = cli.system;
     config.inner.skip_plasma_detection = cli.skip_plasma_detection;
     Ok(config)
+}
+
+/// A config directory that exists but is not a directory is the caller's usage
+/// error: the run has nowhere to keep its settings and should say so plainly.
+fn reject_unusable_config_dir() -> Result<(), Stop> {
+    match cli_config::unusable_config_dir() {
+        Some(dir) => Err(Stop::Usage(format!(
+            "config directory {dir:?} is not a directory"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Writes one payload block to stdout, the only stream the binary's data takes.
@@ -321,7 +377,16 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
         return dry_run(&update_config, args.component.as_deref(), quiet);
     }
 
+    // A named component is the caller's explicit choice, the way `-y` is for
+    // the whole selection, so only an unnamed update needs the confirmation.
     let auto = args.yes || config.assume_yes || config.update_all_by_default;
+    if !auto && args.component.is_none() && !std::io::stdin().is_terminal() {
+        return Err(Stop::Usage(
+            "refusing to update on a non-interactive stdin; pass -y/--yes to confirm".into(),
+        ));
+    }
+
+    authenticate_system(config.inner.system)?;
 
     let restart = if args.restart_plasma {
         RestartDecision::Always
@@ -366,10 +431,8 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
         check_failed = true;
     }
 
-    let (installable, interactive_empty) = if auto || !std::io::stdin().is_terminal() {
+    let (installable, interactive_empty) = if auto || check_result.available_updates.is_empty() {
         (check_result.available_updates, false)
-    } else if check_result.available_updates.is_empty() {
-        (Vec::new(), false)
     } else {
         let selected = lib::cli::select(&check_result.available_updates)?;
         let empty = selected.is_empty();
@@ -618,13 +681,22 @@ fn finish_update(
 }
 
 fn maybe_restart(needs: bool, decision: RestartDecision) {
-    if !needs {
-        return;
-    }
-    let confirmed = match decision {
-        RestartDecision::Always => true,
-        RestartDecision::Prompt => std::io::stdin().is_terminal() && prompt_restart(),
-        RestartDecision::Never => false,
+    apply_restart(restart_plan(
+        decision,
+        needs,
+        std::io::stdin().is_terminal(),
+    ));
+}
+
+fn apply_restart(plan: RestartPlan) {
+    let confirmed = match plan {
+        RestartPlan::Restart => true,
+        RestartPlan::Prompt => prompt_restart(),
+        RestartPlan::Skip => false,
+        RestartPlan::SkipWarn(message) => {
+            log::warn!("{message}");
+            false
+        }
     };
     if confirmed && let Err(error) = lib::restart_plasmashell() {
         log_restart_failure(&error);
@@ -650,6 +722,17 @@ fn prompt_restart() -> bool {
 
 fn is_root_user() -> bool {
     nix::unistd::Uid::effective().is_root()
+}
+
+/// Authenticates a system-wide run up front, so the installs do not stop on a
+/// password prompt. Only a run that writes under `--system` gets here; `check`,
+/// `list-installed` and `update --dry-run` read and never authenticate.
+fn authenticate_system(system_wide: bool) -> Result<(), lib::Error> {
+    if system_wide && !is_root_user() {
+        validate_sudo()
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_sudo() -> Result<(), lib::Error> {
@@ -757,28 +840,78 @@ mod tests {
 
     static CAPTURE: CaptureLogger = CaptureLogger;
 
-    #[test]
-    fn a_failed_restart_is_an_error_line() {
-        // `main` installs the stderr logger; this test binary installs its own
-        // so the level of the line is observable.
+    /// `main` installs the stderr logger; this test binary installs its own so
+    /// the level of each line is observable.
+    fn install_capture_logger() {
         static INSTALL: std::sync::Once = std::sync::Once::new();
         INSTALL.call_once(|| {
             log::set_logger(&CAPTURE).expect("no other logger in this test binary");
             log::set_max_level(log::LevelFilter::Debug);
         });
+    }
+
+    #[test]
+    fn a_failed_restart_is_an_error_line() {
+        install_capture_logger();
 
         super::log_restart_failure(&libplasmoid_updater::Error::Config(
             "systemctl exited with status 1".to_string(),
         ));
 
         let logged = RESTART_LOG.lock().expect("the restart log mutex");
+        // The log is process-wide, so another test's line may follow this one.
+        assert!(
+            logged.iter().any(|(level, message)| *level == log::Level::Error
+                && message
+                    == "failed to restart plasmashell: configuration error: systemctl exited with status 1"),
+            "{logged:?}"
+        );
+    }
+
+    #[test]
+    fn a_restart_prompt_on_a_non_tty_warns_and_names_the_flag() {
+        let plan = super::restart_plan(super::RestartDecision::Prompt, true, false);
+        let super::RestartPlan::SkipWarn(message) = plan else {
+            panic!("a non-interactive stdin must skip the restart prompt: {plan:?}");
+        };
+        assert!(message.contains("skipped"), "{message}");
+        assert!(message.contains("--restart-plasma"), "{message}");
+    }
+
+    #[test]
+    fn a_restart_prompt_on_a_tty_asks_and_a_skip_needs_no_warning() {
+        use super::{RestartDecision, RestartPlan, restart_plan};
         assert_eq!(
-            logged.last(),
-            Some(&(
-                log::Level::Error,
-                "failed to restart plasmashell: configuration error: systemctl exited with status 1"
-                    .to_string()
-            )),
+            restart_plan(RestartDecision::Prompt, true, true),
+            RestartPlan::Prompt
+        );
+        assert_eq!(
+            restart_plan(RestartDecision::Prompt, false, false),
+            RestartPlan::Skip
+        );
+        assert_eq!(
+            restart_plan(RestartDecision::Always, true, false),
+            RestartPlan::Restart
+        );
+        assert_eq!(
+            restart_plan(RestartDecision::Never, true, true),
+            RestartPlan::Skip
+        );
+    }
+
+    #[test]
+    fn a_skipped_restart_prompt_is_logged_as_a_warning() {
+        install_capture_logger();
+
+        super::apply_restart(super::RestartPlan::SkipWarn(super::RESTART_PROMPT_SKIPPED));
+
+        let logged = RESTART_LOG.lock().expect("the restart log mutex");
+        // Matched by its own message, not by position: the log is process-wide.
+        assert!(
+            logged
+                .iter()
+                .any(|(level, message)| *level == log::Level::Warn
+                    && message == super::RESTART_PROMPT_SKIPPED),
             "{logged:?}"
         );
     }
