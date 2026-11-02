@@ -7,7 +7,7 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 
 ## Requirements
 
-- bsdtar, kpackagetool6 (`systemctl` too, for the optional plasmashell restart)
+- bsdtar and kpackagetool6, for `update` and `install` only (`check` needs neither); `systemctl` too, for the optional plasmashell restart
 - [Rust](https://rust-lang.org/tools/install/)
 
 ## Installation
@@ -164,10 +164,10 @@ Run `topgrade --edit-config` and add the following under `[commands]`:
 | KWin Scripts               | 720                |
 | KWin Switchers             | 721                |
 | Global Themes              | 722                |
-| Plasma Styles              | 709                |
+| Plasma Styles              | 104                |
 | Aurorae Window Decorations | 114                |
 | Color Schemes              | 112                |
-| Splash Screens             | 708                |
+| Splash Screens             | 716                |
 | SDDM Themes                | 101 (system only)  |
 | Icon Themes                | 132                |
 | Wallpapers                 | 299                |

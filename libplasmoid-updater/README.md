@@ -8,7 +8,7 @@ A Rust library for updating KDE Plasma 6 components from the KDE Store.
 ## Requirements
 
 Runtime dependencies:
-- `bsdtar` – Archive extraction
+- `bsdtar` – Archive extraction, for `update` and `install` only (`check` needs no extractor)
 - `kpackagetool6` – KDE package installation
 - `systemctl` – plasmashell restart, when a restart is requested
 - `sudo` – only for `--system` operations
@@ -56,7 +56,7 @@ Built with a builder table via `Config::new()`:
 | `with_excluded_packages(Vec<String>)` | skip these packages (by dir name or display name) |
 | `with_excluded_patterns(Vec<String>)` | skip packages whose name or dir matches these regexes (invalid ones are dropped with a warning) |
 | `with_widgets_id_table(HashMap<String, u64>)` | override fallback dir-to-content-ID mapping |
-| `with_store_url(impl Into<String>)` | OCS base URL every store request targets (default `https://api.kde-look.org/ocs/v1`) |
+| `with_api_url(impl Into<String>)` | OCS base URL every store request targets (default `https://api.kde-look.org/ocs/v1`) |
 | `with_threads(usize)` | max parallel install threads (default: logical CPU count) |
 | `with_skip_plasma_detection(bool)` | skip KDE environment check (for CI/testing) |
 | `with_inhibit_idle(bool)` | inhibit system sleep during installs (default: `true`) |
