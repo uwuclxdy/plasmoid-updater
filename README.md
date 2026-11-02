@@ -81,7 +81,7 @@ Options:
 
 `--ignore` works on both `check` and `update` and skips the named components for that run only, on top of the config exclusions. Example: `plasmoid-updater update --ignore weather,clock`.
 
-Running `plasmoid-updater` without a subcommand prints its help and exits 0. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; on a non-interactive stdin it refuses without `-y` (exit 2) rather than guessing, unless it names a COMPONENT. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing. At the selection menu, Escape selects nothing and Ctrl-C ends the run by SIGINT (a shell reports exit status 130). An update that goes ahead (not `--dry-run`, not a refused one) first puts back what a killed run left stranded, even when there is nothing to install.
+Running `plasmoid-updater` without a subcommand prints its help and exits 0. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; on a non-interactive stdin it refuses without `-y` (exit 2) rather than guessing, unless it names a COMPONENT, runs `--dry-run`, or the config sets `assume_yes` or `update_all_by_default`. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing. At the selection menu, Escape selects nothing and Ctrl-C ends the run by SIGINT (a shell reports exit status 130). An update that goes ahead (not `--dry-run`, not a refused one) first puts back what a killed run left stranded, even when there is nothing to install.
 
 With `--system`, only a real `update` authenticates through `sudo -v`; `check`, `list-installed` and `update --dry-run` never ask for a password.
 
@@ -95,7 +95,7 @@ Components that fail to update don't stop the run: failures are summarized at th
 | ---- | ------- |
 | 0 | success |
 | 1 | at least one component failed, or an install's version could not be verified, or `check`, `update` or `update --dry-run` could not settle a component |
-| 2 | usage error: an unknown option or subcommand, `update <name>` naming no installed component, `update` naming no component without `-y` on a non-interactive stdin, conflicting restart flags, or a config directory that is not a directory |
+| 2 | usage error: an unknown option or subcommand, `update <name>` naming no installed component, `update` naming no component without `-y` (or `assume_yes`/`update_all_by_default`) on a non-interactive stdin, conflicting restart flags, or a config directory that is not a directory |
 | 3 | the run could not start or finish |
 | 100 | `check` found updates to install |
 
