@@ -5,7 +5,7 @@ coverage:
   exclude:
     - "target/**"
     - "vendor/**"
-  acceptable: patch >= 70% && current >= 32.5%
+  acceptable: patch >= 70% && current >= 69.8%
   if: true
 codeToTestRatio:
   code:
