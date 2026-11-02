@@ -44,7 +44,7 @@ Progress leaves the core only through a `Reporter` hook that does nothing by def
 
 ### Errors
 
-Two levels: `Error` means the run could not start or finish (unsupported OS, no Plasma, already running, missing tool, network, rate limit, API status, parse, io with path, config); a per-component problem is a `Failure { component, kind, message }` row inside a successful `UpdateResult`, with `FailureKind` one of `NoMatchingDownload`, `Download`, `Checksum`, `Extract`, `Install`, `RestoreFailed`, `Unverified`. `UpdateResult` holds `succeeded` (verified installs), `failed` and `skipped` (excluded and unresolved names); `needs_restart()` tells whether a plasmashell restart is warranted.
+Two levels: `Error` means the run could not start or finish (unsupported OS, no Plasma, already running, missing tool, network, rate limit, API status, parse, io with path, config); a per-component problem is a `Failure { component, kind, message }` row inside a successful `UpdateResult`, with `FailureKind` one of `NoMatchingDownload`, `Download`, `Checksum`, `Extract`, `Install`, `RestoreFailed`, `Unverified`, `Registry`. `UpdateResult` holds `succeeded` (verified installs), `failed` and `skipped` (excluded and unresolved names); `needs_restart()` tells whether a plasmashell restart is warranted.
 
 ### Config
 
