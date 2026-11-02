@@ -25,6 +25,13 @@ use libplasmoid_updater as lib;
     "\nThere is NO WARRANTY, to the extent permitted by law.",
 ))]
 #[command(disable_help_subcommand = true)]
+#[command(after_help = concat!(
+    "project: ",
+    env!("CARGO_PKG_REPOSITORY"),
+    "\nreport bugs: ",
+    env!("CARGO_PKG_REPOSITORY"),
+    "/issues",
+))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -67,9 +74,14 @@ enum Commands {
             help = "names to skip for this run (comma-separated or repeatable)"
         )]
         ignore: Vec<String>,
+        #[arg(long, help = "print the result as JSON on stdout")]
+        json: bool,
     },
     #[command(about = "list all installed components")]
-    ListInstalled,
+    ListInstalled {
+        #[arg(long, help = "print the result as JSON on stdout")]
+        json: bool,
+    },
     #[command(about = "update components")]
     Update {
         #[arg(help = "component name or directory to update")]
@@ -82,7 +94,11 @@ enum Commands {
         restart_plasma: bool,
         #[arg(long, help = "do not restart plasmashell")]
         no_restart_plasma: bool,
-        #[arg(short = 'y', long, help = "automatically confirm all updates")]
+        #[arg(
+            short = 'y',
+            long,
+            help = "automatically confirm all updates (TOPGRADE_YES=1 does the same)"
+        )]
         yes: bool,
         #[arg(long, help = "list what would be installed and change nothing")]
         dry_run: bool,
@@ -93,6 +109,8 @@ enum Commands {
             help = "names to skip for this run (comma-separated or repeatable)"
         )]
         ignore: Vec<String>,
+        #[arg(long, help = "print the result as JSON on stdout")]
+        json: bool,
     },
     #[command(about = "print a shell completion script")]
     Completions {
@@ -145,6 +163,7 @@ struct UpdateArgs {
     yes: bool,
     dry_run: bool,
     ignore: Vec<String>,
+    json: bool,
 }
 
 /// Why a run ended before its command finished.
@@ -158,6 +177,8 @@ enum Stop {
     /// Writing the payload to stdout failed; the bin's own stream, so the bin
     /// reports it rather than dressing it as a library error.
     Output(std::io::Error),
+    /// Serializing a result for `--json` failed.
+    Serialize(serde_json::Error),
 }
 
 impl From<lib::Error> for Stop {
@@ -185,6 +206,10 @@ fn main() {
             log::error!("failed to write to stdout: {error}");
             ExitCode::Fatal
         }
+        Err(Stop::Serialize(error)) => {
+            log::error!("failed to serialize the result: {error}");
+            ExitCode::Fatal
+        }
     };
 
     std::process::exit(exit_code.into());
@@ -202,8 +227,10 @@ fn run(cli: Cli) -> Result<ExitCode, Stop> {
         // A bare run is a request for the help, not for an update: it reads
         // no config and makes no store request.
         None => print_help(),
-        Some(Commands::Check { ignore }) => do_check(&configured(&cli)?, ignore, cli.quiet),
-        Some(Commands::ListInstalled) => do_list_installed(&configured(&cli)?),
+        Some(Commands::Check { ignore, json }) => {
+            do_check(&configured(&cli)?, ignore, cli.quiet, *json)
+        }
+        Some(Commands::ListInstalled { json }) => do_list_installed(&configured(&cli)?, *json),
         Some(Commands::Update {
             component,
             restart_plasma,
@@ -211,6 +238,7 @@ fn run(cli: Cli) -> Result<ExitCode, Stop> {
             yes,
             dry_run,
             ignore,
+            json,
         }) => do_update(
             &configured(&cli)?,
             UpdateArgs {
@@ -220,6 +248,7 @@ fn run(cli: Cli) -> Result<ExitCode, Stop> {
                 yes: *yes,
                 dry_run: *dry_run,
                 ignore: ignore.clone(),
+                json: *json,
             },
             cli.quiet,
         ),
@@ -228,7 +257,12 @@ fn run(cli: Cli) -> Result<ExitCode, Stop> {
 
 fn print_help() -> Result<ExitCode, Stop> {
     let help = Cli::command().render_help();
-    payload(format_args!("{}", help.to_string().trim_end_matches('\n')))?;
+    let text = if lib::cli::styled(lib::cli::Stream::Stdout) {
+        help.ansi().to_string()
+    } else {
+        help.to_string()
+    };
+    payload(format_args!("{}", text.trim_end_matches('\n')))?;
     Ok(ExitCode::Success)
 }
 
@@ -266,6 +300,13 @@ fn payload(args: std::fmt::Arguments<'_>) -> Result<(), Stop> {
         })
 }
 
+/// Writes one compact JSON document plus the payload helper's newline to
+/// stdout.
+fn payload_json<T: serde::Serialize>(value: &T) -> Result<(), Stop> {
+    let json = serde_json::to_string(value).map_err(Stop::Serialize)?;
+    payload(format_args!("{json}"))
+}
+
 fn completions(shell: clap_complete::Shell) -> Result<ExitCode, Stop> {
     let mut script = Vec::new();
     clap_complete::generate(shell, &mut Cli::command(), "plasmoid-updater", &mut script);
@@ -286,7 +327,18 @@ fn reporter(quiet: bool) -> Box<dyn lib::Reporter> {
     }
 }
 
-fn do_check(config: &CliConfig, ignore: &[String], quiet: bool) -> Result<ExitCode, Stop> {
+/// `TOPGRADE_YES=1` confirms the way `-y` does, so topgrade can drive an
+/// unattended update. Exactly `1` counts: any other value confirms nothing.
+fn topgrade_yes() -> bool {
+    std::env::var_os("TOPGRADE_YES").is_some_and(|value| value == std::ffi::OsStr::new("1"))
+}
+
+fn do_check(
+    config: &CliConfig,
+    ignore: &[String],
+    quiet: bool,
+    json: bool,
+) -> Result<ExitCode, Stop> {
     let mut check_config = config.inner.clone();
     check_config
         .excluded_packages
@@ -298,7 +350,9 @@ fn do_check(config: &CliConfig, ignore: &[String], quiet: bool) -> Result<ExitCo
 
     report_diagnostics(&result);
 
-    if !result.available_updates.is_empty() {
+    if json {
+        payload_json(&result)?;
+    } else if !result.available_updates.is_empty() {
         payload(format_args!(
             "{} update{} available.",
             result.available_updates.len(),
@@ -310,7 +364,7 @@ fn do_check(config: &CliConfig, ignore: &[String], quiet: bool) -> Result<ExitCo
         ))?;
         payload(format_args!(
             "{}",
-            lib::cli::updates_table(&result.available_updates)
+            lib::cli::updates_table(&result.available_updates, lib::cli::Stream::Stdout)
         ))?;
     } else if result.diagnostics.is_empty() {
         payload(format_args!("no updates available"))?;
@@ -352,8 +406,20 @@ fn report_diagnostic(diagnostic: &lib::Diagnostic) {
     );
 }
 
-fn do_list_installed(config: &CliConfig) -> Result<ExitCode, Stop> {
+/// The `--json` body of `list-installed`: an object, so a later field can join
+/// the components without redefining the document's top level.
+#[derive(serde::Serialize)]
+struct InstalledComponents {
+    components: Vec<lib::InstalledComponent>,
+}
+
+fn do_list_installed(config: &CliConfig, json: bool) -> Result<ExitCode, Stop> {
     let components = lib::get_installed(&config.inner)?;
+
+    if json {
+        payload_json(&InstalledComponents { components })?;
+        return Ok(ExitCode::Success);
+    }
 
     if components.is_empty() {
         payload(format_args!("no components installed"))?;
@@ -365,7 +431,10 @@ fn do_list_installed(config: &CliConfig) -> Result<ExitCode, Stop> {
         components.len(),
         if components.len() == 1 { "" } else { "s" }
     ))?;
-    payload(format_args!("{}", lib::cli::components_table(&components)))?;
+    payload(format_args!(
+        "{}",
+        lib::cli::components_table(&components, lib::cli::Stream::Stdout)
+    ))?;
     Ok(ExitCode::Success)
 }
 
@@ -374,12 +443,12 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
     update_config.excluded_packages.extend(args.ignore);
 
     if args.dry_run {
-        return dry_run(&update_config, args.component.as_deref(), quiet);
+        return dry_run(&update_config, args.component.as_deref(), quiet, args.json);
     }
 
     // A named component is the caller's explicit choice, the way `-y` is for
     // the whole selection, so only an unnamed update needs the confirmation.
-    let auto = args.yes || config.assume_yes || config.update_all_by_default;
+    let auto = args.yes || topgrade_yes() || config.assume_yes || config.update_all_by_default;
     if !auto && args.component.is_none() && !std::io::stdin().is_terminal() {
         return Err(Stop::Usage(
             "refusing to update on a non-interactive stdin; pass -y/--yes to confirm".into(),
@@ -406,7 +475,7 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
     lib::install(&[], &update_config, reporter(quiet).as_ref())?;
 
     if let Some(ref name) = args.component {
-        return do_update_single(name, update_config, restart, quiet);
+        return do_update_single(name, update_config, restart, quiet, args.json);
     }
 
     let reporter = reporter(quiet);
@@ -438,7 +507,7 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
         let empty = selected.is_empty();
         (selected, empty)
     };
-    if interactive_empty {
+    if interactive_empty && !args.json {
         payload(format_args!("nothing to update"))?;
     }
 
@@ -457,65 +526,150 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
         && result.failed.is_empty()
         && result.skipped.is_empty()
     {
+        if args.json {
+            payload_json(&result)?;
+        }
         return Ok(ExitCode::Success);
     }
 
-    finish_update(result, restart, check_failed)
+    finish_update(result, restart, check_failed, args.json)
+}
+
+/// The check shape a named dry run reports: only the named component's own
+/// outcome, so another component's failures do not leak into it.
+fn named_check_result(
+    available_updates: Vec<lib::AvailableUpdate>,
+    skipped: Vec<String>,
+    diagnostics: Vec<lib::Diagnostic>,
+    unavailable: Vec<lib::Failure>,
+) -> lib::CheckResult {
+    lib::CheckResult {
+        available_updates,
+        skipped,
+        diagnostics,
+        unavailable,
+    }
 }
 
 /// Lists what `update` would install, leaving the disk and the registry alone.
-fn dry_run(config: &lib::Config, name: Option<&str>, quiet: bool) -> Result<ExitCode, Stop> {
+fn dry_run(
+    config: &lib::Config,
+    name: Option<&str>,
+    quiet: bool,
+    json: bool,
+) -> Result<ExitCode, Stop> {
     reporter(quiet).event(&lib::Event::Checking);
 
     let check_result = lib::check(config)?;
 
-    let (updates, check_failed) = match name {
+    match name {
         // A named run ends on the named component's own outcome; another
         // component's failed check is not this run's.
         Some(name) => match resolve_named(name, config, &check_result)? {
-            Named::Updates(updates) => (updates, false),
-            Named::Excluded => {
-                payload(format_args!("{name:?} is excluded"))?;
-                return Ok(ExitCode::Success);
+            Named::Updates(updates) => {
+                if json {
+                    payload_json(&named_check_result(
+                        updates,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ))?;
+                } else {
+                    payload(format_args!(
+                        "{}",
+                        lib::cli::updates_table(&updates, lib::cli::Stream::Stdout)
+                    ))?;
+                }
+                Ok(ExitCode::Success)
+            }
+            Named::Excluded(display_name) => {
+                if json {
+                    payload_json(&named_check_result(
+                        Vec::new(),
+                        vec![display_name],
+                        Vec::new(),
+                        Vec::new(),
+                    ))?;
+                } else {
+                    payload(format_args!("{name:?} is excluded"))?;
+                }
+                Ok(ExitCode::Success)
             }
             Named::UpToDate => {
-                payload(format_args!("no update available for {name:?}"))?;
-                return Ok(ExitCode::Success);
+                if json {
+                    payload_json(&named_check_result(
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ))?;
+                } else {
+                    payload(format_args!("no update available for {name:?}"))?;
+                }
+                Ok(ExitCode::Success)
             }
             Named::Unavailable(failure) => {
-                report_failure_rows(vec![failure]);
-                return Ok(ExitCode::Failure);
+                report_failure_rows(vec![failure.clone()]);
+                if json {
+                    // The failure and the diagnostic the check settled for it
+                    // travel together, the way `check` reports them.
+                    let diagnostic = check_result
+                        .diagnostics
+                        .iter()
+                        .find(|diagnostic| diagnostic.name == failure.component.name)
+                        .cloned();
+                    payload_json(&named_check_result(
+                        Vec::new(),
+                        Vec::new(),
+                        diagnostic.into_iter().collect(),
+                        vec![failure],
+                    ))?;
+                }
+                Ok(ExitCode::Failure)
             }
             Named::CheckFailed(diagnostic) => {
                 report_diagnostic(&diagnostic);
-                return Ok(ExitCode::Failure);
+                if json {
+                    payload_json(&named_check_result(
+                        Vec::new(),
+                        Vec::new(),
+                        vec![diagnostic],
+                        Vec::new(),
+                    ))?;
+                }
+                Ok(ExitCode::Failure)
             }
-            Named::Unknown => return Ok(unknown_component(name)),
+            Named::Unknown => Ok(unknown_component(name)),
         },
         None => {
             let unavailable_diagnostics: Vec<&lib::Diagnostic> =
                 check_result.unavailable_diagnostics().collect();
             report_diagnostics_except(&check_result, &unavailable_diagnostics);
             report_failure_rows(check_result.unavailable.clone());
+
             // A failure row the check settled fails the run even though its
             // diagnostic line is not printed.
-            (
-                check_result.available_updates.clone(),
-                !check_result.diagnostics.is_empty(),
-            )
+            let check_failed = !check_result.diagnostics.is_empty();
+            if json {
+                payload_json(&check_result)?;
+            } else if check_result.available_updates.is_empty() {
+                payload(format_args!("no updates available"))?;
+            } else {
+                payload(format_args!(
+                    "{}",
+                    lib::cli::updates_table(
+                        &check_result.available_updates,
+                        lib::cli::Stream::Stdout
+                    )
+                ))?;
+            }
+
+            if check_failed {
+                Ok(ExitCode::Failure)
+            } else {
+                Ok(ExitCode::Success)
+            }
         }
-    };
-
-    if updates.is_empty() {
-        payload(format_args!("no updates available"))?;
-    } else {
-        payload(format_args!("{}", lib::cli::updates_table(&updates)))?;
-    }
-
-    if check_failed {
-        Ok(ExitCode::Failure)
-    } else {
-        Ok(ExitCode::Success)
     }
 }
 
@@ -524,6 +678,7 @@ fn do_update_single(
     config: lib::Config,
     restart: RestartDecision,
     quiet: bool,
+    json: bool,
 ) -> Result<ExitCode, Stop> {
     let reporter = reporter(quiet);
     reporter.event(&lib::Event::Checking);
@@ -533,14 +688,25 @@ fn do_update_single(
     match resolve_named(name, &config, &check_result)? {
         Named::Updates(updates) => {
             let result = lib::install(&updates, &config, reporter.as_ref())?;
-            finish_update(result, restart, false)
+            finish_update(result, restart, false, json)
         }
-        Named::Excluded => {
-            payload(format_args!("{name:?} is excluded"))?;
+        Named::Excluded(display_name) => {
+            if json {
+                payload_json(&lib::UpdateResult {
+                    skipped: vec![display_name],
+                    ..Default::default()
+                })?;
+            } else {
+                payload(format_args!("{name:?} is excluded"))?;
+            }
             Ok(ExitCode::Success)
         }
         Named::UpToDate => {
-            payload(format_args!("no update available for {name:?}"))?;
+            if json {
+                payload_json(&lib::UpdateResult::default())?;
+            } else {
+                payload(format_args!("no update available for {name:?}"))?;
+            }
             Ok(ExitCode::Success)
         }
         Named::Unavailable(failure) => {
@@ -549,10 +715,16 @@ fn do_update_single(
                 failed: vec![failure],
                 skipped: Vec::new(),
             };
-            finish_update(result, restart, false)
+            finish_update(result, restart, false, json)
         }
         Named::CheckFailed(diagnostic) => {
             report_diagnostic(&diagnostic);
+            if json {
+                payload_json(&lib::UpdateResult {
+                    skipped: vec![diagnostic.name],
+                    ..Default::default()
+                })?;
+            }
             Ok(ExitCode::Failure)
         }
         Named::Unknown => Ok(unknown_component(name)),
@@ -563,8 +735,9 @@ fn do_update_single(
 enum Named {
     /// Pending updates for the installed component the name matched.
     Updates(Vec<lib::AvailableUpdate>),
-    /// The installed component is excluded by the configuration.
-    Excluded,
+    /// The installed component is excluded by the configuration, with its
+    /// display name, the name `skipped` lists on every path.
+    Excluded(String),
     /// The installed component has no pending update.
     UpToDate,
     /// The installed component's store entry offers no download link for its
@@ -627,7 +800,7 @@ fn resolve_named(
             *rule == name || *rule == component.name || *rule == component.directory_name
         });
     if excluded {
-        Ok(Named::Excluded)
+        Ok(Named::Excluded(component.name.clone()))
     } else {
         Ok(Named::UpToDate)
     }
@@ -659,21 +832,31 @@ fn finish_update(
     result: lib::UpdateResult,
     restart: RestartDecision,
     check_failed: bool,
+    json: bool,
 ) -> Result<ExitCode, Stop> {
     if result.succeeded.is_empty() && result.failed.is_empty() && result.skipped.is_empty() {
-        payload(format_args!("no updates available"))?;
+        if json {
+            payload_json(&result)?;
+        } else {
+            payload(format_args!("no updates available"))?;
+        }
         return Ok(ExitCode::Success);
     }
 
-    // The summary is the last payload, so a closed stdout costs that line,
+    // The result is the last payload, so a closed stdout costs that document,
     // never the run's own outcome.
-    match payload(format_args!(
-        "Update Summary: {} succeeded, {} failed, {} skipped ({} total)",
-        result.succeeded.len(),
-        result.failed.len(),
-        result.skipped.len(),
-        result.succeeded.len() + result.failed.len() + result.skipped.len(),
-    )) {
+    let written = if json {
+        payload_json(&result)
+    } else {
+        payload(format_args!(
+            "Update Summary: {} succeeded, {} failed, {} skipped ({} total)",
+            result.succeeded.len(),
+            result.failed.len(),
+            result.skipped.len(),
+            result.succeeded.len() + result.failed.len() + result.skipped.len(),
+        ))
+    };
+    match written {
         Err(Stop::PipeClosed) => {}
         other => other?,
     }

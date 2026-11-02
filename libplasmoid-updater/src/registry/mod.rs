@@ -8,6 +8,7 @@ mod utils;
 mod xml;
 
 pub(crate) use manager::{RegistryEntry, RegistryManager};
+pub(crate) use utils::extract_date_from_iso;
 
 use std::{
     collections::{HashMap, HashSet},

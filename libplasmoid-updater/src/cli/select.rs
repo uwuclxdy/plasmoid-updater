@@ -8,7 +8,7 @@ use inquire::InquireError;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use super::CLEAR_LINE_SEQUENCE;
+use super::{CLEAR_LINE_SEQUENCE, Stream, styled};
 use crate::{Error, Result, types::AvailableUpdate};
 
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
@@ -94,9 +94,18 @@ pub fn select(updates: &[AvailableUpdate]) -> Result<Vec<AvailableUpdate>> {
         if updates.len() == 1 { "" } else { "s" }
     );
 
+    // The prompt draws on stderr, so its styling follows that stream's
+    // predicate; inquire's own default reads `NO_COLOR` with a different rule.
+    let render_config = if styled(Stream::Stderr) {
+        inquire::ui::RenderConfig::default_colored()
+    } else {
+        inquire::ui::RenderConfig::empty()
+    };
+
     match inquire::MultiSelect::new(&prompt, options)
         .with_default(&(0..updates.len()).collect::<Vec<usize>>())
         .with_page_size(15)
+        .with_render_config(render_config)
         .raw_prompt()
     {
         Ok(selected) => {

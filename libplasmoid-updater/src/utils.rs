@@ -166,20 +166,19 @@ pub(crate) fn install_updates(
         .map_err(|e| Error::Config(format!("failed to build install thread pool: {e}")))?;
 
     let backups = installer::BackupLedger::default();
-    let outcomes: Vec<(InstalledComponent, Result<InstallOutcome, ComponentFailure>)> = pool
-        .install(|| {
+    let outcomes: Vec<(&AvailableUpdate, Result<InstallOutcome, ComponentFailure>)> =
+        pool.install(|| {
             updates
                 .par_iter()
                 .map(|update| {
-                    let component = update.installed.clone();
                     let outcome = installer::update_component(
                         update,
                         api_client.http_client(),
                         reporter,
                         &backups,
                     );
-                    report_outcome(&component, &outcome, reporter);
-                    (component, outcome)
+                    report_outcome(&update.installed, &outcome, reporter);
+                    (update, outcome)
                 })
                 .collect()
         });
@@ -191,9 +190,17 @@ pub(crate) fn install_updates(
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();
 
-    for (component, outcome) in outcomes {
+    for (update, outcome) in outcomes {
+        let component = update.installed.clone();
         match outcome {
-            Ok(outcome) if outcome.verified => succeeded.push(component),
+            // Verified means the version on disk is the expected one; the
+            // release date is the store's for that version, in the registry's
+            // date-only form.
+            Ok(outcome) if outcome.verified => succeeded.push(InstalledComponent {
+                version: outcome.expected_version,
+                release_date: crate::registry::extract_date_from_iso(&update.release_date),
+                ..component
+            }),
             Ok(outcome) => failed.push(Failure {
                 component,
                 kind: FailureKind::Unverified,

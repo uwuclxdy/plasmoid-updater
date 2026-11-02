@@ -3,9 +3,10 @@
 //! The stderr log backend: `-q` keeps errors, the default keeps warnings,
 //! `-v` adds info and `-vv` debug. `RUST_LOG` is deliberately not consulted.
 
-use std::io::{IsTerminal as _, Write as _};
+use std::io::Write as _;
 use std::sync::OnceLock;
 
+use libplasmoid_updater::cli::{Stream, styled};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 static LOGGER: OnceLock<StderrLogger> = OnceLock::new();
@@ -14,7 +15,7 @@ static LOGGER: OnceLock<StderrLogger> = OnceLock::new();
 pub fn init(quiet: bool, verbose: u8) {
     let logger = LOGGER.get_or_init(|| StderrLogger {
         max_level: level_filter(quiet, verbose),
-        color: color_enabled(),
+        color: styled(Stream::Stderr),
     });
     if log::set_logger(logger).is_ok() {
         log::set_max_level(logger.max_level);
@@ -30,15 +31,6 @@ fn level_filter(quiet: bool, verbose: u8) -> LevelFilter {
         1 => LevelFilter::Info,
         _ => LevelFilter::Debug,
     }
-}
-
-/// Colour needs a terminal that has not opted out.
-fn color_enabled() -> bool {
-    std::io::stderr().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
-        && std::env::var("TERM")
-            .map(|term| term != "dumb")
-            .unwrap_or(true)
 }
 
 struct StderrLogger {

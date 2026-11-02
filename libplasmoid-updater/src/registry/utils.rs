@@ -49,6 +49,6 @@ pub(super) fn registry_installed_file_path(installed_path: &Path) -> String {
 }
 
 /// Extracts date part from ISO timestamp.
-pub(super) fn extract_date_from_iso(iso: &str) -> String {
+pub(crate) fn extract_date_from_iso(iso: &str) -> String {
     iso.split('T').next().unwrap_or(iso).to_string()
 }

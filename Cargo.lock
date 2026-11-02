@@ -962,6 +962,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 name = "libplasmoid-updater"
 version = "0.2.1"
 dependencies = [
+ "anstream",
  "bytesize",
  "chrono",
  "comfy-table",
@@ -1213,6 +1214,7 @@ dependencies = [
  "md5",
  "nix",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]

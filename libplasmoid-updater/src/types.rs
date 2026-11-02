@@ -34,10 +34,13 @@ pub enum ComponentType {
     /// A Plasma wallpaper plugin (`Plasma/Wallpaper`).
     WallpaperPlugin,
     /// A KWin effect (`KWin/Effect`).
+    #[serde(rename = "kwin_effect")]
     KWinEffect,
     /// A KWin script (`KWin/Script`).
+    #[serde(rename = "kwin_script")]
     KWinScript,
     /// A KWin window switcher (`KWin/WindowSwitcher`).
+    #[serde(rename = "kwin_switcher")]
     KWinSwitcher,
     /// A global theme (`Plasma/LookAndFeel`).
     GlobalTheme,

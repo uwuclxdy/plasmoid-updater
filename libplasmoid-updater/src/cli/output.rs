@@ -5,6 +5,7 @@ use std::io::Write as _;
 use bytesize::ByteSize;
 use comfy_table::{Attribute, Cell, CellAlignment, Table, presets};
 
+use super::{Stream, styled};
 use crate::{
     UpdateResult,
     types::{AvailableUpdate, InstalledComponent},
@@ -60,10 +61,9 @@ pub fn print_failures(result: &UpdateResult) {
         return;
     }
 
-    // The table goes to stderr, so comfy-table must decide styling from the
-    // stderr stream's TTY state, not stdout's.
     let mut table = Table::new();
-    table.use_stderr().load_style(presets::NOTHING);
+    table.load_style(presets::NOTHING);
+    apply_styling(&mut table, Stream::Stderr);
     table.set_header(vec![header("NAME"), header("KIND"), header("ERROR")]);
 
     for failure in &result.failed {
@@ -84,9 +84,21 @@ fn format_download_size(size: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn render_table<T: TableRow>(items: &[T], headers: &[&str]) -> String {
+/// Decides styling from the stream the table ends up on, so bold follows the
+/// same predicate as every other terminal surface rather than comfy-table's
+/// own TTY probe.
+fn apply_styling(table: &mut Table, stream: Stream) {
+    if styled(stream) {
+        table.enforce_styling();
+    } else {
+        table.force_no_tty();
+    }
+}
+
+fn render_table<T: TableRow>(items: &[T], headers: &[&str], stream: Stream) -> String {
     let mut table = Table::new();
     table.load_style(presets::NOTHING);
+    apply_styling(&mut table, stream);
     table.set_header(headers.iter().map(|h| header(h)).collect::<Vec<_>>());
 
     for item in items {
@@ -96,14 +108,16 @@ fn render_table<T: TableRow>(items: &[T], headers: &[&str]) -> String {
     table.to_string()
 }
 
-/// Renders the table of available updates (`check`'s payload).
-pub fn updates_table(updates: &[AvailableUpdate]) -> String {
+/// Renders the table of available updates (`check`'s payload), styled for
+/// `stream`, the stream the caller prints it on.
+pub fn updates_table(updates: &[AvailableUpdate], stream: Stream) -> String {
     let headers = ["NAME", "CURRENT", "AVAILABLE", "ID", "SIZE", "TYPE"];
-    render_table(updates, &headers)
+    render_table(updates, &headers, stream)
 }
 
-/// Renders the table of installed components (`list-installed`'s payload).
-pub fn components_table(components: &[InstalledComponent]) -> String {
+/// Renders the table of installed components (`list-installed`'s payload),
+/// styled for `stream`, the stream the caller prints it on.
+pub fn components_table(components: &[InstalledComponent], stream: Stream) -> String {
     let headers = ["NAME", "VERSION", "TYPE"];
-    render_table(components, &headers)
+    render_table(components, &headers, stream)
 }

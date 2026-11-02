@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as ParkingMutex;
 
+use super::{Stream, styled};
 use crate::{Event, Reporter};
 
 const CYAN: &str = "\x1b[36m";
@@ -19,11 +20,12 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A [`Reporter`] drawing download and install progress on stderr.
 ///
-/// Coloured and animated on a TTY stderr; an uncoloured, non-animated
-/// milestone-per-line fallback when `NO_COLOR` is set non-empty, `TERM=dumb`,
-/// or stderr is not a TTY.
+/// Colour follows [`styled`] for stderr; animation (redraws that move the
+/// cursor) additionally needs stderr to be a terminal, so a forced colour into
+/// a pipe colours the installed and failed lines without animating them.
 pub struct ProgressReporter {
     state: ParkingMutex<State>,
+    colored: bool,
     animated: bool,
 }
 
@@ -49,9 +51,8 @@ struct Row {
 impl ProgressReporter {
     /// Creates a reporter writing to stderr.
     pub fn new() -> Self {
-        let animated = std::io::stderr().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
-            && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true);
+        let colored = styled(Stream::Stderr);
+        let animated = colored && std::io::stderr().is_terminal();
         Self {
             state: ParkingMutex::new(State {
                 rows: Vec::new(),
@@ -59,7 +60,18 @@ impl ProgressReporter {
                 drawn: 0,
                 last_redraw: None,
             }),
+            colored,
             animated,
+        }
+    }
+
+    /// Paints `word` in `colour` when styling is on, so a non-animated line
+    /// carries the same colour cue as its animated row.
+    fn status(&self, colour: &str, word: &str, rest: &str) -> String {
+        if self.colored {
+            format!("{colour}{word}{RESET} {rest}")
+        } else {
+            format!("{word} {rest}")
         }
     }
 
@@ -101,6 +113,7 @@ impl Default for ProgressReporter {
 impl std::fmt::Debug for ProgressReporter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressReporter")
+            .field("colored", &self.colored)
             .field("animated", &self.animated)
             .finish_non_exhaustive()
     }
@@ -171,7 +184,7 @@ impl Reporter for ProgressReporter {
                     self.render(&mut state);
                 } else {
                     drop(state);
-                    self.print_line(&format!("failed {name}: {message}"));
+                    self.print_line(&self.status(RED, "failed", &format!("{name}: {message}")));
                 }
             }
         }
@@ -196,7 +209,7 @@ impl ProgressReporter {
             self.render(&mut state);
         } else {
             drop(state);
-            self.print_line(&format!("installed {name}"));
+            self.print_line(&self.status(GREEN, "installed", name));
         }
     }
 }

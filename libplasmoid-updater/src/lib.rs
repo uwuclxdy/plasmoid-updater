@@ -328,7 +328,9 @@ fn repair_after_interrupted_run(config: &Config) {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UpdateResult {
     /// Components that installed successfully and whose post-install version
-    /// was verified.
+    /// was verified, each carrying that installed version and the store's
+    /// release date for it (the registry may not record that date, so a later
+    /// [`check`] can read an older or empty one).
     pub succeeded: Vec<InstalledComponent>,
     /// Components that failed, with the failed stage and the reason.
     pub failed: Vec<Failure>,

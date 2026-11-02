@@ -395,6 +395,10 @@ fn install_applies_the_selection_from_check() {
         let result = install(&available, &cfg, &Quiet).unwrap();
         assert_eq!(result.succeeded.len(), 1, "{result:?}");
         assert!(result.failed.is_empty(), "{result:?}");
+        assert_eq!(
+            result.succeeded[0].version, NEW_VERSION,
+            "a succeeded row carries the installed version: {result:?}"
+        );
         child.done();
         return;
     }
@@ -403,4 +407,44 @@ fn install_applies_the_selection_from_check() {
     let store = FakeStore::start(Listing::default());
     sandbox.run_child("install_applies_the_selection_from_check", store.url());
     assert_content(&sandbox.scheme_path(), NEW_CONTENT);
+}
+
+#[cfg(feature = "cli")]
+#[test]
+fn the_table_renderers_take_the_stream_they_are_printed_on() {
+    use libplasmoid_updater::cli::{Stream, components_table, updates_table};
+    let updates: fn(&[libplasmoid_updater::AvailableUpdate], Stream) -> String = updates_table;
+    let components: fn(&[libplasmoid_updater::InstalledComponent], Stream) -> String =
+        components_table;
+    assert!(updates(&[], Stream::Stderr).contains("NAME"));
+    assert!(components(&[], Stream::Stdout).contains("NAME"));
+}
+
+#[test]
+fn every_component_type_serializes_to_its_spelled_out_snake_case_name() {
+    let expected = [
+        (ComponentType::PlasmaWidget, "plasma_widget"),
+        (ComponentType::WallpaperPlugin, "wallpaper_plugin"),
+        (ComponentType::KWinEffect, "kwin_effect"),
+        (ComponentType::KWinScript, "kwin_script"),
+        (ComponentType::KWinSwitcher, "kwin_switcher"),
+        (ComponentType::GlobalTheme, "global_theme"),
+        (ComponentType::PlasmaStyle, "plasma_style"),
+        (ComponentType::AuroraeDecoration, "aurorae_decoration"),
+        (ComponentType::ColorScheme, "color_scheme"),
+        (ComponentType::SplashScreen, "splash_screen"),
+        (ComponentType::SddmTheme, "sddm_theme"),
+        (ComponentType::IconTheme, "icon_theme"),
+        (ComponentType::Wallpaper, "wallpaper"),
+    ];
+    for (component_type, name) in expected {
+        assert_eq!(
+            serde_json::to_value(component_type).unwrap(),
+            serde_json::Value::String(name.to_string()),
+            "{component_type:?}"
+        );
+        let back: ComponentType =
+            serde_json::from_value(serde_json::Value::String(name.to_string())).unwrap();
+        assert_eq!(back, component_type);
+    }
 }
