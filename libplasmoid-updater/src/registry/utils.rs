@@ -6,8 +6,10 @@
 use std::path::{Path, PathBuf};
 
 /// Extracts the component directory or file name from an installed path.
-/// For paths ending with metadata.json: returns parent directory name.
-/// For other files or directories: returns the last path component.
+///
+/// A path ending in `metadata.json` or `metadata.desktop` names a file inside
+/// the component root, so this returns the parent directory's name. Any other
+/// path names the component directly, so this returns its last component.
 pub(super) fn extract_directory_name(path: &Path) -> Option<String> {
     let name = path.file_name().and_then(|n| n.to_str())?;
 

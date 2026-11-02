@@ -90,7 +90,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// - [`Error::Network`] — a store request failed
 /// - [`Error::RateLimited`] — the store asked the caller to back off
 /// - [`Error::Api`] — the store returned a non-success status
-/// - [`Error::Parse`] — a store response could not be parsed
+/// - [`Error::Parse`] — a store response could not be parsed (a KNewStuff
+///   registry file that cannot be parsed is logged and skipped instead)
 /// - [`Error::Io`] — a filesystem scan failed
 /// - [`Error::Config`] — the configuration is unusable
 pub fn check(config: &Config) -> Result<CheckResult> {
@@ -268,7 +269,8 @@ impl UpdateResult {
     /// Returns `true` when any touched component's type needs a plasmashell
     /// restart to pick up the new files: everything that installed
     /// successfully, plus failures whose files may still have changed
-    /// ([`FailureKind::Unverified`], [`FailureKind::RestoreFailed`]).
+    /// ([`FailureKind::Unverified`], [`FailureKind::Registry`],
+    /// [`FailureKind::RestoreFailed`]).
     pub fn needs_restart(&self) -> bool {
         self.succeeded
             .iter()
@@ -276,7 +278,12 @@ impl UpdateResult {
                 self.failed
                     .iter()
                     .filter(|f| {
-                        matches!(f.kind, FailureKind::Unverified | FailureKind::RestoreFailed)
+                        matches!(
+                            f.kind,
+                            FailureKind::Unverified
+                                | FailureKind::Registry
+                                | FailureKind::RestoreFailed
+                        )
                     })
                     .map(|f| &f.component),
             )
@@ -288,6 +295,9 @@ impl UpdateResult {
 ///
 /// Scans the filesystem and KNewStuff registry to discover locally installed components.
 /// Useful for building custom UIs or auditing what is installed.
+///
+/// A registry file that does not parse is logged at error level and skipped, so
+/// a broken registry never hides the components discovered from anywhere else.
 ///
 /// # Errors
 ///
@@ -307,4 +317,34 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 /// nonzero.
 pub fn restart_plasmashell() -> Result<()> {
     installer::restart_plasmashell()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn a_registry_failure_on_a_plugin_type_counts_toward_needs_restart() {
+        let result = UpdateResult {
+            succeeded: Vec::new(),
+            failed: vec![Failure {
+                component: InstalledComponent {
+                    name: "widget".to_string(),
+                    directory_name: "widget".to_string(),
+                    version: "1.0".to_string(),
+                    component_type: ComponentType::PlasmaWidget,
+                    path: PathBuf::from("/usr/share/plasma/plasmoids/widget"),
+                    is_system: true,
+                    release_date: String::new(),
+                },
+                kind: FailureKind::Registry,
+                message: "the registry could not be rewritten".to_string(),
+            }],
+            skipped: Vec::new(),
+        };
+
+        assert!(result.needs_restart(), "{result:?}");
+    }
 }

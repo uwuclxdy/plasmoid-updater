@@ -409,6 +409,11 @@ pub enum FailureKind {
     /// verified to match the expected version. The component still counts
     /// toward [`UpdateResult::needs_restart`](crate::UpdateResult::needs_restart).
     Unverified,
+    /// The files were installed, but the KNewStuff registry could not be
+    /// rewritten, so Discover still records the previous version. The
+    /// component still counts toward
+    /// [`UpdateResult::needs_restart`](crate::UpdateResult::needs_restart).
+    Registry,
 }
 
 impl std::fmt::Display for FailureKind {
@@ -421,6 +426,7 @@ impl std::fmt::Display for FailureKind {
             Self::Install => "install",
             Self::RestoreFailed => "restore",
             Self::Unverified => "unverified",
+            Self::Registry => "registry",
         };
         f.write_str(label)
     }

@@ -89,7 +89,7 @@ pub(crate) fn update_component(
 
     match perform_installation(update, client, temp.path(), reporter) {
         Ok(()) => {
-            post_install_tasks(update);
+            post_install_tasks(update)?;
             Ok(verify_installed_version(update))
         }
         Err(e) => {
@@ -231,7 +231,7 @@ fn install_from_archive(
     result
 }
 
-fn post_install_tasks(update: &AvailableUpdate) {
+fn post_install_tasks(update: &AvailableUpdate) -> Result<(), ComponentFailure> {
     let component = &update.installed;
 
     let installed_json = component.path.join("metadata.json");
@@ -251,9 +251,12 @@ fn post_install_tasks(update: &AvailableUpdate) {
         log::warn!(target: "patch", "failed to update installed metadata.desktop: {}", e.message);
     }
 
-    if let Err(e) = registry::update_registry_after_install(update) {
-        log::warn!(target: "registry", "failed to update: {e}");
-    }
+    registry::update_registry_after_install(update).map_err(|e| {
+        ComponentFailure::new(
+            FailureKind::Registry,
+            format!("installed, but the KNewStuff registry could not be updated: {e}"),
+        )
+    })
 }
 
 fn verify_installed_version(update: &AvailableUpdate) -> InstallOutcome {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::{path::Path, process::Command};
+use std::{os::unix::fs::PermissionsExt as _, path::Path, process::Command};
 
 use super::ComponentFailure;
 use crate::FailureKind;
@@ -129,43 +129,91 @@ pub(crate) fn rename(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
 /// Writes content to a file, using sudo tee if the path requires it.
 pub(crate) fn write_file(path: &Path, content: &[u8]) -> Result<(), ComponentFailure> {
     if needs_sudo(path) {
-        use std::io::Write;
-        let mut child = Command::new("sudo")
-            .args(["tee", &path.to_string_lossy()])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                ComponentFailure::new(FailureKind::Install, format!("failed to run sudo tee: {e}"))
-            })?;
-
-        #[expect(
-            clippy::expect_used,
-            reason = "stdin was spawned with Stdio::piped(), so the pipe handle always exists"
-        )]
-        let write_result = child
-            .stdin
-            .as_mut()
-            .expect("stdin was piped")
-            .write_all(content);
-
-        // Reap the child even when the write failed: a nonzero exit (e.g. a refused
-        // sudo) is a better error than the broken pipe the write sees.
-        let status = child
-            .wait()
-            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
-        if !status.success() {
-            return Err(ComponentFailure::new(
-                FailureKind::Install,
-                "sudo tee failed",
-            ));
-        }
-        write_result.map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
-        Ok(())
+        write_via_sudo_tee(path, content)
     } else {
         std::fs::write(path, content)
             .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
         Ok(())
+    }
+}
+
+/// Writes content to a file as root, whatever the path looks like.
+pub(crate) fn write_file_as_root(path: &Path, content: &[u8]) -> Result<(), ComponentFailure> {
+    if is_root() {
+        std::fs::write(path, content)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
+        Ok(())
+    } else {
+        write_via_sudo_tee(path, content)
+    }
+}
+
+/// Writes content through `sudo tee`, keeping it off the command line.
+fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailure> {
+    use std::io::Write;
+    let mut child = Command::new("sudo")
+        .args(["tee", &path.to_string_lossy()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            ComponentFailure::new(FailureKind::Install, format!("failed to run sudo tee: {e}"))
+        })?;
+
+    #[expect(
+        clippy::expect_used,
+        reason = "stdin was spawned with Stdio::piped(), so the pipe handle always exists"
+    )]
+    let write_result = child
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(content);
+
+    // Reap the child even when the write failed: a nonzero exit (e.g. a refused
+    // sudo) is a better error than the broken pipe the write sees.
+    let status = child
+        .wait()
+        .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
+    if !status.success() {
+        return Err(ComponentFailure::new(
+            FailureKind::Install,
+            "sudo tee failed",
+        ));
+    }
+    write_result.map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
+    Ok(())
+}
+
+/// Sets a file's permission bits as root, whatever the path looks like.
+pub(crate) fn set_mode_as_root(path: &Path, mode: u32) -> Result<(), ComponentFailure> {
+    if is_root() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
+        Ok(())
+    } else {
+        run_sudo(&["chmod", &format!("{mode:o}"), &path.to_string_lossy()])
+    }
+}
+
+/// Replaces `dest` with `src` through a rename as root, whatever the path looks
+/// like.
+///
+/// `--no-target-directory` makes `mv` replace the file at `dest` instead of
+/// moving `src` inside a directory there, which is what a rename must do.
+pub(crate) fn replace_file_as_root(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
+    if is_root() {
+        std::fs::rename(src, dest)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, dest, e))?;
+        Ok(())
+    } else {
+        run_sudo(&[
+            "mv",
+            "--no-target-directory",
+            "--",
+            &src.to_string_lossy(),
+            &dest.to_string_lossy(),
+        ])
     }
 }
 
@@ -180,6 +228,7 @@ mod tests {
         )));
         assert!(is_system_path(Path::new("/usr/local/share/kwin/effects")));
         assert!(is_system_path(Path::new("/lib/kde/plasma")));
+        assert!(is_system_path(Path::new("/etc/xdg/plasma")));
         assert!(!is_system_path(Path::new("/home/user/.local/share/plasma")));
         assert!(!is_system_path(Path::new("/tmp/test")));
     }

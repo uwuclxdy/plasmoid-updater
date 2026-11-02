@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use crate::{
-    Result, registry,
+    Error, Result, registry,
     types::{ComponentType, InstalledComponent, PackageMetadata},
 };
 
@@ -11,6 +15,9 @@ use crate::{
 ///
 /// When `system` is `true`, scans system-wide directories (`/usr/share/...`);
 /// otherwise scans user directories (`~/.local/share/...`).
+///
+/// One registry file that does not parse is logged and skipped: it must not
+/// hide the components of every other type.
 pub(crate) fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
     let types = if system {
         ComponentType::all()
@@ -23,8 +30,13 @@ pub(crate) fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
 
     for &component_type in types {
         if component_type.registry_only() {
-            let registry_components = registry::scan_registry_components(component_type)?;
-            components.extend(registry_components);
+            match registry::scan_registry_components(component_type, system) {
+                Ok(found) => components.extend(found),
+                Err(e @ Error::Parse { .. }) => {
+                    log::error!(target: "registry", "skipping {component_type}: {e}");
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
 
@@ -51,11 +63,19 @@ pub(crate) fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
 
         // For shared directories (e.g., plasma/look-and-feel), load registry
         // maps for all component types that use this path so we can assign the
-        // correct type based on which registry file contains the entry.
+        // correct type based on which registry file contains the entry. A
+        // `--system` scan reads only the trusted system registries.
         let shared_types = component_type.shared_path_types();
         let registry_maps: Vec<_> = shared_types
             .iter()
-            .map(|&ct| Ok((ct, registry::load_registry_map(ct)?)))
+            .map(|&ct| match registry::load_registry_map(ct, system) {
+                Ok(map) => Ok((ct, map)),
+                Err(e @ Error::Parse { .. }) => {
+                    log::error!(target: "registry", "skipping {ct} entries: {e}");
+                    Ok((ct, HashMap::new()))
+                }
+                Err(e) => Err(e),
+            })
             .collect::<Result<_>>()?;
 
         let discovered = scan_directory(&path, component_type, system, &registry_maps)?;

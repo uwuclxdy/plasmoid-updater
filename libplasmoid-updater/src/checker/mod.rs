@@ -76,3 +76,133 @@ pub(crate) fn check_with_components(
 
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use super::{IdLookup, resolution};
+    use crate::types::{ComponentType, InstalledComponent};
+
+    const CHILD: &str = "PLASMOID_UPDATER_ID_CACHE_TEST_CHILD";
+    const ROOT: &str = "PLASMOID_UPDATER_ID_CACHE_TEST_ROOT";
+    const PLANTED_ID: u64 = 2_380_745;
+    const USER_ID: u64 = 111_001;
+    const TABLE_ID: u64 = 777_001;
+    const WIDGET: &str = "org.frapell.networkspeed";
+    const USER_WIDGET: &str = "user-widget";
+
+    fn component(directory_name: &str, is_system: bool) -> InstalledComponent {
+        InstalledComponent {
+            name: directory_name.to_string(),
+            directory_name: directory_name.to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::PlasmaWidget,
+            path: PathBuf::from(format!("/plasmoids/{directory_name}")),
+            is_system,
+            release_date: String::new(),
+        }
+    }
+
+    /// Under `--system` the store id a system component resolves to may come
+    /// only from a trusted system registry: a user-writable registry must not
+    /// choose the content a privileged update installs. A user run still reads
+    /// the user registry.
+    #[test]
+    fn a_user_registry_entry_does_not_resolve_a_system_component() {
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var(ROOT).unwrap());
+            let mut table = HashMap::new();
+            table.insert(WIDGET.to_string(), TABLE_ID);
+
+            let system_cache = crate::registry::build_id_cache(true);
+            let system_lookup = IdLookup {
+                widgets_id_table: &table,
+                registry_id_cache: &system_cache,
+            };
+            assert_eq!(
+                resolution::resolve_content_id(&component(WIDGET, true), &[], &system_lookup),
+                Some(TABLE_ID),
+                "the user registry chose a system component's store content: {system_cache:?}"
+            );
+
+            let user_cache = crate::registry::build_id_cache(false);
+            let user_lookup = IdLookup {
+                widgets_id_table: &table,
+                registry_id_cache: &user_cache,
+            };
+            assert_eq!(
+                resolution::resolve_content_id(&component(USER_WIDGET, false), &[], &user_lookup),
+                Some(USER_ID),
+                "a user component no longer resolves through the user registry: {user_cache:?}"
+            );
+
+            std::fs::write(root.join("child-done"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let registry_dir = root.join("data/knewstuff3");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("plasmoids.knsregistry"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="705">
+    <name>Network Speed</name>
+    <version>1.0</version>
+    <installedfile>/usr/share/plasma/plasmoids/{WIDGET}/metadata.json</installedfile>
+    <id>{PLANTED_ID}</id>
+  </stuff>
+  <stuff category="705">
+    <name>User Widget</name>
+    <version>1.0</version>
+    <installedfile>{user}/metadata.json</installedfile>
+    <id>{USER_ID}</id>
+  </stuff>
+</hotnewstuffregistry>
+"#,
+                user = root
+                    .join("data/plasma/plasmoids")
+                    .join(USER_WIDGET)
+                    .display(),
+            ),
+        )
+        .unwrap();
+        let system = root.join("system");
+        std::fs::create_dir_all(&system).unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "checker::tests::a_user_registry_entry_does_not_resolve_a_system_component",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", root.join("home"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_DIRS", &system)
+            .env("TMPDIR", root.join("tmp"))
+            .env(CHILD, "1")
+            .env(ROOT, &root)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success() && root.join("child-done").exists(),
+            "child failed ({}; body completed: {})\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            root.join("child-done").exists(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}

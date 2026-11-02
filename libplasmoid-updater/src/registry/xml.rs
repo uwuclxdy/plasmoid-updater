@@ -8,7 +8,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use quick_xml::{Reader, Writer, events::Event};
+use quick_xml::{
+    Reader, Writer,
+    escape::resolve_predefined_entity,
+    events::{BytesEnd, BytesText, Event},
+};
 
 use crate::{
     types::ComponentType,
@@ -16,6 +20,22 @@ use crate::{
 };
 
 use super::{manager::RegistryEntry, utils};
+
+const CLOSING_TAG: &str = "</hotnewstuffregistry>";
+
+const REGISTRY_HEADER: &str =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE khotnewstuff3>\n<hotnewstuffregistry>\n";
+
+/// Returns a whole registry document holding `entries` (already serialized).
+fn registry_document(entries: &str) -> String {
+    format!("{REGISTRY_HEADER}{entries}{CLOSING_TAG}\n")
+}
+
+/// Returns whether `xml` holds nothing but a byte-order mark and whitespace: a
+/// fresh registry with no entry to lose.
+fn is_blank(xml: &str) -> bool {
+    xml.trim_start_matches('\u{feff}').trim().is_empty()
+}
 
 /// Raw fields collected from a single `<stuff>` entry during XML parsing.
 #[derive(Default)]
@@ -37,6 +57,22 @@ impl RawEntry {
         self.installed_files
             .first()
             .map(|f| PathBuf::from(f.trim_end_matches("/*")))
+    }
+
+    /// Records one finished element's text into the field it names.
+    fn assign(&mut self, element: &str, raw: &str) {
+        let value = raw.trim();
+        match element {
+            "name" => self.name = value.to_string(),
+            "version" => self.version = value.to_string(),
+            "id" => self.id_text = value.to_string(),
+            "releasedate" => self.release_date = value.to_string(),
+            "installedfile" if !value.is_empty() => self.installed_files.push(value.to_string()),
+            "uninstalledfile" if !value.is_empty() => {
+                self.uninstalled_files.push(value.to_string());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -61,76 +97,104 @@ pub(super) struct UpdateFields<'a> {
     pub release_date: &'a str,
 }
 
-const EMPTY_REGISTRY_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE khotnewstuff3>
-<hotnewstuffregistry>
-</hotnewstuffregistry>
-"#;
+fn parse_error(detail: impl Into<String>) -> Error {
+    Error::Parse {
+        what: "knewstuff registry",
+        detail: detail.into(),
+    }
+}
+
+/// Decodes one reference fragment (`&amp;`, `&#233;`, `&#xE9;`) into `text`.
+fn decode_ref(text: &mut String, reference: &quick_xml::events::BytesRef<'_>) -> Result<()> {
+    let name = reference.as_ref();
+    let character = reference
+        .resolve_char_ref()
+        .map_err(|e| parse_error(format!("invalid character reference &{name};: {e}")))?;
+    if let Some(character) = character {
+        text.push(character);
+        return Ok(());
+    }
+    let Some(expansion) = resolve_predefined_entity(name) else {
+        return Err(parse_error(format!("unresolved entity reference &{name};")));
+    };
+    text.push_str(expansion);
+    Ok(())
+}
 
 /// Parses all `<stuff>` entries from registry XML into raw field collections.
-pub(super) fn parse_raw_entries(xml: &str) -> Vec<RawEntry> {
+///
+/// Every element's text is collected from all the fragments quick-xml reports
+/// for it — `Event::Text`, `Event::CData` and `Event::GeneralRef` — and decoded
+/// once at its end tag, so `A &amp; B` reads as `A & B` instead of as its last
+/// fragment.
+///
+/// Content holding only a byte-order mark and whitespace is an empty registry;
+/// any other content without a `hotnewstuffregistry` root element is an error,
+/// never zero entries.
+pub(super) fn parse_raw_entries(xml: &str) -> Result<Vec<RawEntry>> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut entries = Vec::new();
     let mut current_element = String::new();
+    let mut text = String::new();
     let mut in_entry = false;
     let mut current = RawEntry::default();
+    let mut open = 0usize;
+    let mut saw_root = false;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let qname = e.name();
-                let name = qname.as_ref();
+                open += 1;
                 current_element.clear();
-                current_element.push_str(name);
+                current_element.push_str(e.name().as_ref());
+                text.clear();
 
-                if name == "stuff" {
+                if current_element == "hotnewstuffregistry" {
+                    saw_root = true;
+                } else if current_element == "stuff" {
                     in_entry = true;
                     current = RawEntry::default();
                 }
             }
-            Ok(Event::End(e)) if e.name().as_ref() == "stuff" && in_entry => {
-                entries.push(std::mem::take(&mut current));
-                in_entry = false;
-            }
-            Ok(Event::Text(e)) => {
-                if !in_entry {
-                    continue;
+            Ok(Event::Empty(e)) if e.name().as_ref() == "hotnewstuffregistry" => saw_root = true,
+            Ok(Event::Text(e)) if in_entry => text.push_str(&e),
+            Ok(Event::CData(e)) if in_entry => text.push_str(&e),
+            Ok(Event::GeneralRef(e)) if in_entry => decode_ref(&mut text, &e)?,
+            Ok(Event::End(e)) => {
+                open = open.saturating_sub(1);
+                let name = e.name();
+                if in_entry {
+                    current.assign(name.as_ref(), &text);
+                    if name.as_ref() == "stuff" {
+                        entries.push(std::mem::take(&mut current));
+                        in_entry = false;
+                    }
                 }
-
-                // Allocate only for the fields we keep; the registry format has ~13
-                // ignored fields per entry (providerid, author, rating, summary, …).
-                match current_element.as_str() {
-                    "name" => current.name = e.as_ref().to_owned(),
-                    "version" => {
-                        current.version = e.as_ref().to_owned();
-                    }
-                    "id" => current.id_text = e.as_ref().to_owned(),
-                    "releasedate" => {
-                        current.release_date = e.as_ref().to_owned();
-                    }
-                    "installedfile" => {
-                        current.installed_files.push(e.as_ref().to_owned());
-                    }
-                    "uninstalledfile" => {
-                        current.uninstalled_files.push(e.as_ref().to_owned());
-                    }
-                    _ => {}
-                }
+                text.clear();
             }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Ok(Event::Eof) => {
+                if open != 0 {
+                    return Err(parse_error(format!(
+                        "unexpected end of file inside {open} unclosed element(s)"
+                    )));
+                }
+                if !saw_root && !is_blank(xml) {
+                    return Err(parse_error("missing <hotnewstuffregistry> root element"));
+                }
+                break;
+            }
+            Err(e) => return Err(parse_error(e.to_string())),
             _ => {}
         }
     }
 
-    entries
+    Ok(entries)
 }
 
 /// Parses all entries from a KNewStuff registry file.
-pub(super) fn parse_registry_entries(xml: &str) -> Vec<RegistryEntry> {
-    parse_raw_entries(xml)
+pub(super) fn parse_registry_entries(xml: &str) -> Result<Vec<RegistryEntry>> {
+    Ok(parse_raw_entries(xml)?
         .into_iter()
         .filter_map(|raw| {
             let installed_path = raw.first_installed_path()?;
@@ -144,12 +208,12 @@ pub(super) fn parse_registry_entries(xml: &str) -> Vec<RegistryEntry> {
                 release_date: raw.release_date,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Creates an empty registry file with the proper XML structure.
 pub(super) fn create_empty_registry() -> String {
-    EMPTY_REGISTRY_TEMPLATE.to_string()
+    registry_document("")
 }
 
 /// Escapes special characters for XML text content.
@@ -174,7 +238,13 @@ fn escape_xml_text(s: &str) -> Cow<'_, str> {
 }
 
 /// Adds a new entry to the registry XML.
-pub(super) fn add_entry(xml: &str, entry: &NewEntry) -> String {
+///
+/// Every interpolated value is escaped, so a path or date carrying `&`, `<` or
+/// `>` cannot break the document. Blank content and a self-closing root are
+/// written as a fresh registry, since neither holds an entry to lose. A
+/// document without its closing tag is an error: rebuilding it would drop the
+/// entries a truncated registry still holds.
+pub(super) fn add_entry(xml: &str, entry: &NewEntry) -> Result<String> {
     let category_id = entry.component_type.category_id();
     let store_url = format!("https://store.kde.org/p/{}", entry.content_id);
     let installed_file = utils::registry_installed_file_path(entry.installed_path);
@@ -201,161 +271,308 @@ pub(super) fn add_entry(xml: &str, entry: &NewEntry) -> String {
     <status>installed</status>
   </stuff>
 "#,
+        category_id = category_id,
         name = escape_xml_text(entry.name),
+        store_url = escape_xml_text(&store_url),
         version = escape_xml_text(entry.version),
-        download_url = escape_xml_text(entry.download_url),
+        installed_file = escape_xml_text(&installed_file),
         content_id = entry.content_id,
-        release_date = entry.release_date,
+        release_date = escape_xml_text(entry.release_date),
+        download_url = escape_xml_text(entry.download_url),
     );
 
-    if let Some(pos) = xml.rfind("</hotnewstuffregistry>") {
-        let suffix = "</hotnewstuffregistry>\n";
-        let mut result = String::with_capacity(pos + new_entry.len() + suffix.len());
-        result.push_str(&xml[..pos]);
-        result.push_str(&new_entry);
-        result.push_str(suffix);
-        result
-    } else {
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE khotnewstuff3>
-<hotnewstuffregistry>
-{new_entry}</hotnewstuffregistry>
-"#
-        )
+    if is_blank(xml) {
+        return Ok(registry_document(&new_entry));
+    }
+    let insert_at = match root_end(xml)? {
+        RootEnd::SelfClosing => return Ok(registry_document(&new_entry)),
+        RootEnd::ClosingTag(offset) => offset,
+    };
+    let mut result = String::with_capacity(xml.len() + new_entry.len());
+    result.push_str(&xml[..insert_at]);
+    result.push_str(&new_entry);
+    result.push_str(&xml[insert_at..]);
+    Ok(result)
+}
+
+/// How a registry document's root element ends.
+enum RootEnd {
+    /// `<hotnewstuffregistry/>`: a valid registry holding no entry.
+    SelfClosing,
+    /// The byte offset of `</hotnewstuffregistry>`.
+    ClosingTag(usize),
+}
+
+/// Returns how the root element ends.
+///
+/// The parser finds the closing tag, so the literal `</hotnewstuffregistry>`
+/// inside a comment, a CDATA section or text can never be mistaken for the
+/// root's end.
+fn root_end(xml: &str) -> Result<RootEnd> {
+    let mut reader = Reader::from_str(xml);
+    let mut saw_root = false;
+
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                if e.name().as_ref() == "hotnewstuffregistry" {
+                    saw_root = true;
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                if e.name().as_ref() == "hotnewstuffregistry" {
+                    return Ok(RootEnd::SelfClosing);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if saw_root && e.name().as_ref() == "hotnewstuffregistry" {
+                    return Ok(RootEnd::ClosingTag(before));
+                }
+            }
+            Ok(Event::Eof) => {
+                if !saw_root {
+                    return Err(parse_error("missing <hotnewstuffregistry> root element"));
+                }
+                return Err(parse_error(format!("missing {CLOSING_TAG} closing tag")));
+            }
+            Err(e) => return Err(parse_error(e.to_string())),
+            _ => {}
+        }
     }
 }
 
 /// Updates an existing entry in the registry XML.
 /// Returns `Some(new_xml)` if entry was found and updated, `None` if not found.
 pub(super) fn update_entry(xml: &str, fields: &UpdateFields) -> Result<Option<String>> {
-    let Some(target_index) = find_target_index(xml, fields.directory_name) else {
+    let Some(target) = find_target_index(xml, fields.directory_name)? else {
         return Ok(None);
     };
 
-    rewrite_with_updates(xml, target_index, fields)
+    rewrite_with_updates(xml, target, fields)
 }
 
-/// Returns the 0-based index of the `<stuff>` entry whose installed or uninstalled
-/// file paths contain `directory_name` as a path segment.
-fn find_target_index(xml: &str, directory_name: &str) -> Option<usize> {
+/// Locates the `<stuff>` entry whose `installedfile` names `directory_name` as
+/// a path segment, and which of that entry's `installedfile` elements matched.
+///
+/// `uninstalledfile` records files a component removed, so it never names the
+/// entry an update belongs to.
+fn find_target_index(xml: &str, directory_name: &str) -> Result<Option<(usize, usize)>> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut current_element = String::new();
+    let mut text = String::new();
     let mut entry_index: Option<usize> = None;
     let mut in_entry = false;
     let mut current_matches = false;
+    let mut installed_ordinal = 0usize;
+    let mut matched_ordinal = 0usize;
+    let mut open = 0usize;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let qname = e.name();
-                let name = qname.as_ref();
+                open += 1;
                 current_element.clear();
-                current_element.push_str(name);
+                current_element.push_str(e.name().as_ref());
+                text.clear();
 
-                if name == "stuff" {
+                if current_element == "stuff" {
                     in_entry = true;
-                    entry_index = Some(entry_index.map_or(0, |i| i + 1));
+                    entry_index = Some(entry_index.map_or(0, |index| index + 1));
                     current_matches = false;
+                    installed_ordinal = 0;
+                } else if in_entry && current_element == "installedfile" {
+                    installed_ordinal += 1;
                 }
             }
-            Ok(Event::Text(e))
-                if in_entry
-                    && !current_matches
-                    && matches!(
-                        current_element.as_str(),
-                        "installedfile" | "uninstalledfile"
-                    ) =>
-            {
-                current_matches = (*e).split('/').any(|seg| seg == directory_name);
+            Ok(Event::Empty(e)) if in_entry && e.name().as_ref() == "installedfile" => {
+                installed_ordinal += 1;
             }
-            Ok(Event::End(e)) if e.name().as_ref() == "stuff" && in_entry => {
-                if current_matches {
-                    return entry_index;
+            Ok(Event::Text(e)) if in_entry && current_element == "installedfile" => {
+                text.push_str(&e);
+            }
+            Ok(Event::CData(e)) if in_entry && current_element == "installedfile" => {
+                text.push_str(&e);
+            }
+            Ok(Event::GeneralRef(e)) if in_entry && current_element == "installedfile" => {
+                decode_ref(&mut text, &e)?;
+            }
+            Ok(Event::End(e)) => {
+                open = open.saturating_sub(1);
+                let name = e.name();
+                if in_entry && name.as_ref() == "installedfile" && !current_matches {
+                    current_matches = text.split('/').any(|segment| segment == directory_name);
+                    matched_ordinal = installed_ordinal;
                 }
-                in_entry = false;
+                if in_entry && name.as_ref() == "stuff" {
+                    if current_matches {
+                        return Ok(entry_index.map(|index| (index, matched_ordinal)));
+                    }
+                    in_entry = false;
+                }
+                text.clear();
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => {
+                if open != 0 {
+                    return Err(parse_error(format!(
+                        "unexpected end of file inside {open} unclosed element(s)"
+                    )));
+                }
+                break;
+            }
+            Err(e) => return Err(parse_error(e.to_string())),
             _ => {}
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Rewrites the registry XML, updating fields in the target entry.
-fn rewrite_with_updates(
+///
+/// Every other event is written back exactly as read, so foreign entries stay
+/// byte-for-byte identical. Only elements inside the target `<stuff>` are
+/// candidates: an element at root level or inside another entry is never
+/// rewritten. A replaced element's whole content is replaced — whatever
+/// fragment count or nested markup its old value had, and whether it was
+/// self-closing — and only the `installedfile` that matched is rewritten;
+/// `uninstalledfile` never is.
+fn rewrite_with_updates<'a>(
     xml: &str,
-    target_index: usize,
-    fields: &UpdateFields,
+    target: (usize, usize),
+    fields: &'a UpdateFields,
 ) -> Result<Option<String>> {
+    let (target_entry, target_installed_file) = target;
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
     let mut writer = Writer::new(Vec::new());
+
     let mut current_element = String::new();
     let mut entry_index: Option<usize> = None;
+    // the depth of the target `<stuff>` while the reader is inside it
+    let mut target_depth: Option<usize> = None;
+    let mut installed_ordinal = 0usize;
+    let mut depth = 0usize;
+    let mut replacing_at: Option<usize> = None;
+    let mut replacement: Option<Cow<'a, str>> = None;
+    let mut closed = false;
 
     // a fn, not a closure: Event borrows from the caller's locals, and a
     // closure would pin one lifetime across all call sites
-    fn write(writer: &mut Writer<Vec<u8>>, event: quick_xml::events::Event<'_>) -> Result<()> {
-        writer.write_event(event).map_err(|e| Error::Parse {
-            what: "knewstuff registry",
-            detail: format!("serialization failed: {e}"),
-        })
+    fn write(writer: &mut Writer<Vec<u8>>, event: Event<'_>) -> Result<()> {
+        writer
+            .write_event(event)
+            .map_err(|e| parse_error(format!("serialization failed: {e}")))
     }
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let qname = e.name();
-                let name = qname.as_ref();
-                current_element.clear();
-                current_element.push_str(name);
-
-                if name == "stuff" {
-                    entry_index = Some(entry_index.map_or(0, |i| i + 1));
-                }
-
-                write(&mut writer, Event::Start(e.clone()))?;
-            }
-            Ok(Event::End(e)) => {
-                write(&mut writer, Event::End(e))?;
-            }
-            Ok(Event::Text(e)) => {
-                let in_target = entry_index == Some(target_index);
-
-                if in_target
-                    && let Some(replacement) = get_field_replacement(&current_element, fields)
-                {
-                    write(
-                        &mut writer,
-                        Event::Text(quick_xml::events::BytesText::new(&replacement)),
-                    )?;
+                depth += 1;
+                if replacing_at.is_some() {
                     continue;
                 }
-
-                write(&mut writer, Event::Text(e))?;
+                current_element.clear();
+                current_element.push_str(e.name().as_ref());
+                if current_element == "stuff" {
+                    entry_index = Some(entry_index.map_or(0, |index| index + 1));
+                    installed_ordinal = 0;
+                    if entry_index == Some(target_entry) {
+                        target_depth = Some(depth);
+                    }
+                } else if target_depth.is_some() {
+                    let replace = if current_element == "installedfile" {
+                        installed_ordinal += 1;
+                        installed_ordinal == target_installed_file
+                    } else {
+                        get_field_replacement(&current_element, fields).is_some()
+                    };
+                    if replace {
+                        replacement = get_field_replacement(&current_element, fields);
+                        replacing_at = Some(depth);
+                    }
+                }
+                write(&mut writer, Event::Start(e))?;
+            }
+            Ok(Event::Empty(e)) => {
+                if replacing_at.is_some() {
+                    continue;
+                }
+                current_element.clear();
+                current_element.push_str(e.name().as_ref());
+                let in_target = target_depth.is_some() && current_element != "stuff";
+                let replace = in_target
+                    && if current_element == "installedfile" {
+                        installed_ordinal += 1;
+                        installed_ordinal == target_installed_file
+                    } else {
+                        get_field_replacement(&current_element, fields).is_some()
+                    };
+                if !replace {
+                    write(&mut writer, Event::Empty(e))?;
+                    continue;
+                }
+                let value = get_field_replacement(&current_element, fields);
+                let end = BytesEnd::new(current_element.clone());
+                write(&mut writer, Event::Start(e))?;
+                if let Some(value) = value {
+                    write(&mut writer, Event::Text(BytesText::new(&value)))?;
+                }
+                write(&mut writer, Event::End(end))?;
+            }
+            Ok(Event::Text(e)) => {
+                if replacing_at.is_none() {
+                    write(&mut writer, Event::Text(e))?;
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if replacing_at.is_none() {
+                    write(&mut writer, Event::CData(e))?;
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if replacing_at.is_none() {
+                    write(&mut writer, Event::GeneralRef(e))?;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let is_root = e.name().as_ref() == "hotnewstuffregistry";
+                let closes_target = target_depth == Some(depth);
+                let closes_replacement = replacing_at == Some(depth);
+                depth = depth.saturating_sub(1);
+                if closes_replacement {
+                    if let Some(value) = replacement.take() {
+                        write(&mut writer, Event::Text(BytesText::new(&value)))?;
+                    }
+                    replacing_at = None;
+                }
+                if replacing_at.is_some() {
+                    continue;
+                }
+                if closes_target {
+                    target_depth = None;
+                }
+                if is_root {
+                    closed = true;
+                }
+                write(&mut writer, Event::End(e))?;
             }
             Ok(Event::Eof) => break,
-            Ok(e) => {
-                write(&mut writer, e)?;
+            Ok(event) => {
+                if replacing_at.is_none() {
+                    write(&mut writer, event)?;
+                }
             }
-            Err(e) => {
-                return Err(Error::Parse {
-                    what: "knewstuff registry",
-                    detail: e.to_string(),
-                });
-            }
+            Err(e) => return Err(parse_error(e.to_string())),
         }
     }
 
-    let result = String::from_utf8(writer.into_inner()).map_err(|e| Error::Parse {
-        what: "knewstuff registry",
-        detail: format!("invalid utf8: {e}"),
-    })?;
+    if !closed {
+        return Err(parse_error(format!("missing {CLOSING_TAG} closing tag")));
+    }
+
+    let result = String::from_utf8(writer.into_inner())
+        .map_err(|e| parse_error(format!("invalid utf8: {e}")))?;
     Ok(Some(result))
 }
 
@@ -371,9 +588,386 @@ fn get_field_replacement<'a>(element_name: &str, fields: &'a UpdateFields) -> Op
         "payload" => Some(Cow::Borrowed(fields.download_url)),
         "releasedate" => Some(Cow::Borrowed(fields.release_date)),
         "status" => Some(Cow::Borrowed("installed")),
-        "installedfile" | "uninstalledfile" => Some(Cow::Owned(
-            utils::registry_installed_file_path(fields.installed_path),
-        )),
+        "installedfile" => Some(Cow::Owned(utils::registry_installed_file_path(
+            fields.installed_path,
+        ))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_entry(installed_path: &Path) -> NewEntry<'_> {
+        NewEntry {
+            name: "Fake & Caf<é>",
+            component_type: ComponentType::ColorScheme,
+            content_id: 7,
+            version: "1.0 & beta",
+            download_url: "https://example.test/dl?a=1&b=2",
+            installed_path,
+            release_date: "2026-01-01 & later",
+        }
+    }
+
+    fn update_fields<'a>(directory_name: &'a str, installed_path: &'a Path) -> UpdateFields<'a> {
+        UpdateFields {
+            directory_name,
+            content_id: 777,
+            new_version: "2.0",
+            download_url: "https://example.test/dl?new=1",
+            installed_path,
+            release_date: "2026-02-02",
+        }
+    }
+
+    #[test]
+    fn entities_decode_and_fragments_append_in_every_read_field() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Fake &amp; Caf&#233; &lt;lit&gt; &quot;q&quot; &#xE9;</name>
+    <version>1.0 &amp; beta</version>
+    <releasedate>2026-01-01&amp;later</releasedate>
+    <installedfile>/home/u/my&amp;dir/f/metadata.json</installedfile>
+    <uninstalledfile>/home/u/gone&amp;old/f</uninstalledfile>
+    <id>999001</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let entries = parse_raw_entries(xml).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.name, "Fake & Café <lit> \"q\" é");
+        assert_eq!(entry.version, "1.0 & beta");
+        assert_eq!(entry.release_date, "2026-01-01&later");
+        assert_eq!(
+            entry.installed_files,
+            vec!["/home/u/my&dir/f/metadata.json"]
+        );
+        assert_eq!(entry.uninstalled_files, vec!["/home/u/gone&old/f"]);
+        assert_eq!(entry.id_text, "999001");
+    }
+
+    #[test]
+    fn add_entry_escapes_every_interpolated_value() {
+        let entry = new_entry(Path::new("/tmp/a&b<scheme>"));
+
+        let out = add_entry(&create_empty_registry(), &entry).unwrap();
+
+        assert!(
+            out.contains("/tmp/a&amp;b&lt;scheme&gt;/metadata.json"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<releasedate>2026-01-01 &amp; later</releasedate>"),
+            "{out}"
+        );
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed[0].name, "Fake & Caf<é>");
+        assert_eq!(parsed[0].version, "1.0 & beta");
+        assert_eq!(parsed[0].release_date, "2026-01-01 & later");
+        assert_eq!(
+            parsed[0].installed_files,
+            vec!["/tmp/a&b<scheme>/metadata.json"]
+        );
+    }
+
+    #[test]
+    fn add_entry_refuses_a_registry_without_its_closing_tag() {
+        let truncated = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE khotnewstuff3>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Foreign</name>
+    <installedfile>/home/u/foreign/metadata.json</installedfile>
+    <id>1</id>
+  </stuff>"#;
+
+        let err = add_entry(truncated, &new_entry(Path::new("/tmp/a"))).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "failed to parse knewstuff registry: missing </hotnewstuffregistry> closing tag"
+        );
+    }
+
+    #[test]
+    fn update_matches_installedfile_never_uninstalledfile() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Other</name>
+    <version>1.0</version>
+    <installedfile>/home/u/other/Other.colors</installedfile>
+    <uninstalledfile>/home/u/target/Target.colors</uninstalledfile>
+    <id>111</id>
+  </stuff>
+  <stuff category="112">
+    <name>Target</name>
+    <version>1.0</version>
+    <installedfile>/home/u/target/Target.colors</installedfile>
+    <id>222</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let out = update_entry(
+            xml,
+            &update_fields("Target.colors", Path::new("/home/u/target/Target.colors")),
+        )
+        .unwrap()
+        .unwrap();
+
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id_text, "111");
+        assert_eq!(parsed[0].version, "1.0");
+        assert_eq!(
+            parsed[0].uninstalled_files,
+            vec!["/home/u/target/Target.colors"]
+        );
+        assert_eq!(parsed[1].id_text, "777");
+        assert_eq!(parsed[1].version, "2.0");
+    }
+
+    #[test]
+    fn update_replaces_the_installedfile_that_matched() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Target</name>
+    <version>1.0</version>
+    <installedfile>/home/u/target/Target.png</installedfile>
+    <installedfile>/home/u/target/Target.colors</installedfile>
+    <uninstalledfile>/home/u/gone/Old.colors</uninstalledfile>
+    <id>222</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let out = update_entry(
+            xml,
+            &update_fields("Target.colors", Path::new("/home/u/target/replacement")),
+        )
+        .unwrap()
+        .unwrap();
+
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(
+            parsed[0].installed_files,
+            vec![
+                "/home/u/target/Target.png",
+                "/home/u/target/replacement/metadata.json"
+            ]
+        );
+        assert_eq!(parsed[0].uninstalled_files, vec!["/home/u/gone/Old.colors"]);
+    }
+
+    #[test]
+    fn update_keeps_untouched_entries_byte_for_byte() {
+        let foreign = "  <stuff category=\"112\">\n    <name>Other &amp; More</name>\n    <installedfile>/home/u/other/Other.colors</installedfile>\n    <id>111</id>\n  </stuff>\n";
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE khotnewstuff3>\n<hotnewstuffregistry>\n{foreign}  <stuff category=\"112\">\n    <name>Target</name>\n    <version>1.0</version>\n    <installedfile>/home/u/target/Target.colors</installedfile>\n    <id>222</id>\n  </stuff>\n</hotnewstuffregistry>\n"
+        );
+
+        let out = update_entry(
+            &xml,
+            &update_fields("Target.colors", Path::new("/home/u/target/Target.colors")),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            out.contains(foreign),
+            "untouched entry not preserved:\n{out}"
+        );
+    }
+
+    #[test]
+    fn add_entry_treats_an_empty_or_whitespace_registry_as_fresh() {
+        for blank in ["", "   ", "\n\t \n"] {
+            let out = add_entry(blank, &new_entry(Path::new("/tmp/a"))).unwrap();
+
+            assert!(
+                out.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+                "{blank:?} -> {out:?}"
+            );
+            let parsed = parse_raw_entries(&out).unwrap();
+            assert_eq!(parsed.len(), 1, "{blank:?} -> {out}");
+            assert_eq!(parsed[0].name, "Fake & Caf<é>");
+        }
+    }
+
+    #[test]
+    fn cdata_content_is_read_as_text() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name><![CDATA[Fake & Caf<é>]]></name>
+    <installedfile><![CDATA[/home/u/my&dir/f/metadata.json]]></installedfile>
+    <id>7</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let entries = parse_raw_entries(xml).unwrap();
+
+        assert_eq!(entries[0].name, "Fake & Caf<é>");
+        assert_eq!(
+            entries[0].installed_files,
+            vec!["/home/u/my&dir/f/metadata.json"]
+        );
+    }
+
+    #[test]
+    fn update_rewrites_a_self_closing_field() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Target</name>
+    <version/>
+    <installedfile>/home/u/target/Target.colors</installedfile>
+    <id>222</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let out = update_entry(
+            xml,
+            &update_fields("Target.colors", Path::new("/home/u/target/replacement")),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(out.contains("<version>2.0</version>"), "{out}");
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed[0].version, "2.0");
+    }
+
+    #[test]
+    fn update_rewrites_a_field_holding_nested_markup() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Target</name>
+    <version><b>1.0</b></version>
+    <installedfile>/home/u/target/Target.colors</installedfile>
+    <id>222</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let out = update_entry(
+            xml,
+            &update_fields("Target.colors", Path::new("/home/u/target/replacement")),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(out.contains("<version>2.0</version>"), "{out}");
+        assert!(!out.contains("<b>"), "{out}");
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed[0].version, "2.0");
+    }
+
+    #[test]
+    fn add_entry_inserts_before_the_root_element_found_by_the_parser() {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<hotnewstuffregistry>\n  <stuff category=\"112\">\n    <name>Foreign</name>\n    <installedfile>/home/u/foreign/metadata.json</installedfile>\n    <id>1</id>\n  </stuff>\n</hotnewstuffregistry>\n<!-- a note mentioning </hotnewstuffregistry> -->\n";
+
+        let out = add_entry(xml, &new_entry(Path::new("/tmp/a"))).unwrap();
+
+        assert!(
+            out.contains("<!-- a note mentioning </hotnewstuffregistry> -->"),
+            "{out}"
+        );
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed.len(), 2, "{out}");
+        assert_eq!(parsed[1].name, "Fake & Caf<é>");
+    }
+
+    #[test]
+    fn add_entry_writes_a_full_document_for_a_self_closing_root() {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<hotnewstuffregistry/>\n";
+
+        let out = add_entry(xml, &new_entry(Path::new("/tmp/a"))).unwrap();
+
+        assert!(
+            out.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+            "{out}"
+        );
+        assert!(out.contains("<hotnewstuffregistry>"), "{out}");
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed.len(), 1, "{out}");
+        assert_eq!(parsed[0].name, "Fake & Caf<é>");
+    }
+
+    #[test]
+    fn a_registry_holding_only_a_byte_order_mark_is_fresh() {
+        for blank in ["\u{feff}", "\u{feff}\n", "\u{feff} \n\t"] {
+            assert!(
+                parse_raw_entries(blank).unwrap().is_empty(),
+                "{blank:?} parsed as a registry with entries"
+            );
+            let out = add_entry(blank, &new_entry(Path::new("/tmp/a"))).unwrap();
+            assert!(
+                out.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+                "{blank:?} -> {out:?}"
+            );
+            assert_eq!(
+                parse_raw_entries(&out).unwrap().len(),
+                1,
+                "{blank:?} -> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_leaves_a_root_level_element_outside_the_entry_alone() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Target</name>
+    <version>1.0</version>
+    <installedfile>/home/u/target/Target.colors</installedfile>
+    <id>222</id>
+  </stuff>
+  <version>9.9</version>
+  <status>foreign</status>
+</hotnewstuffregistry>
+"#;
+
+        let out = update_entry(
+            xml,
+            &update_fields("Target.colors", Path::new("/home/u/target/replacement")),
+        )
+        .unwrap()
+        .unwrap();
+
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed[0].version, "2.0", "{out}");
+        assert!(
+            out.contains("<version>9.9</version>"),
+            "the root-level element was rewritten:\n{out}"
+        );
+        assert!(
+            out.contains("<status>foreign</status>"),
+            "the root-level element was rewritten:\n{out}"
+        );
+    }
+
+    #[test]
+    fn text_without_the_root_element_is_a_parse_error() {
+        let err = parse_registry_entries("not a registry\n").unwrap_err();
+        assert!(matches!(err, Error::Parse { .. }), "{err}");
+
+        let err = parse_registry_entries("\0\0\0").unwrap_err();
+        assert!(matches!(err, Error::Parse { .. }), "{err}");
+
+        assert!(parse_raw_entries("").unwrap().is_empty());
+        assert!(parse_raw_entries("  \n").unwrap().is_empty());
     }
 }
