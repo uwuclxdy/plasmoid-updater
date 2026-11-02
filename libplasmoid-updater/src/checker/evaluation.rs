@@ -63,7 +63,7 @@ pub(crate) fn check_component(
         );
         let diagnostic = Diagnostic::new(
             component.name.clone(),
-            format!("store entry {content_id} not in fetched data"),
+            format!("could not fetch store entry {content_id}"),
         )
         .with_content_id(content_id);
         return ComponentCheckResult::Unresolved(diagnostic);
@@ -145,6 +145,7 @@ mod tests {
         StoreEntry {
             id,
             name: name.to_string(),
+            author: String::new(),
             version: version.to_string(),
             type_id,
             download_links: vec![DownloadLink {
@@ -189,6 +190,30 @@ mod tests {
 
         let result = check_component(&component, &store_entries, &lookup);
         assert!(matches!(result, ComponentCheckResult::Update(_)));
+    }
+
+    #[test]
+    fn same_named_entries_evaluate_the_latest_changed() {
+        let component = make_component("Clock", "org.example.clock");
+        let mut older = make_entry(100, "Clock", "3.0.0", 708);
+        older.changed_date = "2026-09-01T00:00:00+00:00".to_string();
+        let mut newer = make_entry(200, "Clock", "2.0.0", 709);
+        newer.changed_date = "2026-10-01T00:00:00+00:00".to_string();
+        let store_entries = vec![older, newer];
+        let wid = HashMap::new();
+        let reg = HashMap::new();
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+
+        let ComponentCheckResult::Update(update) =
+            check_component(&component, &store_entries, &lookup)
+        else {
+            panic!("expected an update from the latest changed entry");
+        };
+        assert_eq!(update.content_id, 200);
+        assert_eq!(update.latest_version, "2.0.0");
     }
 
     #[test]

@@ -15,12 +15,18 @@ pub(crate) fn check_components(
     registry_components: &[InstalledComponent],
     client: &ApiClient,
     store_entries: &[StoreEntry],
+    store_answered: bool,
     lookup: &IdLookup,
     result: &mut UpdateCheckResult,
 ) -> crate::Result<()> {
-    let resolved: Vec<(&InstalledComponent, u64)> = registry_components
+    let resolutions: Vec<(&InstalledComponent, Option<u64>)> = registry_components
         .iter()
-        .filter_map(|c| resolution::resolve_content_id(c, store_entries, lookup).map(|id| (c, id)))
+        .map(|c| (c, resolution::resolve_content_id(c, store_entries, lookup)))
+        .collect();
+
+    let resolved: Vec<(&InstalledComponent, u64)> = resolutions
+        .iter()
+        .filter_map(|(component, id)| (*id).map(|id| (*component, id)))
         .collect();
 
     // Reuse any entries already present in store_entries; fetch only the rest.
@@ -37,13 +43,15 @@ pub(crate) fn check_components(
     // A per-id lookup failure (a gone entry, a bad status, a timeout, a
     // dropped connection) degrades that component to a diagnostic below.
     // Only a lookup that could not connect to the store at all proves the
-    // store unreachable, and only when every lookup failed that way and no
-    // store entry is available from anywhere else — then the run fails.
+    // store unreachable, and only when the store answered no request (catalog
+    // or per-id) and no store entry is available from anywhere else — then
+    // the run fails. An empty catalog page is an answer, so a store that
+    // reported zero entries has been reached and its lookups stay diagnostics.
     let mut fetched: HashMap<u64, StoreEntry> = HashMap::new();
     let mut connect_failures = 0usize;
     let mut last_connect_error: Option<Error> = None;
-    for (id, result) in missing_ids.iter().zip(client.fetch_details(&missing_ids)) {
-        match result {
+    for (id, detail) in missing_ids.iter().zip(client.fetch_details(&missing_ids)) {
+        match detail.result {
             Ok(entry) => {
                 fetched.insert(*id, entry);
             }
@@ -60,7 +68,7 @@ pub(crate) fn check_components(
     if let Some(err) = last_connect_error
         && connect_failures == missing_ids.len()
         && fetched.is_empty()
-        && store_entries.is_empty()
+        && !store_answered
     {
         return Err(err);
     }
@@ -93,17 +101,15 @@ pub(crate) fn check_components(
         }
     }
 
-    for component in registry_components {
-        if !resolved
-            .iter()
-            .any(|(c, _)| c.directory_name == component.directory_name)
-        {
-            let diagnostic = Diagnostic::new(
-                component.name.clone(),
-                "could not match to kde store entry".to_string(),
-            );
-            result.add_unresolved(diagnostic);
+    for (component, resolved) in &resolutions {
+        if resolved.is_some() {
+            continue;
         }
+        let diagnostic = Diagnostic::new(
+            component.name.clone(),
+            "could not match to kde store entry".to_string(),
+        );
+        result.add_unresolved(diagnostic);
     }
 
     Ok(())

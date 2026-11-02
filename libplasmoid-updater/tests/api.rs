@@ -30,9 +30,9 @@ impl Reporter for Recording {
     }
 }
 
-fn config(store_url: &str) -> Config {
+fn config(api_url: &str) -> Config {
     Config::new()
-        .with_store_url(store_url)
+        .with_api_url(api_url)
         .with_skip_plasma_detection(true)
         .with_inhibit_idle(false)
 }

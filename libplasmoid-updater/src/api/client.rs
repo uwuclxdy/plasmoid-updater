@@ -4,7 +4,7 @@
 // and KDE Discover (https://invent.kde.org/plasma/discover) -
 // GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 
-use std::{thread, time::Duration};
+use std::{collections::HashSet, thread, time::Duration};
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
@@ -27,7 +27,7 @@ pub(crate) struct ApiClient {
 }
 
 impl ApiClient {
-    /// Creates a new API client pointed at `config.store_url`.
+    /// Creates a new API client pointed at `config.api_url`.
     ///
     /// # Errors
     ///
@@ -42,7 +42,7 @@ impl ApiClient {
 
         Ok(Self {
             client,
-            base_url: config.store_url.clone(),
+            base_url: config.api_url.clone(),
         })
     }
 
@@ -52,67 +52,117 @@ impl ApiClient {
     }
 
     /// Fetches all content from specified categories with parallel page fetching.
-    pub fn fetch_all(&self, categories: &[ComponentType]) -> Result<Vec<StoreEntry>> {
+    ///
+    /// A later page that cannot be read is skipped and reported. Page 0 is
+    /// different: it carries the total that paging needs, so when it fails
+    /// after its retries the catalog is empty for this run, the warning says
+    /// so, and only the per-id lookups of known ids can still resolve
+    /// anything. Entries are deduplicated by content id because the catalog
+    /// shifts under `sort=new` while later pages are in flight, and paging
+    /// stops at [`API_CONFIG.max_pages`].
+    pub fn fetch_all(&self, categories: &[ComponentType]) -> CatalogFetch {
         let category_str = build_category_string(categories);
-        let base_url = &self.base_url;
         let page_size = u32::from(API_CONFIG.page_size);
 
-        let first_url = format!(
-            "{base_url}/content/data?categories={category_str}&page=0&pagesize={page_size}&sort=new"
-        );
+        let first = self.fetch_page(&catalog_url(&self.base_url, &category_str, page_size, 0));
+        let mut answered = first.answered;
+        let Some(meta) = first.meta else {
+            if let Some(error) = &first.error {
+                log::warn!(
+                    target: "api",
+                    "catalog page 0 unavailable, so the catalog is empty for this run: {error}"
+                );
+            }
+            return CatalogFetch {
+                entries: Vec::new(),
+                answered,
+                error: first.error,
+            };
+        };
 
-        let (first_entries, meta) = self.fetch_page(&first_url)?;
-        let total_items = meta.total_items;
-
-        if total_items <= page_size {
-            return Ok(first_entries);
-        }
-
-        let total_pages = total_items.div_ceil(page_size);
-
-        if total_pages > 10 {
+        let Some(total_items) = meta.total_items else {
+            // Without a total the page count is unknown; page 0 is still a real
+            // answer, so keep what it listed and stop instead of guessing.
             log::warn!(
                 target: "api",
-                "store returned {total_items} items across {total_pages} pages; fetch may be slow"
+                "catalog page 0 has no totalitems; keeping its {} entries and fetching no further pages",
+                first.entries.len()
+            );
+            return CatalogFetch {
+                entries: first.entries,
+                answered,
+                error: None,
+            };
+        };
+
+        let wanted_pages = total_items.div_ceil(page_size);
+        let total_pages = wanted_pages.min(API_CONFIG.max_pages);
+        if wanted_pages > total_pages {
+            log::warn!(
+                target: "api",
+                "store reports {total_items} items ({wanted_pages} pages); fetching {total_pages} of them"
             );
         }
 
         let remaining_pages: Vec<u32> = (1..total_pages).collect();
-
-        let results: Vec<Result<(Vec<StoreEntry>, _)>> = remaining_pages
+        let results: Vec<(u32, Page)> = remaining_pages
             .par_iter()
             .map(|&page| {
-                let url = format!(
-                    "{base_url}/content/data?categories={category_str}&page={page}&pagesize={page_size}&sort=new"
-                );
-                self.fetch_page(&url)
+                (
+                    page,
+                    self.fetch_page(&catalog_url(&self.base_url, &category_str, page_size, page)),
+                )
             })
             .collect();
 
-        let mut all_entries = first_entries;
-        for (entries, _) in results.into_iter().collect::<Result<Vec<_>>>()? {
-            all_entries.extend(entries);
+        let mut entries = first.entries;
+        for (page, fetched) in results {
+            answered |= fetched.answered;
+            if let Some(error) = &fetched.error {
+                log::warn!(target: "api", "catalog page {page} unavailable, skipping it: {error}");
+                continue;
+            }
+            entries.extend(fetched.entries);
         }
 
-        Ok(all_entries)
+        let mut seen = HashSet::with_capacity(entries.len());
+        entries.retain(|entry| seen.insert(entry.id));
+
+        CatalogFetch {
+            entries,
+            answered,
+            error: None,
+        }
     }
 
     /// Fetches content details of multiple components.
-    pub fn fetch_details(&self, content_ids: &[u64]) -> Vec<Result<StoreEntry>> {
+    pub fn fetch_details(&self, content_ids: &[u64]) -> Vec<DetailFetch> {
         content_ids
             .par_iter()
             .map(|&id| {
                 let url = format!("{}/content/data/{id}", self.base_url);
-                let (entries, _) = self.fetch_page(&url)?;
-                entries.into_iter().next().ok_or_else(|| Error::Parse {
-                    what: "store entry",
-                    detail: format!("content id {id}: empty data"),
-                })
+                let page = self.fetch_page(&url);
+                let answered = page.answered;
+                let result = match page.error {
+                    Some(error) => Err(error),
+                    None => page.entries.into_iter().next().ok_or_else(|| Error::Parse {
+                        what: "store entry",
+                        detail: format!("content id {id}: empty data"),
+                    }),
+                };
+                DetailFetch { result, answered }
             })
             .collect()
     }
 
-    fn fetch_page(&self, url: &str) -> Result<(Vec<StoreEntry>, Meta)> {
+    /// Fetches one page, recording whether the store answered it at all.
+    fn fetch_page(&self, url: &str) -> Page {
+        let mut answered = false;
+        let result = self.request_page(url, &mut answered);
+        Page::from_result(result, answered)
+    }
+
+    fn request_page(&self, url: &str, answered: &mut bool) -> Result<(Vec<StoreEntry>, Meta)> {
         let mut backoff_ms = API_CONFIG.initial_backoff_ms;
         let attempts = API_CONFIG.max_retries;
 
@@ -120,7 +170,10 @@ impl ApiClient {
             let last_attempt = attempt + 1 >= attempts;
 
             let r = match self.client.get(url).send() {
-                Ok(response) => response,
+                Ok(response) => {
+                    *answered = true;
+                    response
+                }
                 Err(e) if !last_attempt => {
                     log::warn!(
                         target: "api",
@@ -228,6 +281,59 @@ impl ApiClient {
     }
 }
 
+/// The catalog entries one check could read, plus whether the store answered
+/// any of its page requests at all.
+pub(crate) struct CatalogFetch {
+    pub(crate) entries: Vec<StoreEntry>,
+    /// True when at least one page got an HTTP response, even a bad one.
+    pub(crate) answered: bool,
+    /// The page-0 error when no page could be read, for a run that cannot
+    /// tell "empty catalog" from "store unreachable".
+    pub(crate) error: Option<Error>,
+}
+
+/// One per-id lookup's outcome, plus whether the store answered it at all.
+pub(crate) struct DetailFetch {
+    pub(crate) result: Result<StoreEntry>,
+    /// True when the store sent an HTTP response, even one whose body then
+    /// broke off.
+    pub(crate) answered: bool,
+}
+
+/// One catalog page's outcome. Reading a page never fails the run: the page
+/// carries its error and the caller decides whether to skip it or give up.
+struct Page {
+    entries: Vec<StoreEntry>,
+    meta: Option<Meta>,
+    error: Option<Error>,
+    answered: bool,
+}
+
+impl Page {
+    fn from_result(result: Result<(Vec<StoreEntry>, Meta)>, answered: bool) -> Self {
+        match result {
+            Ok((entries, meta)) => Self {
+                entries,
+                meta: Some(meta),
+                error: None,
+                answered,
+            },
+            Err(error) => Self {
+                entries: Vec::new(),
+                meta: None,
+                error: Some(error),
+                answered,
+            },
+        }
+    }
+}
+
+fn catalog_url(base_url: &str, categories: &str, page_size: u32, page: u32) -> String {
+    format!(
+        "{base_url}/content/data?categories={categories}&page={page}&pagesize={page_size}&sort=new"
+    )
+}
+
 /// Sleeps for the current backoff, then doubles it for the next attempt.
 fn backoff_sleep(backoff_ms: &mut u32) {
     thread::sleep(Duration::from_millis(u64::from(*backoff_ms)));
@@ -242,4 +348,139 @@ fn parse_retry_after(response: &reqwest::blocking::Response) -> Option<u64> {
         .ok()?
         .parse()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn entry(id: u64) -> String {
+        format!(
+            "<content><id>{id}</id><name>Item {id}</name><version>2.0</version>\
+             <typeid>705</typeid><changed>2026-10-01</changed></content>"
+        )
+    }
+
+    fn ocs(total: Option<u32>, content: &str) -> String {
+        let total_items = total
+            .map(|items| format!("<totalitems>{items}</totalitems>"))
+            .unwrap_or_default();
+        format!(
+            "<?xml version=\"1.0\"?>\n<ocs><meta><status>ok</status><statuscode>100</statuscode>\
+             <message></message>{total_items}<itemsperpage>100</itemsperpage>\
+             </meta><data>{content}</data></ocs>"
+        )
+    }
+
+    fn page_of(target: &str) -> usize {
+        target
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("page="))
+            .and_then(|page| page.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Serves `bodies[page]` for each catalog page request, and counts them.
+    fn serve(bodies: Vec<String>) -> (String, Arc<AtomicUsize>) {
+        let bodies = Arc::new(bodies);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&requests);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let bodies = Arc::clone(&bodies);
+                let served = Arc::clone(&served);
+                std::thread::spawn(move || respond(stream, &bodies, &served));
+            }
+        });
+        (format!("http://127.0.0.1:{port}/ocs/v1"), requests)
+    }
+
+    fn respond(mut stream: TcpStream, bodies: &[String], requests: &AtomicUsize) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if header == "\r\n" || header == "\n" => break,
+                Ok(_) => {}
+            }
+        }
+        let target = request_line.split_whitespace().nth(1).unwrap_or("");
+        requests.fetch_add(1, Ordering::SeqCst);
+        let body = bodies.get(page_of(target)).cloned().unwrap_or_default();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
+    }
+
+    fn client_for(base_url: String) -> ApiClient {
+        ApiClient::new(&Config::new().with_api_url(base_url)).unwrap()
+    }
+
+    #[test]
+    fn catalog_pages_are_deduplicated_by_content_id() {
+        let (base, _requests) = serve(vec![
+            ocs(Some(101), &entry(1)),
+            ocs(Some(101), &format!("{}{}", entry(1), entry(2))),
+        ]);
+        let catalog = client_for(base).fetch_all(&[ComponentType::PlasmaWidget]);
+        let ids: Vec<u64> = catalog.entries.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert!(catalog.answered);
+    }
+
+    #[test]
+    fn catalog_page_without_totalitems_keeps_its_entries_and_fetches_no_more_pages() {
+        let (base, requests) = serve(vec![ocs(None, &entry(1))]);
+        let catalog = client_for(base).fetch_all(&[ComponentType::PlasmaWidget]);
+        let ids: Vec<u64> = catalog.entries.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![1]);
+        assert!(catalog.answered);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "an unknown total must not drive further page requests"
+        );
+    }
+
+    #[test]
+    fn a_failed_first_page_leaves_the_catalog_empty_and_asks_for_no_more() {
+        let (base, _requests) = serve(vec![
+            "<html>maintenance</html>".to_string(),
+            ocs(Some(200), &entry(1)),
+        ]);
+        let catalog = client_for(base).fetch_all(&[ComponentType::PlasmaWidget]);
+        assert!(
+            catalog.entries.is_empty(),
+            "without page 0 there is no total, so page 1 must not be read"
+        );
+        assert!(catalog.answered, "a garbage page is still an answer");
+        assert!(catalog.error.is_some());
+    }
+
+    #[test]
+    fn a_bad_page_after_the_first_does_not_stop_later_pages() {
+        let (base, _requests) = serve(vec![
+            ocs(Some(300), &entry(1)),
+            "<html>maintenance</html>".to_string(),
+            ocs(Some(300), &entry(3)),
+        ]);
+        let catalog = client_for(base).fetch_all(&[ComponentType::PlasmaWidget]);
+        let ids: Vec<u64> = catalog.entries.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert!(catalog.answered);
+    }
 }

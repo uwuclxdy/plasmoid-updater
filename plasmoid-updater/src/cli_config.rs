@@ -22,7 +22,7 @@ fn config_path() -> Option<PathBuf> {
 /// non-empty. The one place the bin calls the library's URL builder.
 fn with_api_url(config: libplasmoid_updater::Config) -> libplasmoid_updater::Config {
     match std::env::var(API_URL_ENV) {
-        Ok(url) if !url.is_empty() => config.with_store_url(url),
+        Ok(url) if !url.is_empty() => config.with_api_url(url),
         _ => config,
     }
 }

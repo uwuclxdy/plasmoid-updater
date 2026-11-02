@@ -6,15 +6,18 @@ use serde::{Deserialize, Serialize};
 
 /// KDE Store category IDs for supported component types.
 const CATEGORY_PLASMA_WIDGET: u16 = 705;
+/// The store's "Various Plasma 6 Improvements" widget subcategory. The 705
+/// listing does not expand to it, so a catalog query has to name it.
+const CATEGORY_PLASMA_WIDGET_IMPROVEMENTS: u16 = 713;
 const CATEGORY_WALLPAPER_PLUGIN: u16 = 715;
 const CATEGORY_KWIN_EFFECT: u16 = 719;
 const CATEGORY_KWIN_SCRIPT: u16 = 720;
 const CATEGORY_KWIN_SWITCHER: u16 = 721;
 const CATEGORY_GLOBAL_THEME: u16 = 722;
-const CATEGORY_PLASMA_STYLE: u16 = 709;
+const CATEGORY_PLASMA_STYLE: u16 = 104;
 const CATEGORY_AURORAE_DECORATION: u16 = 114;
 const CATEGORY_COLOR_SCHEME: u16 = 112;
-const CATEGORY_SPLASH_SCREEN: u16 = 708;
+const CATEGORY_SPLASH_SCREEN: u16 = 716;
 const CATEGORY_SDDM_THEME: u16 = 101;
 const CATEGORY_ICON_THEME: u16 = 132;
 const CATEGORY_WALLPAPER: u16 = 299;
@@ -73,21 +76,44 @@ impl ComponentType {
         }
     }
 
+    /// The store categories a catalog query must name to list every entry of
+    /// this type.
+    ///
+    /// Entries are filed under their subcategory id, and the store's 705
+    /// listing expands to 706-712 only: entries filed under 713 need naming
+    /// on their own (measured 2026-11-02 against `GET /content/data`).
+    pub(crate) const fn catalog_ids(self) -> &'static [u16] {
+        match self {
+            Self::PlasmaWidget => &[CATEGORY_PLASMA_WIDGET, CATEGORY_PLASMA_WIDGET_IMPROVEMENTS],
+            Self::WallpaperPlugin => &[CATEGORY_WALLPAPER_PLUGIN],
+            Self::KWinEffect => &[CATEGORY_KWIN_EFFECT],
+            Self::KWinScript => &[CATEGORY_KWIN_SCRIPT],
+            Self::KWinSwitcher => &[CATEGORY_KWIN_SWITCHER],
+            Self::GlobalTheme => &[CATEGORY_GLOBAL_THEME],
+            Self::PlasmaStyle => &[CATEGORY_PLASMA_STYLE],
+            Self::AuroraeDecoration => &[CATEGORY_AURORAE_DECORATION],
+            Self::ColorScheme => &[CATEGORY_COLOR_SCHEME],
+            Self::SplashScreen => &[CATEGORY_SPLASH_SCREEN],
+            Self::SddmTheme => &[CATEGORY_SDDM_THEME],
+            Self::IconTheme => &[CATEGORY_ICON_THEME],
+            Self::Wallpaper => &[CATEGORY_WALLPAPER],
+        }
+    }
+
     /// Returns true if the given store `type_id` belongs to this component type.
     ///
-    /// The OCS API returns subcategory IDs in the `typeid` field. For example,
-    /// PlasmaWidget queries with parent category 705 but store entries have
-    /// specific subcategory IDs (706 "Applets", 708 "Clocks", 710 "Monitoring",
-    /// etc.). This method accounts for those parent-child relationships.
+    /// The OCS API returns the subcategory id in an entry's `typeid` field, so
+    /// a widget filed under "Plasma 6 Clocks" carries 708, not 705. Only the
+    /// live widget subcategories 706-713 match: the rest of the 700-range is
+    /// other component kinds (715 wallpaper plugins, 716 splash screens, 717
+    /// window decorations, 722 global themes, 724 sysmon applet designs;
+    /// measured 2026-11-02 against `GET /content/categories`). The 723
+    /// category lists only typeid 724 entries, so no entry carries 723.
     pub(crate) const fn matches_type_id(self, type_id: u16) -> bool {
         if self.category_id() == type_id {
             return true;
         }
-        // PlasmaWidget (705) is the parent of all subcategories in the 700-range.
-        // Using the full range is safe because other 700-range types (e.g. 708
-        // SplashScreen, 709 PlasmaStyle) have their own `category_id()` which
-        // fires first via the direct match above.
-        matches!((self, type_id), (Self::PlasmaWidget, 700..=799))
+        matches!((self, type_id), (Self::PlasmaWidget, 706..=713))
     }
 
     pub(crate) const fn kpackage_type(self) -> Option<&'static str> {
@@ -462,6 +488,8 @@ impl AvailableUpdate {
 pub(crate) struct StoreEntry {
     pub id: u64,
     pub name: String,
+    /// `<personid>` in the OCS payload: the uploader's store username.
+    pub author: String,
     pub version: String,
     pub type_id: u16,
     pub download_links: Vec<DownloadLink>,
@@ -495,6 +523,15 @@ pub(crate) struct KPluginInfo {
     pub description: Option<String>,
     #[serde(rename = "Icon")]
     pub icon: Option<String>,
+    #[serde(rename = "Authors", default)]
+    pub authors: Vec<KPluginAuthor>,
+}
+
+/// One `KPlugin.Authors` entry of a component's `metadata.json`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct KPluginAuthor {
+    #[serde(rename = "Name")]
+    pub name: Option<String>,
 }
 
 impl PackageMetadata {
@@ -504,6 +541,21 @@ impl PackageMetadata {
 
     pub(crate) fn version(&self) -> Option<&str> {
         self.kplugin.as_ref()?.version.as_deref()
+    }
+
+    /// The author names the metadata records, trimmed and without empties.
+    pub(crate) fn author_names(&self) -> Vec<String> {
+        let Some(kplugin) = &self.kplugin else {
+            return Vec::new();
+        };
+        kplugin
+            .authors
+            .iter()
+            .filter_map(|author| author.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -599,14 +651,37 @@ mod tests {
     }
 
     #[test]
-    fn plasma_widget_matches_extended_subcategories() {
-        assert!(ComponentType::PlasmaWidget.matches_type_id(705)); // parent
-        assert!(ComponentType::PlasmaWidget.matches_type_id(706)); // existing
-        assert!(ComponentType::PlasmaWidget.matches_type_id(714)); // previously missing
-        assert!(ComponentType::PlasmaWidget.matches_type_id(718)); // previously missing
-        assert!(ComponentType::PlasmaWidget.matches_type_id(723)); // existing
-        assert!(!ComponentType::PlasmaWidget.matches_type_id(100)); // unrelated
-        assert!(!ComponentType::PlasmaWidget.matches_type_id(800)); // out of range
+    fn plasma_widget_matches_its_live_subcategories() {
+        for id in [705, 706, 707, 708, 709, 710, 711, 712, 713] {
+            assert!(
+                ComponentType::PlasmaWidget.matches_type_id(id),
+                "widget type id {id}"
+            );
+        }
+        assert!(!ComponentType::PlasmaWidget.matches_type_id(100));
+        assert!(!ComponentType::PlasmaWidget.matches_type_id(800));
+    }
+
+    #[test]
+    fn plasma_widget_does_not_match_other_component_types() {
+        // Other kinds sharing the 700-range (measured 2026-11-02 against
+        // GET /content/categories; 714 is not listed there).
+        for id in [714, 715, 716, 722, 723, 724] {
+            assert!(
+                !ComponentType::PlasmaWidget.matches_type_id(id),
+                "widget type id {id}"
+            );
+        }
+        assert!(!ComponentType::PlasmaWidget.matches_type_id(717)); // window decorations
+        assert!(!ComponentType::PlasmaWidget.matches_type_id(719)); // kwin effects
+    }
+
+    #[test]
+    fn category_ids_match_the_live_store() {
+        assert_eq!(ComponentType::PlasmaWidget.category_id(), 705);
+        assert_eq!(ComponentType::PlasmaStyle.category_id(), 104);
+        assert_eq!(ComponentType::SplashScreen.category_id(), 716);
+        assert_eq!(ComponentType::GlobalTheme.category_id(), 722);
     }
 
     #[test]

@@ -71,7 +71,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Checks for available updates to installed KDE Plasma components.
 ///
 /// Scans the local filesystem for installed KDE components and queries the
-/// store at [`Config::store_url`] for newer versions.
+/// store at [`Config::api_url`] for newer versions.
 ///
 /// Components matching [`Config::excluded_packages`] or
 /// [`Config::excluded_patterns`] leave `available_updates` and are listed in
@@ -87,7 +87,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// - [`Error::UnsupportedOs`] — not running on Linux
 /// - [`Error::NotKde`] — KDE Plasma not detected and
 ///   [`Config::skip_plasma_detection`] is unset
-/// - [`Error::MissingTool`] — a required tool (e.g. `bsdtar`) is missing
 /// - [`Error::Network`] — a store request failed
 /// - [`Error::RateLimited`] — the store asked the caller to back off
 /// - [`Error::Api`] — the store returned a non-success status
@@ -170,6 +169,7 @@ impl CheckResult {
 ///
 /// Returns an [`Error`] when the run cannot start or finish:
 /// - [`Error::AlreadyRunning`] — another run holds the update lock
+/// - [`Error::MissingTool`] — `bsdtar` is missing, needed to extract archives
 /// - the environment and store errors [`check`] documents
 ///
 /// A component that fails to download, extract or install is not an `Error` —
@@ -178,6 +178,7 @@ impl CheckResult {
 pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> {
     let _lock = installer::UpdateLock::acquire()?;
     crate::utils::validate_environment(config.skip_plasma_detection)?;
+    crate::utils::require_extractor()?;
 
     reporter.event(&Event::Checking);
 
@@ -225,6 +226,7 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
 ///
 /// Returns an [`Error`] when the run cannot start or finish:
 /// - [`Error::AlreadyRunning`] — another run holds the update lock
+/// - [`Error::MissingTool`] — `bsdtar` is missing, needed to extract archives
 /// - the environment and store errors [`check`] documents
 ///
 /// Per-component problems become [`Failure`] rows in [`UpdateResult::failed`].
@@ -239,6 +241,7 @@ pub fn install(
 
     let _lock = installer::UpdateLock::acquire()?;
     crate::utils::validate_environment(config.skip_plasma_detection)?;
+    crate::utils::require_extractor()?;
 
     let api_client = api::ApiClient::new(config)?;
 

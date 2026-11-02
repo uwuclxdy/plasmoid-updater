@@ -178,6 +178,25 @@ impl Sandbox {
     }
 }
 
+/// A widget entry the fake category listing serves when the query names its
+/// subcategory id.
+#[derive(Clone, Copy)]
+pub struct CatalogWidget {
+    pub id: u64,
+    pub name: &'static str,
+    pub type_id: u16,
+    pub version: &'static str,
+}
+
+/// What `<meta><totalitems>` reports on a catalog page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TotalItems {
+    /// The page's own item count: one entry on a listing page, zero otherwise.
+    Default,
+    /// A fixed count on every page.
+    Items(u32),
+}
+
 /// What the fake store advertises for the fake color scheme.
 pub struct Listing {
     pub version: &'static str,
@@ -192,6 +211,23 @@ pub struct Listing {
     pub per_id_fails_first: usize,
     /// Whether the per-id lookup closes the connection without answering.
     pub per_id_drops: bool,
+    /// Whether the per-id lookup redirects to a port nothing listens on, so
+    /// following the redirect fails to connect while the catalog answered.
+    pub per_id_connects_nowhere: bool,
+    /// Whether the per-id lookup answers with a `200` status line and then
+    /// drops the connection mid-body.
+    pub per_id_drops_mid_body: bool,
+    /// Whether the catalog listing redirects to a port nothing listens on, so
+    /// following the redirect fails to connect while the store is up.
+    pub catalog_connects_nowhere: bool,
+    /// Whether the first catalog page answers `200 OK` with a body that is
+    /// not OCS XML.
+    pub catalog_garbage: bool,
+    /// A widget entry the category listing serves when the query names its
+    /// subcategory id.
+    pub widget: Option<CatalogWidget>,
+    /// The `<totalitems>` every catalog page reports.
+    pub total_items: TotalItems,
 }
 
 impl Default for Listing {
@@ -203,6 +239,12 @@ impl Default for Listing {
             per_id_fails: false,
             per_id_fails_first: 0,
             per_id_drops: false,
+            per_id_connects_nowhere: false,
+            per_id_drops_mid_body: false,
+            catalog_connects_nowhere: false,
+            catalog_garbage: false,
+            widget: None,
+            total_items: TotalItems::Default,
         }
     }
 }
@@ -211,6 +253,7 @@ impl Default for Listing {
 /// library: the category listing, the per-id content lookup, and the download.
 pub struct FakeStore {
     base: String,
+    served: Arc<Served>,
 }
 
 impl FakeStore {
@@ -222,6 +265,10 @@ impl FakeStore {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let host = format!("http://127.0.0.1:{port}");
+        let dead_port = {
+            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
         let entry = format!(
             "<content details=\"full\"><id>{SCHEME_ID}</id><name>{SCHEME_NAME}</name>\
              <version>{version}</version><typeid>{COLOR_SCHEME_CATEGORY}</typeid>\
@@ -233,28 +280,54 @@ impl FakeStore {
             version = listing.version,
             size_kb = archive.len().div_ceil(1024),
         );
+        let widget = listing.widget.map(|widget| {
+            let entry = format!(
+                "<content details=\"full\"><id>{}</id><name>{}</name>\
+                 <version>{}</version><typeid>{}</typeid>\
+                 <changed>2026-10-01T00:00:00+00:00</changed>\
+                 <downloadlink1>{host}/dl/fake-widget.tar.gz</downloadlink1>\
+                 <download_version1>{}</download_version1></content>",
+                widget.id, widget.name, widget.version, widget.type_id, widget.version,
+            );
+            (widget.type_id, entry)
+        });
         let state = Arc::new(Served {
             entry,
+            widget,
             archive,
             in_catalog: listing.in_catalog,
             per_id_fails: listing.per_id_fails,
             per_id_fails_left: AtomicUsize::new(listing.per_id_fails_first),
             per_id_drops: listing.per_id_drops,
+            per_id_connects_nowhere: listing.per_id_connects_nowhere,
+            per_id_drops_mid_body: listing.per_id_drops_mid_body,
+            catalog_connects_nowhere: listing.catalog_connects_nowhere,
+            catalog_garbage: listing.catalog_garbage,
+            total_items: listing.total_items,
+            dead_port,
+            catalog_requests: AtomicUsize::new(0),
         });
+        let shared = Arc::clone(&state);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let state = Arc::clone(&state);
+                let state = Arc::clone(&shared);
                 std::thread::spawn(move || serve(stream, &state));
             }
         });
         Self {
             base: format!("{host}/ocs/v1"),
+            served: state,
         }
     }
 
-    /// The OCS base URL to hand to `Config::with_store_url`.
+    /// The OCS base URL to hand to `Config::with_api_url`.
     pub fn url(&self) -> &str {
         &self.base
+    }
+
+    /// How many catalog listing requests the store has answered.
+    pub fn catalog_requests(&self) -> usize {
+        self.served.catalog_requests.load(Ordering::SeqCst)
     }
 }
 
@@ -268,11 +341,19 @@ pub fn dead_store_url() -> String {
 
 struct Served {
     entry: String,
+    widget: Option<(u16, String)>,
     archive: Vec<u8>,
     in_catalog: bool,
     per_id_fails: bool,
     per_id_fails_left: AtomicUsize,
     per_id_drops: bool,
+    per_id_connects_nowhere: bool,
+    per_id_drops_mid_body: bool,
+    catalog_connects_nowhere: bool,
+    catalog_garbage: bool,
+    total_items: TotalItems,
+    dead_port: u16,
+    catalog_requests: AtomicUsize,
 }
 
 fn serve(mut stream: TcpStream, served: &Served) {
@@ -291,6 +372,7 @@ fn serve(mut stream: TcpStream, served: &Served) {
     }
     let target = request_line.split_whitespace().nth(1).unwrap_or("");
     let entry = served.entry.as_str();
+    let mut location: Option<String> = None;
     let (status, body): (&str, Vec<u8>) = if target.starts_with("/dl/") {
         ("200 OK", served.archive.clone())
     } else if target == format!("/ocs/v1/content/data/{SCHEME_ID}") {
@@ -298,40 +380,79 @@ fn serve(mut stream: TcpStream, served: &Served) {
             .per_id_fails_left
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
-        if served.per_id_drops {
+        if served.per_id_connects_nowhere {
+            location = Some(format!("http://127.0.0.1:{}/nope", served.dead_port));
+            ("302 Found", Vec::new())
+        } else if served.per_id_drops_mid_body {
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(b"<ocs><meta>");
+            return;
+        } else if served.per_id_drops {
             return;
         } else if served.per_id_fails || fail_now {
             ("503 Service Unavailable", Vec::new())
         } else {
-            ("200 OK", ocs(1, entry).into_bytes())
+            ("200 OK", ocs(Some(1), entry).into_bytes())
         }
     } else if let Some(query) = target.strip_prefix("/ocs/v1/content/data?") {
-        let first_page = query.split('&').any(|kv| kv == "page=0");
-        let lists_schemes = query
-            .split('&')
-            .filter_map(|kv| kv.strip_prefix("categories="))
-            .flat_map(|cats| cats.split('x'))
-            .any(|cat| cat == COLOR_SCHEME_CATEGORY.to_string());
-        if first_page && lists_schemes && served.in_catalog {
-            ("200 OK", ocs(1, entry).into_bytes())
+        served.catalog_requests.fetch_add(1, Ordering::SeqCst);
+        if served.catalog_connects_nowhere {
+            location = Some(format!("http://127.0.0.1:{}/nope", served.dead_port));
+            ("302 Found", Vec::new())
         } else {
-            ("200 OK", ocs(0, "").into_bytes())
+            let names = |category: u16| {
+                query
+                    .split('&')
+                    .filter_map(|kv| kv.strip_prefix("categories="))
+                    .flat_map(|cats| cats.split('x'))
+                    .any(|cat| cat == category.to_string())
+            };
+            let first_page = query.split('&').any(|kv| kv == "page=0");
+            let mut content = String::new();
+            let mut listed = 0u32;
+            if first_page && served.in_catalog && names(COLOR_SCHEME_CATEGORY) {
+                content.push_str(entry);
+                listed += 1;
+            }
+            if first_page
+                && let Some((type_id, widget)) = &served.widget
+                && names(*type_id)
+            {
+                content.push_str(widget);
+                listed += 1;
+            }
+            let total = match served.total_items {
+                TotalItems::Items(items) => Some(items),
+                TotalItems::Default => Some(listed),
+            };
+            if first_page && served.catalog_garbage {
+                ("200 OK", b"<html>maintenance</html>".to_vec())
+            } else {
+                ("200 OK", ocs(total, &content).into_bytes())
+            }
         }
     } else {
         ("404 Not Found", Vec::new())
     };
+    let location_header = location
+        .map(|url| format!("Location: {url}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{location_header}\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&body);
 }
 
-fn ocs(total: u32, content: &str) -> String {
+fn ocs(total: Option<u32>, content: &str) -> String {
+    let total_items = total
+        .map(|items| format!("<totalitems>{items}</totalitems>"))
+        .unwrap_or_default();
     format!(
         "<?xml version=\"1.0\"?>\n<ocs><meta><status>ok</status><statuscode>100</statuscode>\
-         <message></message><totalitems>{total}</totalitems><itemsperpage>100</itemsperpage>\
+         <message></message>{total_items}<itemsperpage>100</itemsperpage>\
          </meta><data>{content}</data></ocs>"
     )
 }

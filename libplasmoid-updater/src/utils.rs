@@ -17,8 +17,13 @@ pub(crate) fn validate_environment(skip_plasma_detection: bool) -> crate::Result
     if !plasma_found {
         return Err(Error::NotKde);
     }
-    check_dependency("bsdtar")?;
     Ok(())
+}
+
+/// Fails when `bsdtar` is not on `PATH`. Only installs extract archives, so
+/// only [`update`](crate::update) and [`install`](crate::install) need it.
+pub(crate) fn require_extractor() -> crate::Result<()> {
+    check_dependency("bsdtar")
 }
 
 fn check_dependency(name: &'static str) -> crate::Result<()> {
@@ -250,5 +255,70 @@ mod tests {
     fn compile_returns_none_when_empty_or_all_invalid() {
         assert!(compile_exclude_patterns(&[]).is_none());
         assert!(compile_exclude_patterns(&["(".to_string()]).is_none());
+    }
+
+    const CHILD_FLAG: &str = "PLASMOID_UPDATER_ENV_CHILD";
+    const MARKER_VAR: &str = "PLASMOID_UPDATER_ENV_MARKER";
+
+    /// The `which` binary the parent resolves, so a child `PATH` can hold it
+    /// alone: tool lookups then run against a path with no tools in it.
+    fn which_on_path() -> std::path::PathBuf {
+        let path = std::env::var_os("PATH")
+            .expect("PATH is unset; the child's tool lookups would fail without `which`");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("which"))
+            .find(|candidate| candidate.is_file())
+            .expect("no `which` on PATH; the child would read every tool as missing")
+    }
+
+    /// Runs the body in a child process whose `PATH` holds `which` and nothing
+    /// else: setting env in-process needs `unsafe`, which the workspace forbids.
+    #[test]
+    fn check_does_not_require_bsdtar_but_installs_do() {
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            std::fs::write(std::env::var(MARKER_VAR).unwrap(), b"ok").unwrap();
+            assert!(
+                super::check_dependency("which").is_ok(),
+                "the child's PATH must resolve `which`, or every tool reads as missing"
+            );
+            assert!(
+                super::validate_environment(true).is_ok(),
+                "check must not need bsdtar on PATH"
+            );
+            assert!(
+                matches!(
+                    super::require_extractor(),
+                    Err(crate::Error::MissingTool { tool: "bsdtar" })
+                ),
+                "update and install still need bsdtar"
+            );
+            return;
+        }
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let path = sandbox.path().join("bin");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::copy(which_on_path(), path.join("which")).unwrap();
+        let marker = sandbox.path().join("child-done");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "check_does_not_require_bsdtar_but_installs_do",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", &path)
+            .env(CHILD_FLAG, "1")
+            .env(MARKER_VAR, &marker)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && marker.exists(),
+            "child run failed ({}; body completed: {})\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            marker.exists(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }

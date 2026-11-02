@@ -10,6 +10,13 @@ use crate::{
 
 use super::IdLookup;
 
+/// The store entries a check could read, and whether the store answered any
+/// request at all.
+pub(crate) struct StoreFetch {
+    pub(crate) entries: Vec<StoreEntry>,
+    pub(crate) answered: bool,
+}
+
 pub(crate) fn partition_components(
     components: Vec<InstalledComponent>,
 ) -> (Vec<InstalledComponent>, Vec<InstalledComponent>) {
@@ -31,9 +38,12 @@ pub(crate) fn fetch_store_entries(
     client: &ApiClient,
     regular_components: &[InstalledComponent],
     lookup: &IdLookup,
-) -> Result<Vec<StoreEntry>> {
+) -> Result<StoreFetch> {
     if regular_components.is_empty() {
-        return Ok(Vec::new());
+        return Ok(StoreFetch {
+            entries: Vec::new(),
+            answered: false,
+        });
     }
 
     let known_ids: HashSet<u64> = regular_components
@@ -44,31 +54,34 @@ pub(crate) fn fetch_store_entries(
     // Always fetch catalog for all distinct component types — not just unresolved ones.
     // When all IDs are locally known, skipping this forces one targeted request per ID.
     let types = distinct_types(regular_components);
-    let catalog_entries = client.fetch_all(&types)?;
+    let catalog = client.fetch_all(&types);
+    let mut answered = catalog.answered;
 
     // Targeted fetch only for known IDs genuinely absent from the catalog
     // (e.g. old/unlisted components that no longer appear in recent pages).
-    let catalog_ids: HashSet<u64> = catalog_entries.iter().map(|e| e.id).collect();
+    let listed_ids: HashSet<u64> = catalog.entries.iter().map(|e| e.id).collect();
     let missing_ids: Vec<u64> = known_ids
         .iter()
         .copied()
-        .filter(|id| !catalog_ids.contains(id))
+        .filter(|id| !listed_ids.contains(id))
         .collect();
 
-    let targeted_entries: Vec<StoreEntry> = if !missing_ids.is_empty() {
-        client
-            .fetch_details(&missing_ids)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut entries = catalog.entries;
+    for (id, detail) in missing_ids.iter().zip(client.fetch_details(&missing_ids)) {
+        answered |= detail.answered;
+        match detail.result {
+            Ok(entry) => entries.push(entry),
+            Err(error) => {
+                log::warn!(target: "api", "store entry {id} could not be fetched: {error}");
+            }
+        }
+    }
 
-    Ok(catalog_entries
-        .into_iter()
-        .chain(targeted_entries)
-        .collect())
+    if !answered && let Some(error) = catalog.error {
+        return Err(error);
+    }
+
+    Ok(StoreFetch { entries, answered })
 }
 
 fn resolve_id_locally(component: &InstalledComponent, lookup: &IdLookup) -> Option<u64> {

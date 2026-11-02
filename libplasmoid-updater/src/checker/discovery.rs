@@ -34,7 +34,14 @@ pub(crate) fn find_installed(system: bool) -> Result<Vec<InstalledComponent>> {
             component_type.user_path()
         };
 
-        if path.as_os_str().is_empty() || !path.exists() {
+        let exists = match path.try_exists() {
+            Ok(exists) => exists,
+            Err(e) => {
+                log::warn!(target: "discovery", "cannot access {}: {e}", path.display());
+                false
+            }
+        };
+        if path.as_os_str().is_empty() || !exists {
             continue;
         }
 
@@ -69,14 +76,34 @@ fn scan_directory(
 ) -> Result<Vec<InstalledComponent>> {
     let mut components = Vec::new();
 
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(components);
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!(target: "discovery", "cannot scan {}: {e}", dir.display());
+            return Ok(components);
+        }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log::warn!(
+                    target: "discovery",
+                    "cannot read an entry under {}: {e}",
+                    dir.display()
+                );
+                continue;
+            }
+        };
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                log::warn!(target: "discovery", "cannot stat {}: {e}", path.display());
+                continue;
+            }
         }
 
         let Some(directory_name) = path
@@ -87,8 +114,7 @@ fn scan_directory(
             continue;
         };
 
-        let Some(metadata) = read_metadata_json(&path).or_else(|| read_metadata_desktop(&path))
-        else {
+        let Some(metadata) = read_metadata(&path) else {
             continue;
         };
 
@@ -119,15 +145,43 @@ fn scan_directory(
     Ok(components)
 }
 
-fn read_metadata_json(package_dir: &Path) -> Option<PackageMetadata> {
-    let path = package_dir.join("metadata.json");
-    let content = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+/// Reads a component's metadata, preferring `metadata.json` over
+/// `metadata.desktop`. A file that exists but cannot be read or parsed is
+/// reported, so a present component is never dropped without a trace.
+pub(super) fn read_metadata(package_dir: &Path) -> Option<PackageMetadata> {
+    let json_path = package_dir.join("metadata.json");
+    match fs::read_to_string(&json_path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(metadata) => return Some(metadata),
+            Err(e) => log::warn!(
+                target: "discovery",
+                "invalid {}: {e}",
+                json_path.display()
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!(target: "discovery", "cannot read {}: {e}", json_path.display()),
+    }
+    read_metadata_desktop(package_dir)
 }
 
 fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
     let path = package_dir.join("metadata.desktop");
-    let entry = freedesktop_entry_parser::parse_entry(&path).ok()?;
+    match path.try_exists() {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(e) => {
+            log::warn!(target: "discovery", "cannot access {}: {e}", path.display());
+            return None;
+        }
+    }
+    let entry = match freedesktop_entry_parser::parse_entry(&path) {
+        Ok(entry) => entry,
+        Err(e) => {
+            log::warn!(target: "discovery", "invalid {}: {e}", path.display());
+            return None;
+        }
+    };
     let section = entry.section("Desktop Entry")?;
 
     let attr = |key: &str| section.attr(key).first().map(|s| s.to_string());
@@ -138,6 +192,83 @@ fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
             version: attr("X-KDE-PluginInfo-Version"),
             icon: attr("Icon"),
             description: attr("Comment"),
+            authors: attr("X-KDE-PluginInfo-Author")
+                .map(|name| vec![crate::types::KPluginAuthor { name: Some(name) }])
+                .unwrap_or_default(),
         }),
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::{Mutex, Once};
+
+    use super::*;
+
+    static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static CAPTURE: Capture = Capture;
+    static INSTALL: Once = Once::new();
+
+    /// Keeps the warnings the discovery target logs, so a test can read them.
+    struct Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if record.level() <= log::Level::Warn && record.target() == "discovery" {
+                captured().push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// The captured warnings. A test that fails while holding the lock poisons
+    /// it, and every later log must keep working, so a poisoned lock is read
+    /// through rather than propagated.
+    fn captured() -> std::sync::MutexGuard<'static, Vec<String>> {
+        CAPTURED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn capture_discovery_warnings() {
+        INSTALL.call_once(|| {
+            let _ = log::set_logger(&CAPTURE);
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        captured().clear();
+    }
+
+    #[test]
+    fn an_unstattable_entry_is_reported_and_the_scan_continues() {
+        capture_discovery_warnings();
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("org.example.dangling");
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), &dangling).unwrap();
+        let good = dir.path().join("org.example.good");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(
+            good.join("metadata.json"),
+            r#"{"KPlugin": {"Name": "Good", "Version": "1.0"}}"#,
+        )
+        .unwrap();
+
+        let components =
+            scan_directory(dir.path(), ComponentType::PlasmaWidget, false, &[]).unwrap();
+
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].directory_name, "org.example.good");
+        let warnings = captured().clone();
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(&dangling.display().to_string())),
+            "no warning named {}: {warnings:?}",
+            dangling.display()
+        );
+    }
 }

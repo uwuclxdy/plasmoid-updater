@@ -81,8 +81,8 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y mold
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
-      # check, update and install refuse to start without bsdtar on PATH, and
-      # update extracts with it; ubuntu ships it in libarchive-tools.
+      # update and install refuse to start without bsdtar on PATH, and update
+      # extracts with it; ubuntu ships it in libarchive-tools.
       - name: test dependencies (bsdtar)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libarchive-tools

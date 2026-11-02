@@ -55,6 +55,7 @@ impl StatusCode {
 pub(super) struct ContentXml {
     id: u64,
     name: String,
+    author: String,
     version: String,
     typeid: u16,
     changed: String,
@@ -66,7 +67,7 @@ pub(crate) struct Meta {
     #[serde(rename = "statuscode")]
     pub status_code: StatusCode,
     #[serde(rename = "totalitems", default)]
-    pub total_items: u32,
+    pub total_items: Option<u32>,
 }
 
 impl<'de> Deserialize<'de> for StatusCode {
@@ -157,6 +158,7 @@ impl<'de> Deserialize<'de> for ContentXml {
             {
                 let mut id: Option<u64> = None;
                 let mut name: Option<String> = None;
+                let mut author = String::new();
                 let mut version = String::new();
                 let mut typeid: u16 = 0;
                 let mut changed = String::new();
@@ -167,6 +169,7 @@ impl<'de> Deserialize<'de> for ContentXml {
                     match key.as_str() {
                         "id" => id = Some(map.next_value()?),
                         "name" => name = Some(map.next_value()?),
+                        "personid" => author = map.next_value()?,
                         "version" => version = map.next_value()?,
                         "typeid" => typeid = map.next_value()?,
                         "changed" => changed = map.next_value()?,
@@ -181,6 +184,7 @@ impl<'de> Deserialize<'de> for ContentXml {
                 Ok(ContentXml {
                     id: id.ok_or_else(|| serde::de::Error::missing_field("id"))?,
                     name: name.ok_or_else(|| serde::de::Error::missing_field("name"))?,
+                    author,
                     version,
                     typeid,
                     changed,
@@ -211,6 +215,7 @@ impl ContentXml {
         StoreEntry {
             id: self.id,
             name: self.name,
+            author: self.author,
             version: self.version,
             type_id: self.typeid,
             download_links: self.download_links,
@@ -245,14 +250,17 @@ pub(crate) fn parse_ocs_response(xml: &str) -> Result<(Vec<StoreEntry>, Meta)> {
     Ok((entries, response.meta))
 }
 
+/// The `categories=` parameter naming every category the given types list
+/// entries under.
 pub(crate) fn build_category_string(types: &[ComponentType]) -> String {
-    // u16 max is 5 digits; reserve 4 chars per type (3-4 digits + separator)
-    let mut s = String::with_capacity(types.len() * 4);
-    for (i, c) in types.iter().enumerate() {
+    let ids: usize = types.iter().map(|c| c.catalog_ids().len()).sum();
+    // A five-digit id plus its `x` separator.
+    let mut s = String::with_capacity(ids * 6);
+    for (i, category) in types.iter().flat_map(|c| c.catalog_ids()).enumerate() {
         if i > 0 {
             s.push('x');
         }
-        append_u16(&mut s, c.category_id());
+        append_u16(&mut s, *category);
     }
     s
 }
@@ -272,5 +280,48 @@ fn append_u16(s: &mut String, mut n: u16) {
     }
     for &byte in &buf[pos..] {
         s.push(byte as char);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_category_string, parse_ocs_response};
+
+    #[test]
+    fn a_widget_catalog_query_names_the_subcategory_the_parent_listing_skips() {
+        // The store's 705 listing expands to 706-712 only; entries filed
+        // under 713 need naming on their own (measured 2026-11-02).
+        assert_eq!(
+            build_category_string(&[crate::types::ComponentType::PlasmaWidget]),
+            "705x713"
+        );
+    }
+
+    #[test]
+    fn a_multi_type_catalog_query_joins_every_types_categories() {
+        assert_eq!(
+            build_category_string(&[
+                crate::types::ComponentType::PlasmaWidget,
+                crate::types::ComponentType::ColorScheme,
+            ]),
+            "705x713x112"
+        );
+    }
+
+    #[test]
+    fn parses_the_uploader_username() {
+        // The shape of a real /content/data/{id} answer: <personid> carries
+        // the uploader's username, the only author field the store exposes.
+        let xml = "<?xml version=\"1.0\"?><ocs><meta><status>ok</status>\
+                   <statuscode>100</statuscode><message></message>\
+                   <totalitems>1</totalitems><itemsperpage>100</itemsperpage></meta>\
+                   <data><content details=\"full\"><id>2380745</id>\
+                   <name>Claude Usage</name><version>0.2.0</version>\
+                   <typeid>706</typeid><personid>Elwynn18</personid>\
+                   <changed>2026-10-31T10:54:20+00:00</changed>\
+                   <downloadlink1>https://example.org/a.plasmoid</downloadlink1>\
+                   <download_version1>0.2.0</download_version1></content></data></ocs>";
+        let (entries, _meta) = parse_ocs_response(xml).unwrap();
+        assert_eq!(entries[0].author, "Elwynn18");
     }
 }

@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, FixedOffset};
+
 use crate::types::{InstalledComponent, StoreEntry};
 use crate::version::normalize_version;
 
@@ -19,37 +21,107 @@ pub(crate) struct DownloadInfo {
 ///
 /// Uses a three-tier resolution strategy:
 /// 1. KNewStuff registry lookup via pre-built cache (most reliable)
-/// 2. Exact name match from store API results
+/// 2. Exact name match from store API results, only against entries of the
+///    component's own type
 /// 3. Fallback widgets-id table
+///
+/// `None` when no tier matches.
 pub(crate) fn resolve_content_id(
     component: &InstalledComponent,
     store_entries: &[StoreEntry],
     lookup: &IdLookup,
 ) -> Option<u64> {
-    lookup
+    if let Some(id) = lookup
         .registry_id_cache
         .get(&component.directory_name)
         .copied()
-        .or_else(|| resolve_by_name(component, store_entries))
+    {
+        return Some(id);
+    }
+
+    resolve_by_name(component, store_entries)
         .or_else(|| resolve_by_table(component, lookup.widgets_id_table))
 }
 
 fn resolve_by_name(component: &InstalledComponent, store_entries: &[StoreEntry]) -> Option<u64> {
-    // Prefer entries that match both name and type
-    let type_match = store_entries.iter().find(|e| {
-        e.name.eq_ignore_ascii_case(&component.name)
-            && component.component_type.matches_type_id(e.type_id)
-    });
-
-    if let Some(entry) = type_match {
-        return Some(entry.id);
-    }
-
-    // Fall back to name-only match (handles miscategorized store entries)
-    store_entries
+    let matching: Vec<&StoreEntry> = store_entries
         .iter()
-        .find(|e| e.name.eq_ignore_ascii_case(&component.name))
-        .map(|e| e.id)
+        .filter(|entry| {
+            entry.name.eq_ignore_ascii_case(&component.name)
+                && component.component_type.matches_type_id(entry.type_id)
+        })
+        .collect();
+
+    match matching.as_slice() {
+        [] => None,
+        [entry] => Some(entry.id),
+        several => Some(newest_entry(component, several).id),
+    }
+}
+
+/// Picks the entry to treat as the installed one when several store entries
+/// share the component's name and type. Entries uploaded by the component's
+/// own author win; otherwise, and when that still leaves several, the latest
+/// `<changed>` instant wins, an undated (or unparseable) entry ranks below
+/// every dated one, and an equal instant falls to the higher content id.
+fn newest_entry<'a>(
+    component: &InstalledComponent,
+    candidates: &[&'a StoreEntry],
+) -> &'a StoreEntry {
+    let by_author = entries_by_the_author(component, candidates);
+    let pool = if by_author.is_empty() {
+        candidates
+    } else {
+        by_author.as_slice()
+    };
+    let mut newest = pool[0];
+    for &entry in &pool[1..] {
+        if outranks(entry, newest) {
+            newest = entry;
+        }
+    }
+    newest
+}
+
+/// The `<changed>` value as an instant: `None` when it is empty or not an
+/// RFC 3339 timestamp.
+fn changed_instant(entry: &StoreEntry) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(entry.changed_date.trim()).ok()
+}
+
+/// Whether `candidate` supersedes `incumbent` for the installed slot: a later
+/// `<changed>` instant, any dated entry over an undated or unparseable one, and
+/// a higher content id on equal instants (or when both are undated).
+fn outranks(candidate: &StoreEntry, incumbent: &StoreEntry) -> bool {
+    match (changed_instant(candidate), changed_instant(incumbent)) {
+        (Some(candidate_at), Some(incumbent_at)) => {
+            candidate_at > incumbent_at
+                || (candidate_at == incumbent_at && candidate.id > incumbent.id)
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => candidate.id > incumbent.id,
+    }
+}
+
+/// The candidates uploaded by the component's own author, as named in its
+/// metadata: empty when the metadata names no author or none matches.
+fn entries_by_the_author<'a>(
+    component: &InstalledComponent,
+    candidates: &[&'a StoreEntry],
+) -> Vec<&'a StoreEntry> {
+    let Some(metadata) = super::discovery::read_metadata(&component.path) else {
+        return Vec::new();
+    };
+    let authors = metadata.author_names();
+    candidates
+        .iter()
+        .copied()
+        .filter(|entry| {
+            let uploader = entry.author.trim().to_lowercase();
+            !uploader.is_empty() && authors.iter().any(|name| name.to_lowercase() == uploader)
+        })
+        .collect()
 }
 
 fn resolve_by_table(
@@ -110,7 +182,7 @@ pub(crate) fn find_store_entry(entries: &[StoreEntry], content_id: u64) -> Optio
     entries.iter().find(|e| e.id == content_id)
 }
 
-/// Name-only resolution without registry/table lookups.
+/// Resolution by name alone, without registry or table lookups.
 /// Used as a fallback when the primary resolved ID is absent from fetched data.
 pub(crate) fn resolve_by_name_only(
     component: &InstalledComponent,
@@ -138,13 +210,24 @@ mod tests {
     }
 
     fn make_entry(id: u64, name: &str, type_id: u16) -> StoreEntry {
+        make_entry_by(id, name, type_id, "", "")
+    }
+
+    fn make_entry_by(
+        id: u64,
+        name: &str,
+        type_id: u16,
+        changed_date: &str,
+        author: &str,
+    ) -> StoreEntry {
         StoreEntry {
             id,
             name: name.to_string(),
+            author: author.to_string(),
             version: "2.0.0".to_string(),
             type_id,
             download_links: vec![],
-            changed_date: String::new(),
+            changed_date: changed_date.to_string(),
         }
     }
 
@@ -153,13 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn name_match_ignores_type_id() {
+    fn name_match_requires_a_matching_type() {
         let component = make_component(
             "My Widget",
             "org.example.widget",
             ComponentType::PlasmaWidget,
         );
-        let entries = vec![make_entry(999, "My Widget", 714)];
+        let entries = vec![
+            make_entry(999, "My Widget", 716),
+            make_entry(998, "My Widget", 722),
+            make_entry(997, "My Widget", 714),
+        ];
         let (wid, reg) = empty_lookup();
         let lookup = IdLookup {
             widgets_id_table: &wid,
@@ -167,11 +254,11 @@ mod tests {
         };
 
         let result = resolve_content_id(&component, &entries, &lookup);
-        assert_eq!(result, Some(999));
+        assert_eq!(result, None);
     }
 
     #[test]
-    fn name_match_prefers_same_type_when_ambiguous() {
+    fn name_match_ignores_entries_of_other_types() {
         let component = make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
         let entries = vec![make_entry(100, "Clock", 708), make_entry(200, "Clock", 299)];
         let (wid, reg) = empty_lookup();
@@ -185,13 +272,13 @@ mod tests {
     }
 
     #[test]
-    fn name_match_falls_back_to_any_type_when_no_type_match() {
+    fn name_match_resolves_when_the_registry_has_no_entry() {
         let component = make_component(
             "Fancy Thing",
             "org.example.fancy",
-            ComponentType::KWinEffect,
+            ComponentType::PlasmaWidget,
         );
-        let entries = vec![make_entry(555, "Fancy Thing", 705)];
+        let entries = vec![make_entry(555, "Fancy Thing", 706)];
         let (wid, reg) = empty_lookup();
         let lookup = IdLookup {
             widgets_id_table: &wid,
@@ -202,6 +289,177 @@ mod tests {
         assert_eq!(result, Some(555));
     }
 
+    fn component_with_metadata(authors: &str) -> (tempfile::TempDir, InstalledComponent) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            format!("{{\"KPlugin\": {{\"Name\": \"Clock\", \"Authors\": [{authors}]}}}}"),
+        )
+        .unwrap();
+        let mut component =
+            make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
+        component.path = dir.path().to_path_buf();
+        (dir, component)
+    }
+
+    fn resolve_with(component: &InstalledComponent, entries: &[StoreEntry]) -> Option<u64> {
+        let (wid, reg) = empty_lookup();
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+        resolve_content_id(component, entries, &lookup)
+    }
+
+    #[test]
+    fn same_named_entries_resolve_to_the_latest_changed() {
+        let component = make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
+        let newest = make_entry_by(100, "Clock", 708, "2026-10-01T00:00:00+00:00", "");
+        let older = make_entry_by(200, "Clock", 709, "2026-09-01T00:00:00+00:00", "");
+
+        assert_eq!(
+            resolve_with(&component, &[older.clone(), newest.clone()]),
+            Some(100)
+        );
+        assert_eq!(resolve_with(&component, &[newest, older]), Some(100));
+    }
+
+    #[test]
+    fn equal_changed_dates_resolve_to_the_higher_content_id() {
+        let component = make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
+        let lower = make_entry_by(100, "Clock", 708, "2026-10-01T00:00:00+00:00", "");
+        let higher = make_entry_by(200, "Clock", 709, "2026-10-01T00:00:00+00:00", "");
+
+        assert_eq!(
+            resolve_with(&component, &[higher.clone(), lower.clone()]),
+            Some(200)
+        );
+        assert_eq!(resolve_with(&component, &[lower, higher]), Some(200));
+
+        // The same instant written in two offsets: only instant equality ties
+        // them, so a string comparison ranks the wrong one.
+        let plus_two = make_entry_by(100, "Clock", 708, "2026-10-01T12:00:00+02:00", "");
+        let utc = make_entry_by(200, "Clock", 709, "2026-10-01T10:00:00+00:00", "");
+        assert_eq!(
+            resolve_with(&component, &[plus_two.clone(), utc.clone()]),
+            Some(200)
+        );
+        assert_eq!(resolve_with(&component, &[utc, plus_two]), Some(200));
+    }
+
+    #[test]
+    fn same_day_uploads_resolve_to_the_later_timestamp() {
+        let component = make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
+        // The later upload reads an earlier wall clock in its own offset, so
+        // only comparing instants picks it.
+        let earlier = make_entry_by(300, "Clock", 709, "2026-10-01T22:00:00+02:00", "");
+        let later = make_entry_by(100, "Clock", 708, "2026-10-01T21:00:00+00:00", "");
+
+        assert_eq!(
+            resolve_with(&component, &[earlier.clone(), later.clone()]),
+            Some(100)
+        );
+        assert_eq!(resolve_with(&component, &[later, earlier]), Some(100));
+    }
+
+    #[test]
+    fn an_empty_or_unparseable_changed_never_outranks_a_dated_entry() {
+        let component = make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
+        let dated = make_entry_by(100, "Clock", 708, "2026-10-01T00:00:00+00:00", "");
+        let undated = make_entry_by(500, "Clock", 709, "", "");
+        let unparseable = make_entry_by(600, "Clock", 709, "yesterday", "");
+
+        assert_eq!(
+            resolve_with(&component, &[undated.clone(), dated.clone()]),
+            Some(100)
+        );
+        assert_eq!(
+            resolve_with(&component, &[dated.clone(), undated]),
+            Some(100)
+        );
+        assert_eq!(
+            resolve_with(&component, &[unparseable.clone(), dated.clone()]),
+            Some(100)
+        );
+        assert_eq!(resolve_with(&component, &[dated, unparseable]), Some(100));
+    }
+
+    #[test]
+    fn the_installed_author_match_is_unicode_case_insensitive() {
+        let (_dir, component) = component_with_metadata("{\"Name\": \"ÉLODIE\"}");
+        let own_uploader = make_entry_by(100, "Clock", 709, "2026-09-01T00:00:00+00:00", "élodie");
+        let other_uploader =
+            make_entry_by(300, "Clock", 708, "2026-10-01T00:00:00+00:00", "someone");
+
+        assert_eq!(
+            resolve_with(&component, &[other_uploader.clone(), own_uploader.clone()]),
+            Some(100)
+        );
+        assert_eq!(
+            resolve_with(&component, &[own_uploader, other_uploader]),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn same_named_entries_resolve_to_the_newest_without_readable_metadata() {
+        let invalid_metadata = tempfile::tempdir().unwrap();
+        std::fs::write(invalid_metadata.path().join("metadata.json"), "not json").unwrap();
+        let missing_metadata = tempfile::tempdir().unwrap();
+        let older = make_entry_by(300, "Clock", 709, "2026-09-01T00:00:00+00:00", "alpha");
+        let newer = make_entry_by(200, "Clock", 708, "2026-10-01T00:00:00+00:00", "beta");
+
+        let mut unreadable =
+            make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
+        unreadable.path = invalid_metadata.path().to_path_buf();
+        assert_eq!(
+            resolve_with(&unreadable, &[older.clone(), newer.clone()]),
+            Some(200),
+            "an unparseable metadata.json must not stop resolution"
+        );
+
+        let mut absent = make_component("Clock", "org.example.clock", ComponentType::PlasmaWidget);
+        absent.path = missing_metadata.path().to_path_buf();
+        assert_eq!(
+            resolve_with(&absent, &[older, newer]),
+            Some(200),
+            "a component with no metadata file must still resolve to the newest entry"
+        );
+    }
+
+    #[test]
+    fn the_installed_author_narrows_same_named_entries() {
+        let (_dir, component) = component_with_metadata(
+            "{\"Email\": \"oursbleu18@gmail.com\", \"Name\": \" Elwynn18 \"}",
+        );
+        let own_uploader =
+            make_entry_by(100, "Clock", 709, "2026-09-01T00:00:00+00:00", "elwynn18");
+        let other_uploader =
+            make_entry_by(300, "Clock", 708, "2026-10-01T00:00:00+00:00", "someone");
+
+        assert_eq!(
+            resolve_with(&component, &[other_uploader.clone(), own_uploader.clone()]),
+            Some(100)
+        );
+        assert_eq!(
+            resolve_with(&component, &[own_uploader, other_uploader]),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn an_unmatched_author_still_resolves_to_the_latest_changed() {
+        let (_dir, component) = component_with_metadata("{\"Name\": \"Somebody Else\"}");
+        let older = make_entry_by(300, "Clock", 709, "2026-09-01T00:00:00+00:00", "alpha");
+        let newer = make_entry_by(200, "Clock", 708, "2026-10-01T00:00:00+00:00", "beta");
+
+        assert_eq!(
+            resolve_with(&component, &[older.clone(), newer.clone()]),
+            Some(200)
+        );
+        assert_eq!(resolve_with(&component, &[newer, older]), Some(200));
+    }
+
     #[test]
     fn download_link_matches_with_normalized_version() {
         use crate::types::DownloadLink;
@@ -209,6 +467,7 @@ mod tests {
         let entry = StoreEntry {
             id: 1,
             name: "Test".to_string(),
+            author: String::new(),
             version: "2.0.0".to_string(),
             type_id: 705,
             download_links: vec![
@@ -240,6 +499,7 @@ mod tests {
         let entry = StoreEntry {
             id: 1,
             name: "Test".to_string(),
+            author: String::new(),
             version: "2.0.0".to_string(),
             type_id: 705,
             download_links: vec![
@@ -290,6 +550,7 @@ mod tests {
         let entry = StoreEntry {
             id: 1,
             name: "Test".to_string(),
+            author: String::new(),
             version: "1.0.0".to_string(),
             type_id: 705,
             download_links: vec![
@@ -319,6 +580,7 @@ mod tests {
         let entry = StoreEntry {
             id: 1,
             name: "Test".to_string(),
+            author: String::new(),
             version: "1.0.0".to_string(),
             type_id: 705,
             download_links: vec![DownloadLink {

@@ -48,13 +48,15 @@ pub(crate) fn normalize_version(version: &str) -> String {
     result
 }
 
-/// Returns true if there's an update based on version or date.
+/// Returns true when the store entry is newer than the installed component.
 ///
-/// Mirrors KNewStuff's update detection: an update is available when the
-/// version string differs OR the release date differs. When both versions
-/// are parseable we use semantic comparison (newer = update); when they
-/// are equal we fall back to date comparison to catch "refresh" uploads
-/// where the author re-uploads the same version with a newer date.
+/// Two parseable versions decide by ordering: a newer available version is an
+/// update and an older one is not. Equal versions, identical raw strings
+/// included, fall to the release dates, to catch "refresh" uploads where the
+/// author re-uploads the same version with a newer date. An unparseable
+/// installed version against a parseable available one is an update without
+/// consulting the dates; when both are unparseable, or only the available one
+/// is, the dates decide.
 pub(crate) fn is_update_available_with_date(
     installed_version: &str,
     available_version: &str,
@@ -118,9 +120,10 @@ fn is_date_newer(installed_date: &str, available_date: &str) -> bool {
     if installed_date.is_empty() || available_date.is_empty() {
         return false;
     }
-    // extract just the date part (first 10 chars for YYYY-MM-DD)
-    let local_date = installed_date.get(..10).unwrap_or(installed_date);
-    let store_date = available_date.get(..10).unwrap_or(available_date);
+    // Compare just the date part (YYYY-MM-DD), cutting at a char boundary so
+    // a multi-byte date never falls back to the whole string.
+    let local_date = &installed_date[..installed_date.floor_char_boundary(10)];
+    let store_date = &available_date[..available_date.floor_char_boundary(10)];
     store_date > local_date
 }
 
@@ -183,6 +186,15 @@ mod tests {
         assert!(is_date_newer("2024-01-01", "2025-ñ1-01"));
         // All multi-byte: ë (0xc3..) > '2' (0x32) so local_date > store_date
         assert!(!is_date_newer("ëëëëëëëëëë", "2025-01-01"));
+    }
+
+    #[test]
+    fn date_truncation_cuts_at_a_char_boundary() {
+        // Byte 10 lands inside the final "é", so the old whole-string fallback
+        // compared "2024-01-0é" (whose next byte is 0xC3) and read the store's
+        // "2024-01-05" as older; the floored cut compares "2024-01-0" and the
+        // store date wins.
+        assert!(is_date_newer("2024-01-0é", "2024-01-05T00:00:00"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ static DEFAULT_WIDGETS_TABLE: LazyLock<HashMap<String, u64>> =
     LazyLock::new(|| Config::parse_widgets_id(DEFAULT_WIDGETS_ID));
 
 /// The OCS base URL every store request uses unless
-/// [`Config::with_store_url`] overrides it.
+/// [`Config::with_api_url`] overrides it.
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kde-look.org/ocs/v1";
 
 /// Configuration for libplasmoid-updater operations.
@@ -44,7 +44,7 @@ pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kde-look.org/ocs/v1";
 /// let config = Config::new()
 ///     .with_excluded_packages(vec!["problematic-widget".to_string()])
 ///     .with_widgets_id_table(widgets_table)
-///     .with_store_url("https://mirror.example.org/ocs/v1");
+///     .with_api_url("https://mirror.example.org/ocs/v1");
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -98,8 +98,8 @@ pub struct Config {
     /// targets.
     ///
     /// Defaults to `https://api.kde-look.org/ocs/v1`. Point it at a mirror or
-    /// a local fake store with [`Config::with_store_url`].
-    pub store_url: String,
+    /// a local fake store with [`Config::with_api_url`].
+    pub api_url: String,
 
     /// Maximum number of parallel installation threads.
     ///
@@ -124,7 +124,7 @@ impl Default for Config {
             excluded_packages: Vec::new(),
             excluded_patterns: Vec::new(),
             widgets_id_table: HashMap::new(),
-            store_url: DEFAULT_BASE_URL.to_string(),
+            api_url: DEFAULT_BASE_URL.to_string(),
             threads: None,
             skip_plasma_detection: false,
             inhibit_idle: true,
@@ -139,7 +139,7 @@ impl Config {
     /// - `system`: false (user components)
     /// - `excluded_packages`: empty
     /// - `widgets_id_table`: loaded from embedded widgets-id file
-    /// - `store_url`: `https://api.kde-look.org/ocs/v1`
+    /// - `api_url`: `https://api.kde-look.org/ocs/v1`
     ///
     /// The embedded widgets-id table provides fallback content ID mappings
     /// for components that cannot be resolved via KNewStuff registry or
@@ -257,17 +257,17 @@ impl Config {
     /// ```rust
     /// use libplasmoid_updater::Config;
     ///
-    /// let config = Config::new().with_store_url("https://mirror.example.org/ocs/v1");
+    /// let config = Config::new().with_api_url("https://mirror.example.org/ocs/v1");
     /// ```
-    pub fn with_store_url(mut self, url: impl Into<String>) -> Self {
-        self.store_url = url.into();
+    pub fn with_api_url(mut self, url: impl Into<String>) -> Self {
+        self.api_url = url.into();
         self
     }
 
     /// Parses a widgets-id table from a string.
     ///
-    /// The format is one entry per line: `content_id directory_name`
-    /// Lines starting with `#` are comments.
+    /// The format is one entry per line: `content_id directory_name`, and a
+    /// `#` anywhere on a line starts a comment that runs to its end.
     pub fn parse_widgets_id(content: &str) -> HashMap<String, u64> {
         let mut table = HashMap::with_capacity(content.lines().count());
         for line in content.lines() {
@@ -340,7 +340,7 @@ pub(crate) fn parse_widgets_id_line(line: &str) -> Option<(u64, String)> {
 
     let mut parts = line.splitn(2, ' ');
     let id = parts.next()?.parse::<u64>().ok()?;
-    let name = parts.next()?.trim();
+    let name = parts.next()?.split('#').next()?.trim();
     if name.is_empty() {
         return None;
     }
@@ -366,6 +366,15 @@ mod tests {
         let line = "#2182964 adhe.menu.11 #Ignored, not a unique ID";
         let result = parse_widgets_id_line(line);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_widgets_id_line_strips_inline_comment() {
+        let line = "2182964 adhe.menu.11 #Ignored, not a unique ID";
+        assert_eq!(
+            parse_widgets_id_line(line),
+            Some((2182964, "adhe.menu.11".to_string()))
+        );
     }
 
     #[test]
@@ -404,6 +413,40 @@ mod tests {
         assert_eq!(
             config.widgets_id_table.get("org.kde.plasma.awesomewidget"),
             Some(&998913)
+        );
+        assert_eq!(
+            config.widgets_id_table.get("adhe.menu.11"),
+            Some(&2171750),
+            "store id 2171750 is \"Menu 11 - plasma 6\" by the uploader adhe"
+        );
+    }
+
+    /// The first component name the table lists twice, with its two lines.
+    fn duplicate_name_line(content: &str) -> Option<(String, usize, usize)> {
+        let mut first_line: HashMap<String, usize> = HashMap::new();
+        for (index, line) in content.lines().enumerate() {
+            let Some((_, name)) = parse_widgets_id_line(line) else {
+                continue;
+            };
+            if let Some(&earlier) = first_line.get(&name) {
+                return Some((name, earlier, index + 1));
+            }
+            first_line.insert(name, index + 1);
+        }
+        None
+    }
+
+    #[test]
+    fn shipped_widgets_id_table_lists_every_name_once() {
+        assert_eq!(
+            duplicate_name_line("1 alpha\n2 alpha\n"),
+            Some(("alpha".to_string(), 1, 2))
+        );
+        assert_eq!(duplicate_name_line("1 alpha\n2 beta\n"), None);
+        assert_eq!(
+            duplicate_name_line(DEFAULT_WIDGETS_ID),
+            None,
+            "a duplicated name silently overrides the earlier store id"
         );
     }
 
