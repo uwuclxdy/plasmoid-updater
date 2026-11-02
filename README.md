@@ -52,6 +52,9 @@ Options:
   -v, --verbose...             more diagnostics on stderr (repeat for debug)
   -h, --help                   Print help
   -V, --version                Print version
+
+project: https://github.com/uwuclxdy/plasmoid-updater
+report bugs: https://github.com/uwuclxdy/plasmoid-updater/issues
 ```
 
 ```
@@ -66,10 +69,11 @@ Arguments:
 Options:
       --restart-plasma         automatically restart plasmashell
       --no-restart-plasma      do not restart plasmashell
-  -y, --yes                    automatically confirm all updates
+  -y, --yes                    automatically confirm all updates (TOPGRADE_YES=1 does the same)
       --dry-run                list what would be installed and change nothing
       --ignore <NAMES>         names to skip for this run (comma-separated or repeatable)
       --system                 operate on system-wide components (needs sudo)
+      --json                   print the result as JSON on stdout
       --skip-plasma-detection  skip KDE Plasma detection
   -q, --quiet                  errors only on stderr
   -v, --verbose...             more diagnostics on stderr (repeat for debug)
@@ -79,9 +83,11 @@ Options:
 
 `update --dry-run` prints the same table `check` prints — name, current version, available version, store ID, size and type — and touches neither the installed files nor the KDE Store registry. It matches `--ignore` and the config exclusions exactly as a real `update` does. Like `check`, it exits 1 when a component could not be checked; a named dry run answers only for the component it names, exactly as a named `update` does.
 
+`--json` on `check`, `list-installed` and `update` prints one JSON document on stdout and nothing else there: `check` and `update --dry-run` print the check result (a named dry run restricts it to the named component), `update` prints the update result, and `list-installed` prints `{"components": [...]}`. Diagnostics, progress and log lines stay on stderr, and the exit codes do not change. An interactive `update --json` still opens the selection menu on a terminal; only the result goes to stdout.
+
 `--ignore` works on both `check` and `update` and skips the named components for that run only, on top of the config exclusions. Example: `plasmoid-updater update --ignore weather,clock`.
 
-Running `plasmoid-updater` without a subcommand prints its help and exits 0. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; on a non-interactive stdin it refuses without `-y` (exit 2) rather than guessing, unless it names a COMPONENT, runs `--dry-run`, or the config sets `assume_yes` or `update_all_by_default`. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing. At the selection menu, Escape selects nothing and Ctrl-C ends the run by SIGINT (a shell reports exit status 130). An update that goes ahead (not `--dry-run`, not a refused one) first puts back what a killed run left stranded, even when there is nothing to install.
+Running `plasmoid-updater` without a subcommand prints its help and exits 0. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; on a non-interactive stdin it refuses without `-y` (exit 2) rather than guessing, unless it names a COMPONENT, runs `--dry-run`, or the config sets `assume_yes` or `update_all_by_default`. `TOPGRADE_YES=1` in the environment confirms the way `-y` does, which is how [topgrade](https://github.com/topgrade-rs/topgrade/) drives an unattended update; any other value confirms nothing. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing. At the selection menu, Escape selects nothing and Ctrl-C ends the run by SIGINT (a shell reports exit status 130). An update that goes ahead (not `--dry-run`, not a refused one) first puts back what a killed run left stranded, even when there is nothing to install.
 
 With `--system`, only a real `update` authenticates through `sudo -v`; `check`, `list-installed` and `update --dry-run` never ask for a password.
 
@@ -103,7 +109,9 @@ Components that fail to update don't stop the run: failures are summarized at th
 
 ## Logging
 
-Only the payload — the tables, the summary, the completion script — goes to stdout. Diagnostics, progress and log lines go to stderr.
+Only the payload — the tables, the summary, the JSON document, the completion script — goes to stdout. Diagnostics, progress and log lines go to stderr.
+
+Styling follows the rule clap applies to `--help`: `NO_COLOR` set non-empty turns it off, `CLICOLOR_FORCE` set non-empty turns it on even into a pipe, `CLICOLOR=0` turns it off, and otherwise it is on only on a terminal, and there only when `TERM` is set and not `dumb`, `CLICOLOR` is set to anything but `0`, or `CI` is set. The selection prompt and log levels use the same rule on stderr. Progress animates only when stderr is a terminal, so a forced colour into a pipe colours the installed and failed lines without redrawing them.
 
 | Flag | stderr |
 | ---- | ------ |
