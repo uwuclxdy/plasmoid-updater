@@ -84,7 +84,7 @@ fn format_download_size(size: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn print_stdout_table<T: TableRow>(items: &[T], headers: &[&str]) {
+fn render_table<T: TableRow>(items: &[T], headers: &[&str]) -> String {
     let mut table = Table::new();
     table.load_style(presets::NOTHING);
     table.set_header(headers.iter().map(|h| header(h)).collect::<Vec<_>>());
@@ -93,18 +93,17 @@ fn print_stdout_table<T: TableRow>(items: &[T], headers: &[&str]) {
         table.add_row(item.to_row());
     }
 
-    println!("{table}");
+    table.to_string()
 }
 
-/// Prints the table of available updates (check output) to stdout.
-pub fn print_updates_table(updates: &[AvailableUpdate]) {
+/// Renders the table of available updates (`check`'s payload).
+pub fn updates_table(updates: &[AvailableUpdate]) -> String {
     let headers = ["NAME", "CURRENT", "AVAILABLE", "ID", "SIZE", "TYPE"];
-    print_stdout_table(updates, &headers);
+    render_table(updates, &headers)
 }
 
-/// Prints the table of installed components (`list-installed` output) to
-/// stdout.
-pub fn print_components_table(components: &[InstalledComponent]) {
+/// Renders the table of installed components (`list-installed`'s payload).
+pub fn components_table(components: &[InstalledComponent]) -> String {
     let headers = ["NAME", "VERSION", "TYPE"];
-    print_stdout_table(components, &headers);
+    render_table(components, &headers)
 }

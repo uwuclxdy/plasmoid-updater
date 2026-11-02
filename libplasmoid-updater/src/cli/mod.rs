@@ -12,7 +12,7 @@ mod output;
 mod progress;
 mod select;
 
-pub use output::{print_components_table, print_failures, print_updates_table};
+pub use output::{components_table, print_failures, updates_table};
 pub use progress::ProgressReporter;
 pub use select::select;
 

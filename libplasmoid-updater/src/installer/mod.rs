@@ -94,7 +94,7 @@ pub(crate) fn update_component(
         }
         Err(e) => {
             if let Some(ref backup) = backup_path {
-                handle_installation_failure(backup, &component.path, &e)?;
+                handle_installation_failure(backup, component, &e)?;
             }
             Err(e)
         }
@@ -339,11 +339,16 @@ fn read_version_from_registry(component: &InstalledComponent) -> Option<String> 
 
 fn handle_installation_failure(
     backup_path: &Path,
-    component_path: &Path,
+    component: &InstalledComponent,
     original_error: &ComponentFailure,
 ) -> Result<(), ComponentFailure> {
-    if let Err(restore_err) = restore_component(backup_path, component_path) {
-        log::error!(target: "restore", "failed: {}", restore_err.message);
+    if let Err(restore_err) = restore_component(backup_path, &component.path) {
+        log::error!(
+            target: "restore",
+            "failed to restore {:?} from its backup: {}",
+            component.name,
+            restore_err.message
+        );
         Err(ComponentFailure::new(
             FailureKind::RestoreFailed,
             format!(
@@ -354,5 +359,82 @@ fn handle_installation_failure(
     } else {
         log::info!(target: "restore", "restored component from backup");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ComponentType;
+    use std::sync::{Mutex, OnceLock};
+
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static RECORDER: Recorder = Recorder;
+
+    struct Recorder;
+
+    impl log::Log for Recorder {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            LINES.lock().unwrap().push(record.args().to_string());
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn logged_by(run: impl FnOnce()) -> Vec<String> {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            log::set_logger(&RECORDER).unwrap();
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        LINES.lock().unwrap().clear();
+        run();
+        LINES.lock().unwrap().clone()
+    }
+
+    fn color_scheme(path: &Path) -> InstalledComponent {
+        InstalledComponent {
+            name: "Fake Scheme".to_string(),
+            directory_name: "FakeScheme.colors".to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::ColorScheme,
+            path: path.to_path_buf(),
+            is_system: false,
+            release_date: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_restore_failure_log_names_the_component() {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("backup");
+        std::fs::write(&backup, b"old").unwrap();
+        // A non-empty directory cannot take a file's rename, so the restore
+        // fails the way a locked or full destination does.
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("occupant"), b"new").unwrap();
+        let component = color_scheme(&target);
+        let install_failure = ComponentFailure::new(FailureKind::Install, "install broke");
+
+        let lines = logged_by(|| {
+            let outcome = handle_installation_failure(&backup, &component, &install_failure);
+            assert!(outcome.is_err(), "the restore was expected to fail");
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&component.name)),
+            "the restore failure log does not name the component: {lines:?}",
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("{:?}", component.name))),
+            "the restore failure log does not repr the component name: {lines:?}",
+        );
     }
 }

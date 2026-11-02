@@ -8,6 +8,8 @@
 //! environment set; the child calls the library and asserts on its results.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// Every test crate compiles this module on its own and uses a different part.
+#![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -124,13 +126,18 @@ impl Sandbox {
         std::fs::read_to_string(self.registry_path()).unwrap()
     }
 
-    /// Re-runs this test binary filtered to `test` inside the sandbox, and
-    /// panics with the child's output unless it ran the test body to the end.
-    pub fn run_child(&self, test: &str, store_url: &str) {
+    /// The plasmoid-updater config dir the sandbox points
+    /// `PLASMOID_UPDATER_CONFIG_DIR` at.
+    pub fn config_dir(&self) -> PathBuf {
+        self.root.path().join("pu-config")
+    }
+
+    /// A command for `program` with a cleared environment holding only `PATH`
+    /// and the sandbox's `HOME`, `XDG_*`, `TMPDIR` and config dir.
+    pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let root = self.root.path();
-        let marker = root.join("child-done");
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        let mut command = Command::new(program);
+        command
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", root.join("home"))
@@ -139,7 +146,22 @@ impl Sandbox {
             .env("XDG_CACHE_HOME", root.join("cache"))
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
             .env("TMPDIR", root.join("tmp"))
-            .env("PLASMOID_UPDATER_CONFIG_DIR", root.join("pu-config"))
+            .env("PLASMOID_UPDATER_CONFIG_DIR", self.config_dir());
+        // An instrumented coverage run names its profile output here; without
+        // it the child's coverage is lost.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        command
+    }
+
+    /// Re-runs this test binary filtered to `test` inside the sandbox, and
+    /// panics with the child's output unless it ran the test body to the end.
+    pub fn run_child(&self, test: &str, store_url: &str) {
+        let marker = self.root.path().join("child-done");
+        let output = self
+            .command(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_FLAG, "1")
             .env(STORE_URL_VAR, store_url)
             .env(MARKER_VAR, &marker)

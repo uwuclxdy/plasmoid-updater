@@ -16,7 +16,9 @@ pub enum Error {
     UnsupportedOs,
 
     /// No KDE Plasma installation was detected.
-    #[error("KDE Plasma desktop environment not detected")]
+    #[error(
+        "KDE Plasma desktop environment not detected: pass --skip-plasma-detection to run anyway"
+    )]
     NotKde,
 
     /// Another instance of this library holds the update lock.

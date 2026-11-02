@@ -18,10 +18,16 @@ path = "src/main.rs"
 [dependencies]
 libplasmoid-updater = { workspace = true, features = ["cli", "inhibit"] }
 clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+log = "0.4.35"
 toml = "1.1.8"
 serde = { workspace = true }
 dirs = { workspace = true }
 nix = { workspace = true }
+
+[dev-dependencies]
+md5 = "0.8.1"
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

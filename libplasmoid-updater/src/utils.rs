@@ -201,7 +201,7 @@ fn report_outcome(
             });
         }
         Err(e) => {
-            log::error!(target: "update", "failed for {}: {}", component.name, e.message);
+            log::debug!(target: "update", "failed for {}: {}", component.name, e.message);
             reporter.event(&Event::Failed {
                 name: component.name.clone(),
                 id,

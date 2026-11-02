@@ -7,12 +7,24 @@ use serde::Deserialize;
 
 const CONFIG_FILE_NAME: &str = "plasmoid-updater.toml";
 const CONFIG_DIR_ENV: &str = "PLASMOID_UPDATER_CONFIG_DIR";
+/// Points every store request at another OCS base URL. Undocumented on
+/// purpose: it exists for mirrors and test fixtures, not for regular use.
+const API_URL_ENV: &str = "PLASMOID_UPDATER_API_URL";
 
 fn config_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV).filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir).join(CONFIG_FILE_NAME));
     }
     dirs::config_dir().map(|d| d.join(CONFIG_FILE_NAME))
+}
+
+/// Points the config at [`API_URL_ENV`]'s store base URL when it is set and
+/// non-empty. The one place the bin calls the library's URL builder.
+fn with_api_url(config: libplasmoid_updater::Config) -> libplasmoid_updater::Config {
+    match std::env::var(API_URL_ENV) {
+        Ok(url) if !url.is_empty() => config.with_store_url(url),
+        _ => config,
+    }
 }
 
 fn config_error(path: &Path, e: std::io::Error) -> libplasmoid_updater::Error {
@@ -45,9 +57,11 @@ impl CliConfig {
     pub fn load() -> libplasmoid_updater::Result<Self> {
         let toml_config = Self::load_toml_config()?;
 
-        let inner = libplasmoid_updater::Config::new()
-            .with_excluded_packages(toml_config.excluded_packages)
-            .with_excluded_patterns(toml_config.excluded_patterns);
+        let inner = with_api_url(
+            libplasmoid_updater::Config::new()
+                .with_excluded_packages(toml_config.excluded_packages)
+                .with_excluded_patterns(toml_config.excluded_patterns),
+        );
 
         Ok(Self {
             inner,

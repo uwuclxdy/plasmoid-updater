@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use crate::{Error, Result, types::ComponentType};
@@ -14,8 +13,9 @@ fn get_user_id() -> String {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] with the `systemctl` path when the command cannot be
-/// spawned or exits nonzero.
+/// Returns [`Error::MissingTool`] when `systemctl` is not on `PATH`,
+/// [`Error::Config`] naming the command when it cannot be spawned or exits
+/// nonzero.
 pub fn restart_plasmashell() -> Result<()> {
     let mut cmd = Command::new("systemctl");
     cmd.args(["--user", "restart", "plasma-plasmashell.service"]);
@@ -33,17 +33,15 @@ pub fn restart_plasmashell() -> Result<()> {
         cmd.env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
     }
 
-    let systemctl = PathBuf::from("systemctl");
-    let status = cmd.status().map_err(|e| Error::Io {
-        path: systemctl.clone(),
-        source: e,
+    let status = cmd.status().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::MissingTool { tool: "systemctl" },
+        _ => Error::Config(format!("failed to run systemctl: {e}")),
     })?;
 
     if !status.success() {
-        return Err(Error::Io {
-            path: systemctl,
-            source: std::io::Error::other(format!("systemctl exited with status {status}")),
-        });
+        return Err(Error::Config(format!(
+            "systemctl exited with status {status}"
+        )));
     }
 
     Ok(())
