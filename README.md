@@ -41,11 +41,14 @@ Commands:
   check           check for available updates
   list-installed  list all installed components
   update          update components
+  completions     print a shell completion script
 
 Options:
       --system                 operate on system-wide components (needs sudo)
       --edit-config            open configuration file in editor
       --skip-plasma-detection  skip KDE Plasma detection
+  -q, --quiet                  errors only on stderr
+  -v, --verbose...             more diagnostics on stderr (repeat for debug)
   -h, --help                   Print help
   -V, --version                Print version
 ```
@@ -63,12 +66,17 @@ Options:
       --restart-plasma         automatically restart plasmashell
       --no-restart-plasma      do not restart plasmashell
   -y, --yes                    automatically confirm all updates
+      --dry-run                list what would be installed and change nothing
       --ignore <NAMES>         names to skip for this run (comma-separated or repeatable)
       --system                 operate on system-wide components (needs sudo)
       --skip-plasma-detection  skip KDE Plasma detection
+  -q, --quiet                  errors only on stderr
+  -v, --verbose...             more diagnostics on stderr (repeat for debug)
   -h, --help                   Print help
 
 ```
+
+`update --dry-run` prints the same table `check` prints — name, current version, available version, store ID, size and type — and touches neither the installed files nor the KDE Store registry. It matches `--ignore` and the config exclusions exactly as a real `update` does. Like `check`, it exits 1 when a component could not be checked; a named dry run answers only for the component it names, exactly as a named `update` does.
 
 `--ignore` works on both `check` and `update` and skips the named components for that run only, on top of the config exclusions. Example: `plasmoid-updater update --ignore weather,clock`.
 
@@ -76,7 +84,40 @@ Running `plasmoid-updater` without a subcommand is the same as `update`. On a te
 
 By default a run restarts nothing. After updates to widgets, plasma styles, global themes, splash screens or KWin switchers, `--restart-plasma` restarts plasmashell, `prompt_restart = true` in the config asks first (on a terminal only), and `--no-restart-plasma` skips it (when both flags are given, `--restart-plasma` wins).
 
-Components that fail to update don't stop the run: failures (and installs whose post-install version could not be verified) are summarized at the end, and the CLI exits 1 when any component failed.
+Components that fail to update don't stop the run: failures are summarized at the end, and the run exits 1 when any component failed or could not be checked. An install whose post-install version cannot be verified counts as a failure too, so it exits 1 as well.
+
+## Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | success |
+| 1 | at least one component failed, or an install's version could not be verified, or `check`, `update` or `update --dry-run` could not settle a component |
+| 2 | usage error: an unknown option or subcommand, or `update <name>` naming no installed component |
+| 3 | the run could not start or finish |
+| 100 | `check` found updates to install |
+
+`check` exits 0 when everything is up to date, 100 when updates are available, and 1 when at least one component could not be checked (the reason goes to stderr, naming the component). A failed check outranks an available update: `check` exits 1 rather than 100 so no failure is masked.
+
+## Logging
+
+Only the payload — the tables, the summary, the completion script — goes to stdout. Diagnostics, progress and log lines go to stderr.
+
+| Flag | stderr |
+| ---- | ------ |
+| `-q` | errors only; no progress |
+| (none) | warnings, plus progress |
+| `-v` | info |
+| `-vv` | debug |
+
+`-q` and `-v` are global flags (`plasmoid-updater -q check` and `plasmoid-updater check -q` both work) and cannot be combined. `-v` and `-vv` raise the log level and leave progress on. Log lines read `<level>: <message>`, with the level bold on a colour-capable terminal, and a multi-line message keeps its lines indented under the one entry. `RUST_LOG` is not read.
+
+## Shell completions
+
+`plasmoid-updater completions <SHELL>` prints a completion script on stdout for `bash`, `zsh`, `fish`, `elvish` or `powershell`:
+
+```
+plasmoid-updater completions bash > ~/.local/share/bash-completion/completions/plasmoid-updater
+```
 
 ## Configuration
 
