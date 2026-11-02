@@ -34,7 +34,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 tempfile = "3.27.0"
 # 2.0.1 hard-pins `indexmap =2.11.4`, which conflicts with toml's `indexmap ^2.13`; the resolver keeps 2.0.0 here
 freedesktop_entry_parser = "2.0.0"
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "signal"] }
 zbus = { version = "6.2.0", default-features = false, features = ["default-rt"], optional = true }
 
 # CLI-only dependencies

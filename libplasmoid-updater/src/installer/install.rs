@@ -5,11 +5,16 @@
 // GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 
 use std::{
-    borrow::Cow,
     collections::BTreeSet,
     fs,
-    io::{ErrorKind, Read as _},
+    io::{ErrorKind, Read},
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
+};
+
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
 };
 
 use super::ComponentFailure;
@@ -29,26 +34,31 @@ const TEMP_OLD_SUFFIX: &str = ".plasmoid-updater-old";
 
 // --- Generic Recursive Directory Search ---
 
-/// Recursively searches a directory tree for an entry matching the predicate.
-///
-/// The predicate is tested against each directory. If it returns `true`,
-/// that directory's path is returned. Otherwise, subdirectories are searched.
+/// The deepest directory level a package search descends into. No KDE Store
+/// package nests its root this far down, and an unbounded walk over a hostile
+/// archive could overflow the stack.
+const MAX_SEARCH_DEPTH: usize = 8;
+
+/// Searches a directory tree breadth-first for the first directory matching the
+/// predicate, so a shallow root always beats a deeper one.
 fn find_in_dir<F>(dir: &Path, predicate: F) -> Option<PathBuf>
 where
     F: Fn(&Path) -> bool + Copy,
 {
-    if predicate(dir) {
-        return Some(dir.to_path_buf());
-    }
-
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            // A link is not followed: it may point anywhere, including outside
-            // the extract directory this search must stay in.
-            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-                let path = entry.path();
-                if let Some(found) = find_in_dir(&path, predicate) {
-                    return Some(found);
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), 0)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        if predicate(&dir) {
+            return Some(dir);
+        }
+        if depth >= MAX_SEARCH_DEPTH {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                // A link is not followed: it may point anywhere, including outside
+                // the extract directory this search must stay in.
+                if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                    queue.push_back((entry.path(), depth + 1));
                 }
             }
         }
@@ -57,12 +67,16 @@ where
     None
 }
 
-/// Recursively searches for files (not directories) matching a predicate.
+/// Searches breadth-first for a file (not a directory) matching the predicate.
 fn find_file_in_dir<F>(dir: &Path, predicate: F) -> Option<PathBuf>
 where
     F: Fn(&Path) -> bool + Copy,
 {
-    if let Ok(entries) = fs::read_dir(dir) {
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), 0)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -72,14 +86,74 @@ where
             // into: the search stays inside the extract directory.
             if file_type.is_file() && predicate(&path) {
                 return Some(path);
-            } else if file_type.is_dir()
-                && let Some(found) = find_file_in_dir(&path, predicate)
-            {
-                return Some(found);
+            } else if file_type.is_dir() && depth < MAX_SEARCH_DEPTH {
+                queue.push_back((path, depth + 1));
             }
         }
     }
     None
+}
+
+/// Whether `path` is a regular file, checked without following the final path
+/// component: a FIFO, socket or device must never be opened as data, and
+/// opening a FIFO for reading waits for a writer that may never come.
+pub(crate) fn is_regular_file(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+/// Whether `path` is a directory, checked without following it.
+fn is_directory(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+/// The largest metadata file the installer or discovery reads whole.
+///
+/// A sparse archive member can declare gigabytes while the archive itself
+/// stays small, so the extraction cap does not bound what a metadata read
+/// pulls into memory.
+pub(crate) const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+
+/// Whether a metadata file is small enough to read whole; a file whose size
+/// cannot be read is not, and the caller reports it.
+pub(crate) fn metadata_size_ok(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.len() <= MAX_METADATA_BYTES)
+}
+
+/// Reads a metadata file the installer owns, refusing one past the cap.
+fn read_metadata_text(path: &Path) -> Result<String, ComponentFailure> {
+    let size = path
+        .symlink_metadata()
+        .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?
+        .len();
+    if size > MAX_METADATA_BYTES {
+        return Err(install_failure(format!(
+            "{} is larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+            path.display()
+        )));
+    }
+    fs::read_to_string(path).map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))
+}
+
+/// Reads a metadata file for a read-only answer, skipping one past the cap
+/// with a warning: such a caller has no failure row to report it on.
+fn read_metadata_for_query(path: &Path, target: &str) -> Option<String> {
+    if !metadata_size_ok(path) {
+        log::warn!(
+            target: target,
+            "ignoring {}: larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+            path.display()
+        );
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+/// Drops a leading UTF-8 byte-order mark, which Qt accepts and serde rejects.
+fn strip_bom(content: &str) -> &str {
+    content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
 // --- Utility Functions ---
@@ -275,12 +349,12 @@ fn recover_dirs(system: bool) -> Vec<PathBuf> {
     dirs
 }
 
-fn recover_in_dir(dir: &Path) {
+/// The components a directory's hidden siblings name, once each.
+fn sibling_component_names(dir: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return names;
     };
-
-    let mut components: BTreeSet<String> = BTreeSet::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
@@ -289,11 +363,14 @@ fn recover_in_dir(dir: &Path) {
         if let Some(component) = installer_sibling_component(name)
             && !component.is_empty()
         {
-            components.insert(component.to_string());
+            names.insert(component.to_string());
         }
     }
+    names
+}
 
-    for component in components {
+fn recover_in_dir(dir: &Path) {
+    for component in sibling_component_names(dir) {
         let dest = dir.join(component);
         if let Err(e) = settle_hidden_siblings(&dest, "recover") {
             log::warn!(
@@ -304,6 +381,44 @@ fn recover_in_dir(dir: &Path) {
             );
         }
     }
+}
+
+/// The display names of the components a killed run stranded in their
+/// `.plasmoid-updater-old` sibling with no visible component beside them.
+///
+/// A `-new` sibling alone is a half-copy that never held the component, and one
+/// beside its component is a dead copy: neither is a component a check names.
+pub(crate) fn stranded_components(system: bool) -> Vec<String> {
+    recover_dirs(system)
+        .iter()
+        .flat_map(|dir| stranded_in_dir(dir))
+        .collect()
+}
+
+/// The stranded components of one directory, named for display.
+fn stranded_in_dir(dir: &Path) -> Vec<String> {
+    let mut stranded = Vec::new();
+    for component in sibling_component_names(dir) {
+        let dest = dir.join(&component);
+        // An unreadable path is not a proven absence: reporting it would also
+        // need a write to repair it.
+        if path_present(&dest).unwrap_or(true) {
+            continue;
+        }
+        let old = temp_sibling(&dest, TEMP_OLD_SUFFIX);
+        if path_present(&old).unwrap_or(false) {
+            stranded.push(stranded_display_name(&old, &component));
+        }
+    }
+    stranded
+}
+
+/// A stranded tree's display name from its metadata, or its directory name when
+/// the metadata is unreadable.
+fn stranded_display_name(tree: &Path, directory_name: &str) -> String {
+    crate::checker::read_metadata(tree)
+        .and_then(|metadata| metadata.name().map(str::to_string))
+        .unwrap_or_else(|| directory_name.to_string())
 }
 
 /// Settles the hidden siblings beside `dest` from the evidence they carry.
@@ -362,12 +477,14 @@ fn settle_hidden_siblings(dest: &Path, target: &str) -> Result<(), ComponentFail
 
 // --- Metadata ---
 
+/// The root of a package in an extract directory: its shallowest directory
+/// holding either metadata file, so a root `metadata.desktop` beats a nested
+/// `contents/config/metadata.json`.
 pub(super) fn find_package_dir(extract_dir: &Path) -> Option<PathBuf> {
-    if let Some(dir) = find_in_dir(extract_dir, |d| d.join("metadata.json").exists()) {
-        return Some(dir);
-    }
-
-    find_in_dir(extract_dir, |d| d.join("metadata.desktop").exists())
+    find_in_dir(extract_dir, |dir| {
+        is_regular_file(&dir.join("metadata.json"))
+            || is_regular_file(&dir.join("metadata.desktop"))
+    })
 }
 
 /// Patches a `metadata.json` file to update the version and KPackageStructure fields.
@@ -376,21 +493,50 @@ pub(super) fn patch_metadata(
     component_type: ComponentType,
     new_version: &str,
 ) -> Result<(), ComponentFailure> {
-    let content = fs::read_to_string(metadata_path)
-        .map_err(|e| ComponentFailure::io(FailureKind::Install, metadata_path, e))?;
-    let mut json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+    if !is_regular_file(metadata_path) {
+        return Err(install_failure(format!(
+            "{} is not a regular file",
+            metadata_path.display()
+        )));
+    }
+    let content = read_metadata_text(metadata_path)?;
+    let mut json: serde_json::Value = serde_json::from_str(strip_bom(&content)).map_err(|e| {
         ComponentFailure::new(
             FailureKind::Install,
             format!("failed to parse {}: {e}", metadata_path.display()),
         )
     })?;
 
+    let Some(object) = json.as_object_mut() else {
+        return Err(install_failure(format!(
+            "{} is not a JSON object",
+            metadata_path.display()
+        )));
+    };
+
     if let Some(kpackage_type) = component_type.kpackage_type() {
-        json["KPackageStructure"] = serde_json::Value::String(kpackage_type.to_string());
+        object.insert(
+            "KPackageStructure".to_string(),
+            serde_json::Value::String(kpackage_type.to_string()),
+        );
     }
 
-    if let Some(kplugin) = json.get_mut("KPlugin") {
-        kplugin["Version"] = serde_json::Value::String(new_version.to_string());
+    // A KPlugin that is not an object is left alone rather than overwritten:
+    // the file still installs, and the version check reports the mismatch.
+    if let Some(kplugin) = object.get_mut("KPlugin") {
+        match kplugin.as_object_mut() {
+            Some(kplugin) => {
+                kplugin.insert(
+                    "Version".to_string(),
+                    serde_json::Value::String(new_version.to_string()),
+                );
+            }
+            None => log::warn!(
+                target: "patch",
+                "{}: KPlugin is not an object",
+                metadata_path.display()
+            ),
+        }
     }
 
     let patched = serde_json::to_string_pretty(&json).map_err(|e| {
@@ -409,8 +555,13 @@ pub(super) fn patch_metadata_desktop(
     metadata_path: &Path,
     new_version: &str,
 ) -> Result<(), ComponentFailure> {
-    let content = fs::read_to_string(metadata_path)
-        .map_err(|e| ComponentFailure::io(FailureKind::Install, metadata_path, e))?;
+    if !is_regular_file(metadata_path) {
+        return Err(install_failure(format!(
+            "{} is not a regular file",
+            metadata_path.display()
+        )));
+    }
+    let content = read_metadata_text(metadata_path)?;
     let line_ending = if content.contains("\r\n") {
         "\r\n"
     } else {
@@ -452,30 +603,274 @@ fn install_failure(message: impl Into<String>) -> ComponentFailure {
 
 // --- Plugin ID Resolution ---
 
-/// Reads the KPlugin.Id from a component's metadata.json, falling back to directory_name.
-fn resolve_plugin_id(component: &InstalledComponent) -> Cow<'_, str> {
-    let metadata_path = component.path.join("metadata.json");
-    if let Ok(content) = fs::read_to_string(&metadata_path)
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-        && let Some(id) = json
-            .get("KPlugin")
-            .and_then(|kp| kp.get("Id"))
-            .and_then(|v| v.as_str())
-        && !id.is_empty()
-    {
-        return Cow::Owned(id.to_string());
+/// The non-empty plugin id a package records, from `metadata.json`
+/// `KPlugin.Id` when it carries one and from `metadata.desktop`
+/// `X-KDE-PluginInfo-Name` otherwise.
+///
+/// Only a regular metadata file is read, and a `KPlugin` that is not an object
+/// carries no id: either way the answer falls through to the next source.
+pub(super) fn plugin_id(package_dir: &Path) -> Option<String> {
+    json_plugin_id(package_dir).or_else(|| desktop_plugin_id(package_dir))
+}
+
+/// The non-empty `KPlugin.Id` a package's `metadata.json` records.
+fn json_plugin_id(package_dir: &Path) -> Option<String> {
+    let metadata_path = package_dir.join("metadata.json");
+    if !is_regular_file(&metadata_path) {
+        return None;
     }
-    Cow::Borrowed(&component.directory_name)
+    let content = read_metadata_for_query(&metadata_path, "install")?;
+    let json: serde_json::Value = serde_json::from_str(strip_bom(&content)).ok()?;
+    json.get("KPlugin")?
+        .get("Id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// The non-empty `X-KDE-PluginInfo-Name` a package's `metadata.desktop`
+/// records.
+fn desktop_plugin_id(package_dir: &Path) -> Option<String> {
+    let metadata_path = package_dir.join("metadata.desktop");
+    if !is_regular_file(&metadata_path) {
+        return None;
+    }
+    let content = read_metadata_for_query(&metadata_path, "install")?;
+    desktop_entry_plugin_id(&content)
+}
+
+/// The id a `metadata.desktop` body records in its `[Desktop Entry]` group.
+///
+/// KConfig trims the key and the value and keeps the last duplicate, so a
+/// raw prefix scan over every group reads a different id than KDE does.
+fn desktop_entry_plugin_id(content: &str) -> Option<String> {
+    let entry = freedesktop_entry_parser::Entry::parse(content.as_bytes()).ok()?;
+    let section = entry.section("Desktop Entry")?;
+    section
+        .attr("X-KDE-PluginInfo-Name")
+        .last()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Refuses a package root whose metadata entries are not regular files.
+///
+/// kpackagetool6 follows a symlinked `metadata.json` and installs whatever id
+/// the link target names, and opening a FIFO waits for a writer that may never
+/// come while the run holds the update lock. Both are refused before anything
+/// reads or copies the package.
+pub(super) fn verify_package_metadata(package_dir: &Path) -> Result<(), ComponentFailure> {
+    for name in ["metadata.json", "metadata.desktop"] {
+        let path = package_dir.join(name);
+        match path.symlink_metadata() {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(install_failure(format!(
+                    "{} is not a regular file",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(ComponentFailure::io(FailureKind::Install, &path, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Refuses the package root `find_package_dir` returns when its metadata is
+/// not a regular file; a tree with no package root is left to the install step.
+pub(super) fn verify_extracted_package(extract_dir: &Path) -> Result<(), ComponentFailure> {
+    match find_package_dir(extract_dir) {
+        Some(package_dir) => verify_package_metadata(&package_dir),
+        None => Ok(()),
+    }
+}
+
+/// Refuses an extracted package holding an entry the installer would follow
+/// out of its own tree.
+///
+/// kpackagetool6 dereferences every symlink in the package, so an absolute
+/// link, or a relative one whose target leaves the package root, copies a file
+/// the store never shipped; with `--system` that copy runs as root. A relative
+/// link's text is not the path it resolves to: a link that walks through
+/// another link cancels a component the real path does not, so the link is
+/// resolved on the filesystem and must stay under the canonical root. A link
+/// that cannot be resolved (dangling, looping) is refused the same way.
+///
+/// A kpackagetool package refuses a link that resolves to a directory as well:
+/// the tool copies it recursively and follows it again on every level, so a
+/// link to an ancestor multiplies the tree. A direct copy recreates a link
+/// without following it, so it keeps a link to a directory inside the root; an
+/// icon theme ships those.
+///
+/// The walk keeps its own stack, so a deep tree cannot overflow the stack, and
+/// extraction has already bounded the number of entries.
+pub(super) fn verify_package_tree(
+    root: &Path,
+    component_type: ComponentType,
+) -> Result<(), ComponentFailure> {
+    let canonical_root =
+        fs::canonicalize(root).map_err(|e| ComponentFailure::io(FailureKind::Install, root, e))?;
+    let refuses_directory_links = component_type.kpackage_type().is_some();
+    // Reported once the whole tree is walked: a link that leaves the root is
+    // the worse finding, and the chain that reaches outside runs through a
+    // directory link, so its refusal must not hide the containment one.
+    let mut directory_link: Option<(PathBuf, PathBuf)> = None;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries =
+            fs::read_dir(&dir).map_err(|e| ComponentFailure::io(FailureKind::Install, &dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| ComponentFailure::io(FailureKind::Install, &dir, e))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|e| ComponentFailure::io(FailureKind::Install, &path, e))?;
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                let target = fs::read_link(&path)
+                    .map_err(|e| ComponentFailure::io(FailureKind::Install, &path, e))?;
+                if target.is_absolute() {
+                    return Err(install_failure(format!(
+                        "{} is an absolute symlink, which the install would follow",
+                        path.display()
+                    )));
+                }
+                if !link_target_stays_inside(&dir, &target, root) {
+                    return Err(install_failure(format!(
+                        "{} points outside the package root: {}",
+                        path.display(),
+                        target.display()
+                    )));
+                }
+                let resolved = fs::canonicalize(&path).map_err(|e| {
+                    install_failure(format!(
+                        "{} points at a target that cannot be resolved: {e}",
+                        path.display()
+                    ))
+                })?;
+                if !resolved.starts_with(&canonical_root) {
+                    return Err(install_failure(format!(
+                        "{} points outside the package root: {}",
+                        path.display(),
+                        target.display()
+                    )));
+                }
+                if refuses_directory_links && resolved.is_dir() && directory_link.is_none() {
+                    directory_link = Some((path, resolved));
+                }
+            } else if file_type.is_dir() {
+                pending.push(path);
+            } else if !file_type.is_file() {
+                return Err(install_failure(format!(
+                    "{} is not a regular file, directory or symlink",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if let Some((link, resolved)) = directory_link {
+        return Err(install_failure(format!(
+            "{} resolves to the directory {}, which kpackagetool6 copies recursively",
+            link.display(),
+            resolved.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `target`, resolved as text from `dir`, stays inside `root`.
+///
+/// This is the cheap first pass; a link whose text stays inside can still
+/// resolve outside, which [`verify_package_tree`] then settles on disk.
+fn link_target_stays_inside(dir: &Path, target: &Path, root: &Path) -> bool {
+    let Ok(relative) = dir.strip_prefix(root) else {
+        return false;
+    };
+    let mut resolved = PathBuf::new();
+    for component in relative.components().chain(target.components()) {
+        match component {
+            std::path::Component::Normal(part) => resolved.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !resolved.pop() {
+                    return false;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
+/// Refuses a store package whose plugin id names a different widget than the
+/// installed component, before any install step runs.
+///
+/// A type whose installed side carries no id is not a widget and skips the
+/// check. Once the installed side has one, a package that yields none (no
+/// metadata, unreadable, unparsable, no id key) is refused as well: skipping
+/// the comparison there is what lets a package install under another id.
+pub(super) fn verify_package_plugin_id(
+    extract_dir: &Path,
+    component: &InstalledComponent,
+) -> Result<(), ComponentFailure> {
+    let Some(installed_id) = plugin_id(&component.path) else {
+        return Ok(());
+    };
+    let package_id = find_package_dir(extract_dir).and_then(|dir| plugin_id(&dir));
+    let Some(package_id) = package_id else {
+        return Err(install_failure(format!(
+            "store entry is a different widget: installed {installed_id:?}, the package records no plugin id"
+        )));
+    };
+    if package_id != installed_id {
+        return Err(install_failure(format!(
+            "store entry is a different widget: installed {installed_id:?}, package {package_id:?}"
+        )));
+    }
+    Ok(())
 }
 
 // --- kpackagetool Installation ---
 
-/// Builds a base `kpackagetool6` command with `-t <type>`, `sudo`, and `--global` as needed.
+/// How long a `kpackagetool6` invocation may run before it is killed: a tool
+/// that blocks would otherwise hold the update lock for as long as it waits.
+const KPACKAGETOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a killed `kpackagetool6` and its process group get to exit before
+/// they are killed outright, and how long its pipe readers may take to finish.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn kpackagetool_timeout() -> std::time::Duration {
+    // A unit test cannot wait out the production deadline, so it may shorten it.
+    #[cfg(test)]
+    {
+        if let Some(millis) = std::env::var("PU_TEST_KPACKAGETOOL_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            return std::time::Duration::from_millis(millis);
+        }
+    }
+    KPACKAGETOOL_TIMEOUT
+}
+
+/// Builds a base `kpackagetool6` command with `-t <type>`, `sudo`, and
+/// `--global` as needed.
+///
+/// The not-installed answer this module matches is English text and
+/// kpackagetool prints it in the locale it inherits, so every call runs in the
+/// C locale. `sudo` resets the environment, so there the locale goes through
+/// `env`, which `sudo` passes on to the tool.
 fn kpackagetool_cmd(kpackage_type: &str, global: bool) -> std::process::Command {
-    let mut cmd = if global {
-        privilege::sudo_command("kpackagetool6")
+    let mut cmd = if global && !privilege::is_root() {
+        let mut cmd = privilege::sudo_command("env");
+        cmd.args(["LC_ALL=C", "LANGUAGE=C", "kpackagetool6"]);
+        cmd
     } else {
-        std::process::Command::new("kpackagetool6")
+        let mut cmd = std::process::Command::new("kpackagetool6");
+        cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
+        cmd
     };
     cmd.arg("-t").arg(kpackage_type);
     if global {
@@ -484,10 +879,167 @@ fn kpackagetool_cmd(kpackage_type: &str, global: bool) -> std::process::Command 
     cmd
 }
 
+/// Drains one of a child's pipes on its own thread.
+fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// Joins the pipe readers, giving them `grace` to finish.
+///
+/// A reader ends when every holder of its write end dies. A process that
+/// outlived the kill keeps one open, so a plain join could hold the run; this
+/// returns `false` instead.
+fn join_readers_bounded(
+    readers: Vec<std::thread::JoinHandle<Vec<u8>>>,
+    grace: std::time::Duration,
+) -> (Vec<Vec<u8>>, bool) {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if readers.iter().all(std::thread::JoinHandle::is_finished) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return (Vec::new(), false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let drained = readers
+        .into_iter()
+        .map(|reader| reader.join().unwrap_or_default())
+        .collect();
+    (drained, true)
+}
+
+/// Whether any process is left in `group`, checked without sending a signal.
+fn process_group_alive(group: Pid) -> bool {
+    killpg(group, None).is_ok()
+}
+
+/// Ends the child and every process it forked, giving the group a grace on
+/// `SIGTERM` before `SIGKILL`: `sudo` and the tool under it share the group,
+/// so the signal reaches the tool that actually holds the pipes. Returns
+/// whether a process survived the kill, which only a process running as
+/// another user (a root tool under sudo) can.
+fn terminate_group(child: &mut std::process::Child, group: Pid) -> bool {
+    let _ = killpg(group, Signal::SIGTERM);
+    let grace_deadline = std::time::Instant::now() + KILL_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return process_group_alive(group),
+            Ok(None) if std::time::Instant::now() >= grace_deadline => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(_) => return process_group_alive(group),
+        }
+    }
+    let _ = killpg(group, Signal::SIGKILL);
+    let _ = child.wait();
+    process_group_alive(group)
+}
+
+/// Runs `command` in its own process group, killing the whole group once
+/// `timeout` has passed.
+///
+/// Stdout and stderr are drained while the tool runs, so a child that fills a
+/// pipe cannot block the wait; a killed group closes its pipes and both
+/// readers finish. The readers are joined with a bound, because a descendant
+/// that survived the grace would otherwise keep the run waiting.
+fn run_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    tool: &str,
+) -> Result<std::process::Output, ComponentFailure> {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| install_failure(format!("failed to run {tool}: {e}")))?;
+    let group = Pid::from_raw(child.id() as i32);
+    let mut readers: Vec<std::thread::JoinHandle<Vec<u8>>> = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_reader(stdout));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_reader(stderr));
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let (drained, finished) = join_readers_bounded(readers, KILL_GRACE);
+                if !finished {
+                    let mut failure =
+                        install_failure(format!("{tool} exited but kept its output pipes open"));
+                    failure.process_may_still_run = true;
+                    return Err(failure);
+                }
+                let mut drained = drained.into_iter();
+                let stdout = drained.next().unwrap_or_default();
+                let stderr = drained.next().unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let still_running = terminate_group(&mut child, group);
+                let _ = join_readers_bounded(readers, KILL_GRACE);
+                let message = if still_running {
+                    format!(
+                        "{tool} timed out after {} s and is still running",
+                        timeout.as_secs()
+                    )
+                } else {
+                    format!("{tool} timed out after {} s", timeout.as_secs())
+                };
+                let mut failure = install_failure(message);
+                failure.process_may_still_run = still_running;
+                return Err(failure);
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(e) => {
+                let still_running = terminate_group(&mut child, group);
+                let _ = join_readers_bounded(readers, KILL_GRACE);
+                let mut failure = install_failure(format!("failed to wait for {tool}: {e}"));
+                failure.process_may_still_run = still_running;
+                return Err(failure);
+            }
+        }
+    }
+}
+
+/// The message a failed `kpackagetool6` run reports.
+///
+/// Both streams carry answers the tool prints (the not-installed text is on
+/// stdout), so the detail is built from stderr first and then stdout, and falls
+/// back to the exit status rather than reporting nothing.
+fn kpackagetool_failure(output: &std::process::Output) -> ComponentFailure {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = match (stderr.trim(), stdout.trim()) {
+        ("", "") => format!("kpackagetool6 exited with {}", output.status),
+        (stderr, "") => stderr.to_string(),
+        ("", stdout) => stdout.to_string(),
+        (stderr, stdout) => format!("{stderr}\n{stdout}"),
+    };
+    install_failure(format!("kpackagetool6 failed: {detail}"))
+}
+
 /// Installs or updates a component package using `kpackagetool6`.
 ///
-/// Tries `-u` (update) first. If that fails (e.g. stale kpackage DB entry after
-/// manual deletion), removes the old entry with `-r` and retries with `-i` (install).
+/// `-u` alone is what a stale kpackage entry needs: kpackagetool answers a
+/// package whose `KPlugin.Id` has no installed directory with exit status 2 and
+/// `is not installed` on either stream. That answer on the component's own
+/// directory means the tool does not recognise the installed tree, and `-i`
+/// would refuse it, so the package is copied over the tree instead. Every
+/// other failure is reported with the tool's own output, so a failed update is
+/// never turned into a remove and reinstall. Nothing is removed with `-r`.
 fn install_via_kpackagetool(
     package_dir: &Path,
     component: &InstalledComponent,
@@ -499,61 +1051,48 @@ fn install_via_kpackagetool(
             component.component_type
         ))
     })?;
+    let timeout = kpackagetool_timeout();
 
-    // Try update first -- the common path
-    let output = kpackagetool_cmd(kpackage_type, global)
-        .arg("-u")
-        .arg(package_dir)
-        .output()
-        .map_err(|e| install_failure(format!("failed to run kpackagetool6: {e}")))?;
+    let output = run_with_timeout(
+        kpackagetool_cmd(kpackage_type, global)
+            .arg("-u")
+            .arg(package_dir),
+        timeout,
+        "kpackagetool6",
+    )?;
     if output.status.success() {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    log::debug!(
+    let not_installed = output.status.code() == Some(2)
+        && (String::from_utf8_lossy(&output.stderr).contains("is not installed")
+            || String::from_utf8_lossy(&output.stdout).contains("is not installed"));
+    // An id-less package draws the same answer, but it is one kpackagetool
+    // refuses to install at all, so it stays a failure.
+    if !not_installed || plugin_id(package_dir).is_none() {
+        return Err(kpackagetool_failure(&output));
+    }
+
+    // A package with a plugin id reaches kpackagetool only when the component's
+    // directory is named after that id, so that directory is the component's
+    // own and is in place: the tool does not recognise it as installed, and
+    // `-i` would answer "already exists". Copying the package over the tree
+    // installs it.
+    log::info!(
         target: "install",
-        "kpackagetool6 -u failed for {}: {}",
+        "{}: kpackagetool6 does not recognise {}, which is in place; copying the package there",
         component.name,
-        stderr.trim(),
+        component.path.display(),
     );
-
-    // Remove stale DB entry (ignore failure -- it may not exist)
-    let plugin_id = resolve_plugin_id(component);
-    let remove_output = kpackagetool_cmd(kpackage_type, global)
-        .arg("-r")
-        .arg(plugin_id.as_ref())
-        .output();
-
-    if let Ok(ref out) = remove_output
-        && out.status.success()
-    {
-        log::debug!(
-            target: "install",
-            "removed stale kpackage entry for {}",
-            plugin_id,
-        );
-    }
-
-    // Fresh install
-    let output = kpackagetool_cmd(kpackage_type, global)
-        .arg("-i")
-        .arg(package_dir)
-        .output()
-        .map_err(|e| install_failure(format!("failed to run kpackagetool6: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(install_failure(format!(
-            "kpackagetool6 failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    Ok(())
+    atomic_install_dir(package_dir, &component.path)
 }
 
 /// Installs or updates a component using kpackagetool, with metadata patching.
+///
+/// kpackagetool addresses an installed package by its plugin id, so a
+/// component whose directory is named differently is installed at its own
+/// path instead: `-u` would answer "not installed" and `-i` would add a
+/// second tree under the id, leaving this one stale.
 pub(super) fn install_via_kpackage(
     extract_dir: &Path,
     component: &InstalledComponent,
@@ -565,13 +1104,13 @@ pub(super) fn install_via_kpackage(
     let metadata_json = package_dir.join("metadata.json");
     let metadata_desktop = package_dir.join("metadata.desktop");
 
-    if metadata_json.exists()
-        && let Err(e) = patch_metadata(&metadata_json, component.component_type, new_version)
-    {
-        log::warn!(target: "patch", "failed for {}: {}", component.name, e.message);
+    if is_regular_file(&metadata_json) {
+        // A metadata.json kpackagetool cannot read as an object is what it
+        // would install blind: refuse the package before the tool runs.
+        patch_metadata(&metadata_json, component.component_type, new_version)?;
     }
 
-    if metadata_desktop.exists()
+    if is_regular_file(&metadata_desktop)
         && let Err(e) = patch_metadata_desktop(&metadata_desktop, new_version)
     {
         log::warn!(
@@ -580,6 +1119,18 @@ pub(super) fn install_via_kpackage(
             component.name,
             e.message
         );
+    }
+
+    if let Some(package_id) = plugin_id(&package_dir)
+        && package_id != component.directory_name
+    {
+        log::info!(
+            target: "install",
+            "installing {} directly: its directory name differs from the plugin id {:?}",
+            component.name,
+            package_id,
+        );
+        return atomic_install_dir(&package_dir, &component.path);
     }
 
     let is_global = privilege::is_system_path(&component.path);
@@ -609,6 +1160,9 @@ fn locate_color_scheme_file(dir: &Path) -> Option<PathBuf> {
 
     // Fallback: check file content for KDE color scheme markers
     find_file_in_dir(dir, |path| {
+        if !is_regular_file(path) {
+            return false;
+        }
         let Ok(mut file) = fs::File::open(path) else {
             return false;
         };
@@ -648,34 +1202,35 @@ fn find_component_root_in_archive(
 fn has_component_structure(dir: &Path, component_type: ComponentType) -> bool {
     match component_type {
         ComponentType::AuroraeDecoration => {
-            dir.join("decoration.svg").exists() || dir.join("aurorae").exists()
+            is_regular_file(&dir.join("decoration.svg")) || is_directory(&dir.join("aurorae"))
         }
         ComponentType::GlobalTheme | ComponentType::SplashScreen => {
-            dir.join("metadata.json").exists() || dir.join("metadata.desktop").exists()
+            is_regular_file(&dir.join("metadata.json"))
+                || is_regular_file(&dir.join("metadata.desktop"))
         }
         ComponentType::PlasmaStyle => {
-            dir.join("colors").exists()
-                || dir.join("widgets").exists()
-                || dir.join("metadata.desktop").exists()
+            is_directory(&dir.join("colors"))
+                || is_directory(&dir.join("widgets"))
+                || is_regular_file(&dir.join("metadata.desktop"))
         }
         ComponentType::SddmTheme => {
-            dir.join("theme.conf").exists() || dir.join("Main.qml").exists()
+            is_regular_file(&dir.join("theme.conf")) || is_regular_file(&dir.join("Main.qml"))
         }
         ComponentType::KWinSwitcher => {
-            dir.join("metadata.json").exists() || dir.join("contents").exists()
+            is_regular_file(&dir.join("metadata.json")) || is_directory(&dir.join("contents"))
         }
         _ => false,
     }
 }
 
 fn find_icon_theme_dir(extract_dir: &Path) -> Option<PathBuf> {
-    find_in_dir(extract_dir, |d| d.join("index.theme").exists())
+    find_in_dir(extract_dir, |d| is_regular_file(&d.join("index.theme")))
 }
 
 fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
     // directory-based wallpaper (with contents/ or metadata.json)
     if let Some(dir) = find_in_dir(extract_dir, |d| {
-        d.join("contents").exists() || d.join("metadata.json").exists()
+        is_directory(&d.join("contents")) || is_regular_file(&d.join("metadata.json"))
     }) {
         return Some(dir);
     }
@@ -778,22 +1333,6 @@ fn install_theme_dir(
     atomic_install_dir(&source_dir, dest_dir)?;
     log::debug!(target: "install", "copied {} to {}", component_type, dest_dir.display());
     Ok(())
-}
-
-/// Returns `true` if the path is a single-file component (e.g., color scheme file, image).
-pub(super) fn is_single_file_component(path: &Path, component_type: ComponentType) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let lower = name.to_lowercase();
-
-    match component_type {
-        ComponentType::ColorScheme => COLOR_SCHEME_EXTENSIONS
-            .iter()
-            .any(|ext| lower.ends_with(ext)),
-        ComponentType::Wallpaper => IMAGE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)),
-        _ => false,
-    }
 }
 
 pub(super) fn install_raw_file(
@@ -1582,7 +2121,7 @@ exit 0
     }
 
     #[test]
-    fn resolve_plugin_id_reads_from_metadata() {
+    fn plugin_id_reads_from_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let metadata = dir.path().join("metadata.json");
         std::fs::write(
@@ -1591,35 +2130,746 @@ exit 0
         )
         .unwrap();
 
-        let component = InstalledComponent {
-            name: "Test".to_string(),
-            directory_name: "org.kde.wrong.name".to_string(),
-            version: "1.0".to_string(),
-            component_type: ComponentType::PlasmaWidget,
-            path: dir.path().to_path_buf(),
-            is_system: false,
-            release_date: String::new(),
-        };
-
-        let id = resolve_plugin_id(&component);
-        assert_eq!(id.as_ref(), "org.kde.actual.id");
+        assert_eq!(plugin_id(dir.path()).as_deref(), Some("org.kde.actual.id"));
     }
 
     #[test]
-    fn resolve_plugin_id_falls_back_to_directory_name() {
+    fn plugin_id_is_absent_without_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        // No metadata.json
+
+        assert_eq!(plugin_id(dir.path()), None);
+    }
+
+    #[test]
+    fn plugin_id_reads_from_metadata_desktop() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.desktop"),
+            "[Desktop Entry]\nName=Test\nX-KDE-PluginInfo-Name=org.kde.desktop.id\n",
+        )
+        .unwrap();
+
+        assert_eq!(plugin_id(dir.path()).as_deref(), Some("org.kde.desktop.id"));
+    }
+
+    /// An installed `metadata.json` past the cap is skipped with a warning, so
+    /// the installed side names no id and the check has nothing to compare.
+    #[test]
+    fn an_oversized_installed_metadata_json_leaves_the_plugin_id_check_unanswered() {
+        capture_logs();
+        let installed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            installed.path().join("metadata.json"),
+            format!(
+                r#"{{"KPlugin": {{"Id": "org.installed.widget"}}, "Pad": "{}"}}"#,
+                "x".repeat(MAX_METADATA_BYTES as usize)
+            ),
+        )
+        .unwrap();
+        let component = widget_at(installed.path(), "org.installed.widget");
+        let extract = tempfile::tempdir().unwrap();
+        let package = extract.path().join("org.other.widget");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.other.widget"}}"#,
+        )
+        .unwrap();
+
+        verify_package_plugin_id(extract.path(), &component).unwrap();
+
+        assert!(
+            captured_logs()
+                .iter()
+                .any(|line| line.contains("metadata cap")),
+            "the skipped installed metadata was not reported: {:?}",
+            captured_logs()
+        );
+    }
+
+    #[test]
+    fn verify_package_plugin_id_refuses_a_desktop_only_package_of_another_widget() {
+        let installed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            installed.path().join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.installed.widget"}}"#,
+        )
+        .unwrap();
         let component = InstalledComponent {
-            name: "Test".to_string(),
-            directory_name: "org.kde.fallback".to_string(),
+            name: "Installed Widget".to_string(),
+            directory_name: "org.installed.widget".to_string(),
             version: "1.0".to_string(),
             component_type: ComponentType::PlasmaWidget,
-            path: dir.path().to_path_buf(),
+            path: installed.path().to_path_buf(),
             is_system: false,
             release_date: String::new(),
         };
+        let extract = tempfile::tempdir().unwrap();
+        let package = extract.path().join("org.other.widget");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("metadata.desktop"),
+            "[Desktop Entry]\nX-KDE-PluginInfo-Name=org.other.widget\n",
+        )
+        .unwrap();
 
-        let id = resolve_plugin_id(&component);
-        assert_eq!(id.as_ref(), "org.kde.fallback");
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal
+                .message
+                .contains("store entry is a different widget"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo {} failed", path.display());
+    }
+
+    /// Runs `body` on its own thread and fails the test when it has not
+    /// returned within five seconds: the defect these tests pin is a read that
+    /// blocks forever, which must red the test rather than hang the suite.
+    fn within_five_seconds<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(body());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the call blocked for five seconds")
+    }
+
+    #[test]
+    fn patch_metadata_rejects_a_metadata_json_that_is_not_an_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, "[1, 2, 3]").unwrap();
+
+        let result = patch_metadata(&path, ComponentType::PlasmaWidget, "2.0");
+
+        assert!(result.is_err(), "a JSON array was patched: {result:?}");
+    }
+
+    #[test]
+    fn patch_metadata_survives_a_kplugin_that_is_not_an_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, r#"{"KPlugin": "not an object"}"#).unwrap();
+
+        // Either outcome is fine; a panic, which would unwind through the
+        // install pool and kill the whole run, is not.
+        let _ = patch_metadata(&path, ComponentType::PlasmaWidget, "2.0");
+    }
+
+    #[test]
+    fn a_symlinked_package_metadata_json_is_refused() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(package.path().join("metadata.desktop"), "[Desktop Entry]\n").unwrap();
+        let real = package.path().join("real.json");
+        std::fs::write(&real, r#"{"KPlugin": {"Id": "org.other.widget"}}"#).unwrap();
+        std::os::unix::fs::symlink(&real, package.path().join("metadata.json")).unwrap();
+
+        let refusal = verify_package_metadata(package.path()).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal.message.contains("metadata.json"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn a_fifo_package_metadata_json_is_refused() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(package.path().join("metadata.desktop"), "[Desktop Entry]\n").unwrap();
+        mkfifo(&package.path().join("metadata.json"));
+
+        let refusal = verify_package_metadata(package.path()).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal.message.contains("metadata.json"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    /// A component whose installed tree is `path`, for the plugin-id checks.
+    fn widget_at(path: &Path, directory_name: &str) -> InstalledComponent {
+        InstalledComponent {
+            name: "Installed Widget".to_string(),
+            directory_name: directory_name.to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::PlasmaWidget,
+            path: path.to_path_buf(),
+            is_system: false,
+            release_date: String::new(),
+        }
+    }
+
+    /// An installed widget whose `metadata.json` names `id`, and an extract
+    /// directory holding a package at `package_name`.
+    fn plugin_id_fixture(
+        installed_id: &str,
+        package_name: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        InstalledComponent,
+        PathBuf,
+    ) {
+        let installed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            installed.path().join("metadata.json"),
+            format!(r#"{{"KPlugin": {{"Id": "{installed_id}"}}}}"#),
+        )
+        .unwrap();
+        let component = widget_at(installed.path(), installed_id);
+        let extract = tempfile::tempdir().unwrap();
+        let package = extract.path().join(package_name);
+        std::fs::create_dir(&package).unwrap();
+        (installed, extract, component, package)
+    }
+
+    fn assert_different_widget(refusal: &ComponentFailure) {
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal
+                .message
+                .contains("store entry is a different widget"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn a_symlinked_package_metadata_desktop_is_refused() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(package.path().join("metadata.json"), "{}").unwrap();
+        let real = package.path().join("real.desktop");
+        std::fs::write(&real, "[Desktop Entry]\n").unwrap();
+        std::os::unix::fs::symlink(&real, package.path().join("metadata.desktop")).unwrap();
+
+        let refusal = verify_package_metadata(package.path()).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal.message.contains("metadata.desktop"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn a_fifo_package_metadata_desktop_is_refused() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(package.path().join("metadata.json"), "{}").unwrap();
+        mkfifo(&package.path().join("metadata.desktop"));
+
+        let refusal = verify_package_metadata(package.path()).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal.message.contains("metadata.desktop"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn a_package_desktop_id_written_with_spaced_equals_is_read() {
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.installed.widget", "org.installed.widget");
+        std::fs::write(
+            package.join("metadata.desktop"),
+            "[Desktop Entry]\nX-KDE-PluginInfo-Name = org.other.widget\n",
+        )
+        .unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_different_widget(&refusal);
+    }
+
+    #[test]
+    fn a_duplicate_package_desktop_id_takes_the_last_value() {
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.installed.widget", "org.installed.widget");
+        std::fs::write(
+            package.join("metadata.desktop"),
+            "[Desktop Entry]\n\
+             X-KDE-PluginInfo-Name=org.installed.widget\n\
+             X-KDE-PluginInfo-Name=org.other.widget\n",
+        )
+        .unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_different_widget(&refusal);
+    }
+
+    #[test]
+    fn a_package_desktop_id_in_another_group_is_not_the_plugin_id() {
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.installed.widget", "org.installed.widget");
+        std::fs::write(
+            package.join("metadata.desktop"),
+            "[Other Group]\n\
+             X-KDE-PluginInfo-Name=org.installed.widget\n\
+             [Desktop Entry]\n\
+             X-KDE-PluginInfo-Name=org.other.widget\n",
+        )
+        .unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_different_widget(&refusal);
+    }
+
+    #[test]
+    fn a_package_json_id_after_a_utf8_bom_is_read() {
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.installed.widget", "org.installed.widget");
+        std::fs::write(
+            package.join("metadata.json"),
+            "\u{feff}{\"KPlugin\": {\"Id\": \"org.other.widget\"}}",
+        )
+        .unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_different_widget(&refusal);
+    }
+
+    #[test]
+    fn a_package_with_no_plugin_id_is_refused_when_the_installed_side_has_one() {
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.installed.widget", "org.installed.widget");
+        std::fs::write(
+            package.join("metadata.desktop"),
+            "[Desktop Entry]\nName=Nameless\n",
+        )
+        .unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_different_widget(&refusal);
+    }
+
+    #[test]
+    fn a_package_link_leaving_its_root_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::create_dir_all(package.join("sub")).unwrap();
+        std::os::unix::fs::symlink("../../outside", package.join("sub").join("link")).unwrap();
+
+        let refusal = verify_package_tree(&package, ComponentType::PlasmaWidget).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal.message.contains("outside the package root"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn an_absolute_package_link_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::create_dir(&package).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", package.join("link")).unwrap();
+
+        let refusal = verify_package_tree(&package, ComponentType::IconTheme).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal.message.contains("absolute symlink"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn a_chain_of_package_links_leaving_the_root_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::create_dir_all(package.join("a/b")).unwrap();
+        std::os::unix::fs::symlink("../..", package.join("a/b/s")).unwrap();
+        std::os::unix::fs::symlink("s/../../..", package.join("a/b/l")).unwrap();
+
+        let refusal = verify_package_tree(&package, ComponentType::PlasmaWidget).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal.message.contains("outside the package root"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn a_package_directory_link_is_refused_for_kpackagetool() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::create_dir_all(package.join("contents/ui")).unwrap();
+        std::fs::write(package.join("contents/ui/main.qml"), "Item {}").unwrap();
+        std::os::unix::fs::symlink("..", package.join("contents/ui/loop")).unwrap();
+
+        let refusal = verify_package_tree(&package, ComponentType::PlasmaWidget).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(refusal.message.contains("directory"), "{}", refusal.message);
+    }
+
+    #[test]
+    fn a_package_link_staying_inside_its_root_is_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::create_dir_all(package.join("sub")).unwrap();
+        std::fs::write(package.join("target.txt"), b"inside").unwrap();
+        std::os::unix::fs::symlink("../target.txt", package.join("sub").join("link")).unwrap();
+
+        verify_package_tree(&package, ComponentType::IconTheme).unwrap();
+    }
+
+    #[test]
+    fn a_directory_link_staying_inside_an_icon_theme_is_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::create_dir_all(package.join("scalable/apps")).unwrap();
+        std::fs::write(package.join("scalable/apps/app.svg"), "<svg/>").unwrap();
+        std::os::unix::fs::symlink("..", package.join("scalable/apps/loop")).unwrap();
+
+        verify_package_tree(&package, ComponentType::IconTheme).unwrap();
+    }
+
+    #[test]
+    fn patch_metadata_refuses_a_metadata_json_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"KPlugin": {{}}, "Pad": "{}"}}"#,
+                "x".repeat(2 * 1024 * 1024)
+            ),
+        )
+        .unwrap();
+
+        let refusal = patch_metadata(&path, ComponentType::PlasmaWidget, "2.0").unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(refusal.message.contains("cap"), "{}", refusal.message);
+    }
+
+    #[test]
+    fn a_present_component_beside_a_stale_old_sibling_is_not_stranded() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("org.test.widget");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("metadata.json"), b"{}").unwrap();
+        let stale = temp_sibling(&dest, TEMP_OLD_SUFFIX);
+        std::fs::create_dir_all(&stale).unwrap();
+
+        assert!(
+            stranded_in_dir(dir.path()).is_empty(),
+            "a present component's dead old copy was reported stranded"
+        );
+
+        // Control: with the component gone, the same sibling is stranded.
+        std::fs::remove_dir_all(&dest).unwrap();
+        assert_eq!(stranded_in_dir(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn the_process_group_probe_sees_a_live_group_and_a_dead_one() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = Pid::from_raw(child.id() as i32);
+
+        assert!(process_group_alive(group), "a live group was read as gone");
+
+        let _ = killpg(group, Signal::SIGKILL);
+        let _ = child.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_group_alive(group) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            !process_group_alive(group),
+            "a dead group was read as alive"
+        );
+    }
+
+    const HUNG_CHILD: &str =
+        "installer::install::tests::a_hung_kpackagetool_is_killed_at_the_timeout";
+
+    /// A fake named `kpackagetool6` that forks a helper which keeps the pipes
+    /// open, then sleeps: killing only the direct child leaves the run blocked.
+    const FORKING_KPACKAGETOOL: &str = "#!/bin/sh\nsh -c 'sleep 30' &\nsleep 30\n";
+
+    #[test]
+    fn a_hung_kpackagetool_is_killed_at_the_timeout() {
+        if std::env::var_os("PU_TEST_HUNG_KPACKAGETOOL").is_some() {
+            let extract = PathBuf::from(std::env::var("PU_TEST_EXTRACT").unwrap());
+            let component = widget_at(
+                Path::new(&std::env::var("PU_TEST_COMPONENT").unwrap()),
+                "org.test.widget",
+            );
+            let started = std::time::Instant::now();
+
+            let refusal = install_via_kpackage(&extract, &component, "2.0").unwrap_err();
+
+            assert_eq!(refusal.kind, FailureKind::Install);
+            assert!(refusal.message.contains("timed out"), "{}", refusal.message);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(3),
+                "a forked kpackagetool kept the run: {:?}",
+                started.elapsed()
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("kpackagetool6"), FORKING_KPACKAGETOOL);
+        let extract = dir.path().join("extract");
+        std::fs::create_dir_all(extract.join("org.test.widget")).unwrap();
+        std::fs::write(
+            extract.join("org.test.widget").join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        let component = dir.path().join("component");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            HUNG_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_HUNG_KPACKAGETOOL", "1"),
+                ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "100"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_EXTRACT", extract.to_str().unwrap()),
+                ("PU_TEST_COMPONENT", component.to_str().unwrap()),
+            ],
+        );
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    const ID_LESS_CHILD: &str =
+        "installer::install::tests::an_id_less_package_answered_not_installed_is_not_copied";
+
+    /// kpackagetool answers an id-less package "not installed" too (measured:
+    /// `Error: Plugin metadata is not installed.`, exit 2), but such a package
+    /// is one it refuses to install, so the answer must not lead to a copy.
+    #[test]
+    fn an_id_less_package_answered_not_installed_is_not_copied() {
+        if std::env::var_os("PU_TEST_ID_LESS").is_some() {
+            let extract = PathBuf::from(std::env::var("PU_TEST_EXTRACT").unwrap());
+            let component_dir = PathBuf::from(std::env::var("PU_TEST_COMPONENT").unwrap());
+            let component = widget_at(&component_dir, "org.test.widget");
+
+            let refusal = install_via_kpackage(&extract, &component, "2.0").unwrap_err();
+
+            assert_eq!(refusal.kind, FailureKind::Install);
+            assert!(
+                !component_dir.join("contents/ui/main.qml").exists(),
+                "an id-less package was copied over the component"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(
+            &bin.join("kpackagetool6"),
+            "#!/bin/sh\necho 'Error: Plugin metadata is not installed.'\nexit 2\n",
+        );
+        let package = dir.path().join("extract/org.test.widget");
+        std::fs::create_dir_all(package.join("contents/ui")).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Name": "Installed Widget", "Version": "2.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("contents/ui/main.qml"), "Item {}\n").unwrap();
+        let component = dir.path().join("component/org.test.widget");
+        std::fs::create_dir_all(&component).unwrap();
+        std::fs::write(
+            component.join("metadata.json"),
+            r#"{"KPlugin": {"Name": "Installed Widget", "Version": "1.0"}}"#,
+        )
+        .unwrap();
+        let done = dir.path().join("child-done");
+        let extract = dir.path().join("extract");
+
+        let output = run_child(
+            ID_LESS_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_ID_LESS", "1"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_EXTRACT", extract.to_str().unwrap()),
+                ("PU_TEST_COMPONENT", component.to_str().unwrap()),
+            ],
+        );
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    const NON_OBJECT_CHILD: &str = "installer::install::tests::a_package_metadata_json_that_is_not_an_object_fails_before_kpackagetool";
+
+    #[test]
+    fn a_package_metadata_json_that_is_not_an_object_fails_before_kpackagetool() {
+        if std::env::var_os("PU_TEST_NON_OBJECT").is_some() {
+            let extract = PathBuf::from(std::env::var("PU_TEST_EXTRACT").unwrap());
+            let component = widget_at(
+                Path::new(&std::env::var("PU_TEST_COMPONENT").unwrap()),
+                "org.test.widget",
+            );
+
+            let refusal = install_via_kpackage(&extract, &component, "2.0").unwrap_err();
+
+            assert_eq!(refusal.kind, FailureKind::Install);
+            assert!(
+                !Path::new(&std::env::var("PU_TEST_KPACKAGETOOL_LOG").unwrap()).exists(),
+                "kpackagetool6 ran on a metadata.json that is not an object"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.path().join("kpackagetool.log");
+        write_script(
+            &bin.join("kpackagetool6"),
+            &format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 0\n", log.display()),
+        );
+        let extract = dir.path().join("extract");
+        std::fs::create_dir_all(extract.join("org.test.widget")).unwrap();
+        std::fs::write(
+            extract.join("org.test.widget").join("metadata.json"),
+            "[1, 2, 3]",
+        )
+        .unwrap();
+        let component = dir.path().join("component");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            NON_OBJECT_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_NON_OBJECT", "1"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_KPACKAGETOOL_LOG", log.to_str().unwrap()),
+                ("PU_TEST_EXTRACT", extract.to_str().unwrap()),
+                ("PU_TEST_COMPONENT", component.to_str().unwrap()),
+            ],
+        );
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn find_package_dir_skips_a_metadata_json_that_is_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        mkfifo(&dir.path().join("metadata.json"));
+
+        let found = find_package_dir(dir.path());
+
+        assert_eq!(found, None, "a FIFO was taken for the package metadata");
+    }
+
+    #[test]
+    fn patch_metadata_does_not_block_on_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        mkfifo(&path);
+
+        let result =
+            within_five_seconds(move || patch_metadata(&path, ComponentType::PlasmaWidget, "2.0"));
+
+        assert!(result.is_err(), "a FIFO was patched as metadata");
+    }
+
+    #[test]
+    fn find_package_dir_prefers_a_root_metadata_desktop_over_a_nested_metadata_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.desktop"),
+            "[Desktop Entry]\nName=Root\n",
+        )
+        .unwrap();
+        let nested = dir.path().join("contents/config");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("metadata.json"), "{}").unwrap();
+
+        let found = find_package_dir(dir.path());
+
+        assert_eq!(found.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn find_package_dir_finds_a_package_one_level_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("org.example.widget");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("metadata.json"), "{}").unwrap();
+
+        assert_eq!(find_package_dir(dir.path()), Some(package));
+    }
+
+    #[test]
+    fn find_package_dir_stops_descending_past_its_depth_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deep = dir.path().to_path_buf();
+        for level in 0..64 {
+            deep.push(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("metadata.json"), "{}").unwrap();
+
+        // No KDE Store package nests its root 64 directories down; a walker
+        // that still finds it has no bound.
+        assert_eq!(find_package_dir(dir.path()), None);
     }
 }

@@ -12,7 +12,7 @@ mod lock;
 mod plasmashell;
 pub(crate) mod privilege;
 #[cfg(test)]
-mod testutil;
+pub(crate) mod testutil;
 
 use std::{
     fs,
@@ -31,8 +31,11 @@ use crate::version::normalize_version;
 pub(crate) use backup::{BackupLedger, prune_backups};
 pub(crate) use download::remove_stale_temp_dirs;
 pub(crate) use inhibit::InhibitGuard;
-pub(crate) use install::{is_installer_sibling, recover_interrupted_installs};
-pub(crate) use lock::UpdateLock;
+pub(crate) use install::{
+    MAX_METADATA_BYTES, is_installer_sibling, is_regular_file, metadata_size_ok,
+    recover_interrupted_installs, stranded_components,
+};
+pub(crate) use lock::{UpdateLock, run_lock_held};
 pub(crate) use plasmashell::{requires_restart, restart_plasmashell};
 
 /// A single component's failure: the [`FailureKind`] naming the failed stage
@@ -42,6 +45,9 @@ pub(crate) use plasmashell::{requires_restart, restart_plasmashell};
 pub(crate) struct ComponentFailure {
     pub kind: FailureKind,
     pub message: String,
+    /// A process the failed step started may still be writing the component's
+    /// tree, so restoring the backup would race it.
+    pub process_may_still_run: bool,
 }
 
 impl ComponentFailure {
@@ -49,6 +55,7 @@ impl ComponentFailure {
         Self {
             kind,
             message: message.into(),
+            process_may_still_run: false,
         }
     }
 
@@ -79,7 +86,8 @@ pub(crate) struct InstallOutcome {
 ///
 /// Emits [`Event::Downloading`](crate::Event::Downloading) through `reporter`
 /// as the download progresses. On failure the original component is restored
-/// from its backup; if the restore itself fails, the returned
+/// from its backup unless the failed step left a process that may still write
+/// that tree; if the restore itself fails, the returned
 /// [`ComponentFailure`] carries kind
 /// [`FailureKind::RestoreFailed`] and both messages. `backups` records the
 /// backup's directory for the run's retention, which runs once the pool has
@@ -124,14 +132,7 @@ fn perform_installation(
     reporter: &dyn Reporter,
 ) -> Result<(), ComponentFailure> {
     let component = &update.installed;
-    let downloaded_path = download::download_package(
-        client,
-        &update.download_url,
-        update.checksum.as_deref(),
-        component,
-        temp_path,
-        reporter,
-    )?;
+    let downloaded_path = download::download_package(update, client, temp_path, reporter)?;
 
     execute_installation(
         &downloaded_path,
@@ -151,8 +152,10 @@ fn execute_installation(
         component.component_type,
         ComponentType::ColorScheme | ComponentType::Wallpaper,
     );
-    let is_raw_file = install::is_single_file_component(downloaded_path, component.component_type)
-        || (is_single_file_type && !has_archive_magic(downloaded_path));
+    // A raw file is the component itself only when the download carries no
+    // archive signature at all; an archive that fails to extract is an extract
+    // failure, never a component file.
+    let is_raw_file = is_single_file_type && !has_archive_magic(downloaded_path);
 
     if is_raw_file {
         let result = install::install_raw_file(downloaded_path, component);
@@ -164,11 +167,14 @@ fn execute_installation(
 }
 
 /// Checks the first bytes of a file for known archive format signatures.
+///
+/// A plain tar stores `ustar` 257 bytes in, so the probe reads a whole header
+/// rather than only the leading magic.
 fn has_archive_magic(path: &Path) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
-    let mut magic = [0u8; 6];
+    let mut magic = [0u8; 263];
     let Ok(n) = file.read(&mut magic) else {
         return false;
     };
@@ -182,6 +188,7 @@ fn has_archive_magic(path: &Path) -> bool {
         | [b'B', b'Z']     // bzip2
     ) || (n >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd]) // zstd
         || (n >= 6 && magic[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) // xz
+        || (n >= 262 && &magic[257..262] == b"ustar") // tar (ustar/gnu)
 }
 
 fn install_from_archive(
@@ -198,45 +205,39 @@ fn install_from_archive(
     }
 
     if let Err(e) = download::extract_archive(downloaded_path, &extract_dir) {
-        // For single-file types (color schemes, wallpapers), the download might
-        // be the raw file itself served without the expected extension.
-        if matches!(
-            component.component_type,
-            ComponentType::ColorScheme | ComponentType::Wallpaper
-        ) {
-            log::debug!(
-                target: "extract",
-                "extraction failed for {}, trying raw file install: {}",
-                component.name,
-                e.message,
-            );
-            let result = install::install_raw_file(downloaded_path, component);
-            let _ = fs::remove_file(downloaded_path);
-            return result;
-        }
         let _ = fs::remove_file(downloaded_path);
         return Err(e);
     }
 
     let _ = fs::remove_file(downloaded_path);
 
-    let result = if component.component_type.kpackage_type().is_some() {
-        match install::install_via_kpackage(&extract_dir, component, new_version) {
-            Ok(()) => Ok(()),
-            Err(e) if component.component_type.has_direct_fallback() => {
-                log::warn!(
-                    target: "install",
-                    "kpackagetool6 failed for {}, falling back to direct install: {}",
-                    component.name,
-                    e.message,
-                );
+    // The package must be a regular package of the component the store entry
+    // claims before any install step touches the installed tree: kpackagetool6
+    // follows every symlink in the package and blocks on a FIFO, and a copy
+    // would read whatever a link points at. The package root's own metadata is
+    // named first, so its refusal names the file rather than the link in it.
+    let result = install::verify_extracted_package(&extract_dir)
+        .and_then(|()| install::verify_package_tree(&extract_dir, component.component_type))
+        .and_then(|()| install::verify_package_plugin_id(&extract_dir, component))
+        .and_then(|()| {
+            if component.component_type.kpackage_type().is_some() {
+                match install::install_via_kpackage(&extract_dir, component, new_version) {
+                    Ok(()) => Ok(()),
+                    Err(e) if component.component_type.has_direct_fallback() => {
+                        log::warn!(
+                            target: "install",
+                            "kpackagetool6 failed for {}, falling back to direct install: {}",
+                            component.name,
+                            e.message,
+                        );
+                        install::install_direct(&extract_dir, component)
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
                 install::install_direct(&extract_dir, component)
             }
-            Err(e) => Err(e),
-        }
-    } else {
-        install::install_direct(&extract_dir, component)
-    };
+        });
 
     let _ = fs::remove_dir_all(&extract_dir);
     result
@@ -248,7 +249,7 @@ fn post_install_tasks(update: &AvailableUpdate) -> Result<(), ComponentFailure> 
     let installed_json = component.path.join("metadata.json");
     let installed_desktop = component.path.join("metadata.desktop");
 
-    if installed_json.exists() {
+    if install::is_regular_file(&installed_json) {
         if let Err(e) = install::patch_metadata(
             &installed_json,
             component.component_type,
@@ -256,7 +257,7 @@ fn post_install_tasks(update: &AvailableUpdate) -> Result<(), ComponentFailure> 
         ) {
             log::warn!(target: "patch", "failed to update installed metadata: {}", e.message);
         }
-    } else if installed_desktop.exists()
+    } else if install::is_regular_file(&installed_desktop)
         && let Err(e) = install::patch_metadata_desktop(&installed_desktop, &update.latest_version)
     {
         log::warn!(target: "patch", "failed to update installed metadata.desktop: {}", e.message);
@@ -312,17 +313,26 @@ fn read_installed_version(component: &InstalledComponent) -> Option<String> {
 
     // Try metadata.json first
     let json_path = component.path.join("metadata.json");
-    if json_path.exists()
-        && let Ok(content) = fs::read_to_string(&json_path)
-        && let Ok(meta) = serde_json::from_str::<crate::types::PackageMetadata>(&content)
-        && let Some(v) = meta.version()
-    {
-        return Some(v.to_string());
+    if install::is_regular_file(&json_path) {
+        if !install::metadata_size_ok(&json_path) {
+            log::warn!(
+                target: "verify",
+                "ignoring {}: larger than the {}-byte metadata cap",
+                json_path.display(),
+                install::MAX_METADATA_BYTES
+            );
+        } else if let Ok(content) = fs::read_to_string(&json_path)
+            && let Ok(meta) = serde_json::from_str::<crate::types::PackageMetadata>(&content)
+            && let Some(v) = meta.version()
+        {
+            return Some(v.to_string());
+        }
     }
 
     // Fall back to metadata.desktop
     let desktop_path = component.path.join("metadata.desktop");
-    if desktop_path.exists()
+    if install::is_regular_file(&desktop_path)
+        && install::metadata_size_ok(&desktop_path)
         && let Ok(content) = fs::read_to_string(&desktop_path)
     {
         for line in content.lines() {
@@ -351,11 +361,33 @@ fn read_version_from_registry(component: &InstalledComponent) -> Option<String> 
         .map(|e| e.version.clone())
 }
 
+/// Puts the backup back after a failed install, unless a process the failure
+/// left behind may still be writing the component's tree.
+///
+/// A tool that survived the kill keeps the tree open; restoring over it would
+/// mix the old and new trees under a writer, so the failure stands, names the
+/// backup to restore from, and leaves it for the next run.
 fn handle_installation_failure(
     backup_path: &Path,
     component: &InstalledComponent,
     original_error: &ComponentFailure,
 ) -> Result<(), ComponentFailure> {
+    if original_error.process_may_still_run {
+        log::error!(
+            target: "restore",
+            "not restoring {:?}: a process the failed install started may still be writing it; the backup is at {}",
+            component.name,
+            backup_path.display()
+        );
+        return Err(ComponentFailure::new(
+            FailureKind::Install,
+            format!(
+                "install failed ({}), and the tool that failed it may still be running; the backup was kept at {}",
+                original_error.message,
+                backup_path.display()
+            ),
+        ));
+    }
     if let Err(restore_err) = restore_component(backup_path, &component.path) {
         log::error!(
             target: "restore",
@@ -449,6 +481,115 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(&format!("{:?}", component.name))),
             "the restore failure log does not repr the component name: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn a_failure_that_left_a_process_running_keeps_the_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("backup");
+        std::fs::write(&backup, b"old").unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, b"new").unwrap();
+        let component = color_scheme(&target);
+        let mut failure = ComponentFailure::new(
+            FailureKind::Install,
+            "kpackagetool6 timed out after 300 s and is still running",
+        );
+        failure.process_may_still_run = true;
+
+        let lines = logged_by(|| {
+            let refusal = handle_installation_failure(&backup, &component, &failure).unwrap_err();
+            assert_eq!(refusal.kind, FailureKind::Install);
+            assert!(
+                refusal.message.contains(&backup.display().to_string()),
+                "{}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains("still running"),
+                "{}",
+                refusal.message
+            );
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new",
+            "the backup was restored over a tree a running tool may still be writing"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("not restoring") && line.contains(&component.name)),
+            "the kept backup was not logged: {lines:?}",
+        );
+    }
+
+    fn plain_tar_holding(dir: &Path, file: &str, content: &str) -> PathBuf {
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(file), content).unwrap();
+        let archive = dir.join("package");
+        let status = std::process::Command::new("tar")
+            .arg("--create")
+            .arg("--format=ustar")
+            .arg("--file")
+            .arg(&archive)
+            .arg("--directory")
+            .arg(&src)
+            .arg(file)
+            .status()
+            .unwrap();
+        assert!(status.success(), "tar failed building the fixture");
+        archive
+    }
+
+    #[test]
+    fn a_plain_tar_counts_as_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = plain_tar_holding(dir.path(), "Scheme.colors", "[Colors:View]\n");
+
+        assert!(has_archive_magic(&archive));
+    }
+
+    #[test]
+    fn a_plain_tar_color_scheme_installs_its_member_not_the_tar() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = plain_tar_holding(root.path(), "Scheme.colors", "[Colors:View]\n# new\n");
+        let dest = root.path().join("installed/FakeScheme.colors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
+        let temp = root.path().join("work");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        execute_installation(&archive, &color_scheme(&dest), "2.0", &temp).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "[Colors:View]\n# new\n"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_archive_fails_extraction_instead_of_installing_its_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        // gzip magic followed by bytes no gzip reader accepts.
+        let archive = root.path().join("package.tar.gz");
+        std::fs::write(&archive, [0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef]).unwrap();
+        let dest = root.path().join("installed/FakeScheme.colors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
+        let temp = root.path().join("work");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let result = execute_installation(&archive, &color_scheme(&dest), "2.0", &temp);
+
+        let failure = result.expect_err("a corrupt archive installed");
+        assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "[Colors:View]\n# old\n"
         );
     }
 }

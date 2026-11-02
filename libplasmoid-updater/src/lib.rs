@@ -119,20 +119,33 @@ pub struct CheckResult {
     pub skipped: Vec<String>,
     /// Components that could not be checked, with the reason for each failure.
     pub diagnostics: Vec<Diagnostic>,
+    /// Components whose store entry offers no download link for its version.
+    ///
+    /// Each is a [`FailureKind::NoMatchingDownload`] row a caller reports the
+    /// way [`update`] does: the store answered, this run just could not
+    /// install it. Each component is also listed in `diagnostics`, so a
+    /// `check` still prints why.
+    pub unavailable: Vec<Failure>,
 }
 
 impl CheckResult {
     pub(crate) fn from_internal(result: UpdateCheckResult) -> Self {
-        let diagnostics = result
+        let mut diagnostics: Vec<Diagnostic> = result
             .unresolved
             .into_iter()
             .chain(result.check_failures)
             .collect();
+        let mut unavailable = Vec::new();
+        for entry in result.no_matching_download {
+            diagnostics.push(entry.diagnostic.clone());
+            unavailable.push(entry.into_failure());
+        }
 
         Self {
             available_updates: result.updates,
             skipped: result.skipped,
             diagnostics,
+            unavailable,
         }
     }
 
@@ -151,6 +164,19 @@ impl CheckResult {
     pub fn is_empty(&self) -> bool {
         self.available_updates.is_empty() && self.diagnostics.is_empty() && self.skipped.is_empty()
     }
+
+    /// The diagnostics carrying the no-download reason, one per
+    /// [`Self::unavailable`] row.
+    ///
+    /// Each is one component whose store entry offered no download link for
+    /// its version. A caller that reports [`Self::unavailable`] as failures
+    /// uses this to keep those components out of the plain diagnostic lines
+    /// and out of `skipped`.
+    pub fn unavailable_diagnostics(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.reason == types::NO_DOWNLOAD_URL_REASON)
+    }
 }
 
 /// Downloads and installs every available update left after the check's
@@ -160,7 +186,9 @@ impl CheckResult {
 /// [`Config`]'s exclusions (the same single filtering [`check`] does), then
 /// download and install the rest on a thread pool. The names of excluded
 /// components and of components the check could not resolve land in
-/// [`UpdateResult::skipped`].
+/// [`UpdateResult::skipped`]; a component whose entry offers no download link
+/// for its version is a [`FailureKind::NoMatchingDownload`] row in
+/// [`UpdateResult::failed`].
 ///
 /// Progress and per-component outcomes are reported through `reporter`.
 /// This function never prompts and never restarts plasmashell; call
@@ -187,7 +215,7 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
     reporter.event(&Event::Checking);
 
     let api_client = api::ApiClient::new(config)?;
-    let check_result =
+    let mut check_result =
         crate::utils::apply_exclusions(crate::utils::fetch_updates(&api_client, config)?, config);
 
     let mut skipped = check_result.skipped;
@@ -199,21 +227,32 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
             .map(|d| d.name.clone()),
     );
 
+    // A component whose entry offers no download link for its version is a
+    // failure, not a skip: the store answered, this run just could not install
+    // it. It carries the component the check resolved.
+    let failed: Vec<Failure> = check_result
+        .no_matching_download
+        .drain(..)
+        .map(types::NoMatchingDownload::into_failure)
+        .collect();
+
     if check_result.updates.is_empty() {
         return Ok(UpdateResult {
             succeeded: Vec::new(),
-            failed: Vec::new(),
+            failed,
             skipped,
         });
     }
 
-    crate::utils::install_updates(
+    let mut result = crate::utils::install_updates(
         &check_result.updates,
         &api_client,
         config,
         reporter,
         skipped,
-    )
+    )?;
+    result.failed.extend(failed);
+    Ok(result)
 }
 
 /// Downloads and installs a caller-chosen selection, such as the output of
@@ -222,15 +261,20 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
 /// Installs exactly the selection it is given: [`Config`]'s exclusions do not
 /// apply here. They are applied once, in [`check`] — a selection built from
 /// [`CheckResult::available_updates`] already has the excluded components
-/// removed. Passing an empty selection returns an empty result and changes
-/// nothing. Like [`update`], this never prompts and never restarts
-/// plasmashell.
+/// removed. An empty selection installs nothing, but still takes the run lock
+/// and repairs what a killed run left stranded, so an interrupted install is
+/// recovered even when this run has nothing to install. When another run
+/// already holds the lock, an empty selection returns an empty result and
+/// leaves the repair to that run; a non-empty selection still fails. Like
+/// [`update`], this never prompts and never restarts plasmashell.
 ///
 /// # Errors
 ///
 /// Returns an [`Error`] when the run cannot start or finish:
-/// - [`Error::AlreadyRunning`] — another run holds the update lock
+/// - [`Error::AlreadyRunning`] — another run holds the update lock, and the
+///   selection is not empty
 /// - [`Error::MissingTool`] — `bsdtar` is missing, needed to extract archives
+///   when the selection is not empty
 /// - [`Error::Io`] naming the lock file — a sudo run could not take the
 ///   invoking user's ids to create it in that user's cache
 /// - the environment and store errors [`check`] documents
@@ -241,14 +285,25 @@ pub fn install(
     config: &Config,
     reporter: &dyn Reporter,
 ) -> Result<UpdateResult> {
+    let _lock = match installer::UpdateLock::acquire() {
+        Ok(lock) => lock,
+        Err(Error::AlreadyRunning) if updates.is_empty() => {
+            log::info!(
+                target: "lock",
+                "another run holds the update lock; it owns the interrupted-install repair"
+            );
+            return Ok(UpdateResult::default());
+        }
+        Err(error) => return Err(error),
+    };
+    crate::utils::validate_environment(config.skip_plasma_detection)?;
+    repair_after_interrupted_run(config);
+
     if updates.is_empty() {
         return Ok(UpdateResult::default());
     }
 
-    let _lock = installer::UpdateLock::acquire()?;
-    crate::utils::validate_environment(config.skip_plasma_detection)?;
     crate::utils::require_extractor()?;
-    repair_after_interrupted_run(config);
 
     let api_client = api::ApiClient::new(config)?;
 
@@ -338,9 +393,104 @@ pub fn restart_plasmashell() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
+
+    const LOCK_CHILD: &str = "tests::an_empty_install_defers_the_repair_to_a_running_lock_holder";
+    const LOCK_ROLE: &str = "PU_TEST_EMPTY_INSTALL_ROLE";
+    const LOCK_ROOT: &str = "PU_TEST_EMPTY_INSTALL_ROOT";
+
+    fn lock_child(root: &Path, role: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", LOCK_CHILD, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", root.join("home"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("TMPDIR", root.join("tmp"))
+            .env(LOCK_ROLE, role)
+            .env(LOCK_ROOT, root);
+        command
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// An empty `install()` under another run's lock has nothing to take: it
+    /// returns the empty result and leaves the interrupted-install repair to
+    /// the run that holds the lock, instead of failing the caller.
+    #[test]
+    fn an_empty_install_defers_the_repair_to_a_running_lock_holder() {
+        let Some(role) = std::env::var_os(LOCK_ROLE) else {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            for name in ["home", "data", "config", "cache", "runtime", "tmp"] {
+                std::fs::create_dir_all(root.join(name)).unwrap();
+            }
+
+            let mut holder = lock_child(&root, "hold").spawn().unwrap();
+            wait_for(&root.join("held"));
+            let body = lock_child(&root, "body").output().unwrap();
+            std::fs::write(root.join("release"), b"ok").unwrap();
+            let status = holder.wait().unwrap();
+
+            assert!(
+                body.status.success() && root.join("body-done").exists(),
+                "the empty install failed under a held lock ({}; body completed: {})\n--- stderr\n{}",
+                body.status,
+                root.join("body-done").exists(),
+                String::from_utf8_lossy(&body.stderr),
+            );
+            assert!(status.success(), "the holding child failed");
+            return;
+        };
+
+        let root = std::path::PathBuf::from(std::env::var(LOCK_ROOT).unwrap());
+        match role.to_str().unwrap() {
+            "hold" => {
+                let _lock =
+                    installer::UpdateLock::acquire().expect("the holding child could not lock");
+                std::fs::write(root.join("held"), b"ok").unwrap();
+                wait_for(&root.join("release"));
+            }
+            "body" => {
+                installer::testutil::capture_logs();
+                let config = Config::new()
+                    .with_skip_plasma_detection(true)
+                    .with_inhibit_idle(false);
+
+                let result = install(&[], &config, &())
+                    .expect("an empty install under a held lock must defer, not fail");
+
+                assert!(
+                    result.succeeded.is_empty() && result.failed.is_empty(),
+                    "{result:?}"
+                );
+                let logged = installer::testutil::captured_logs();
+                assert!(
+                    logged.iter().any(|line| line.starts_with("lock: ")
+                        && line.contains("another run holds the update lock")),
+                    "the deferral was not logged: {logged:?}"
+                );
+                std::fs::write(root.join("body-done"), b"ok").unwrap();
+            }
+            other => panic!("unknown role {other}"),
+        }
+    }
 
     #[test]
     fn a_registry_failure_on_a_plugin_type_counts_toward_needs_restart() {

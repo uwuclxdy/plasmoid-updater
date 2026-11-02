@@ -2,18 +2,28 @@
 
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{BufRead as _, Read, Write},
     os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::Duration,
 };
 
 use super::ComponentFailure;
-use crate::{Event, FailureKind, Reporter, types::InstalledComponent};
+use crate::{AvailableUpdate, Event, FailureKind, Reporter};
 
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const DOWNLOAD_BUFFER_SIZE: usize = 8192;
+/// The cap on an unverified download whose entry advertises no size at all.
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+/// The most an archive may claim to unpack to before extraction is refused.
+const MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// The most members an archive may hold before extraction is refused.
+const MAX_EXTRACTED_MEMBERS: u64 = 100_000;
+/// How far past twice its advertised size an unverified download may run: the
+/// store under-reports often enough (3 of 21 measurable no-MD5 entries served
+/// more than advertised plus a KiB) that the limit carries a margin.
+const ADVERTISED_SIZE_SLACK_BYTES: u64 = 1024 * 1024;
 
 /// The directory the run unpacks downloads into.
 fn temp_base() -> PathBuf {
@@ -105,23 +115,53 @@ fn grant_owner_access(path: &Path) {
     }
 }
 
+/// The bytes a download may write before it is refused.
+///
+/// A verified download is bounded by the extraction cap: nothing past it could
+/// be unpacked. An unverified one is bounded by twice the size its entry
+/// advertised plus a margin for the store's under-reporting, and falls back to
+/// [`MAX_DOWNLOAD_BYTES`] when no size is advertised either.
+fn download_limit(checksum: Option<&str>, advertised: Option<u64>) -> u64 {
+    match (checksum, advertised) {
+        (Some(_), _) => MAX_EXTRACTED_BYTES,
+        (None, Some(size)) => size
+            .saturating_mul(2)
+            .saturating_add(ADVERTISED_SIZE_SLACK_BYTES),
+        (None, None) => MAX_DOWNLOAD_BYTES,
+    }
+}
+
 /// Downloads a package with optional checksum verification, emitting
 /// [`Event::Downloading`] through `reporter` as chunks arrive: the event's
 /// `name` is the component's display name and its `id` the installed path.
 ///
+/// A download without an advertised MD5 is logged as unverified and capped at
+/// twice its advertised size plus a margin, or at [`MAX_DOWNLOAD_BYTES`] when
+/// no size is given; a verified one is capped at [`MAX_EXTRACTED_BYTES`].
+/// Reading past the cap is a download failure.
+///
 /// The component's directory name namespaces the download file, preventing
 /// filename collisions when multiple components download in parallel.
 pub(crate) fn download_package(
+    update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
-    url: &str,
-    expected_checksum: Option<&str>,
-    component: &InstalledComponent,
     temp_path: &Path,
     reporter: &dyn Reporter,
 ) -> Result<PathBuf, ComponentFailure> {
+    let component = &update.installed;
+    let url = &update.download_url;
     let file_name = url.rsplit('/').next().unwrap_or("package.tar.gz");
 
     let dest = temp_path.join(format!("{}_{file_name}", component.directory_name));
+    let limit = download_limit(update.checksum.as_deref(), update.download_size);
+
+    if update.checksum.is_none() {
+        log::warn!(
+            target: "download",
+            "{}: the store advertises no checksum, so the download is unverified and capped at {limit} bytes",
+            component.name,
+        );
+    }
 
     let response = client
         .get(url)
@@ -139,6 +179,14 @@ pub(crate) fn download_package(
     }
 
     let total = response.content_length();
+    if let Some(length) = total
+        && length > limit
+    {
+        return Err(ComponentFailure::new(
+            FailureKind::Download,
+            format!("the download advertises {length} bytes, over the {limit}-byte limit"),
+        ));
+    }
 
     let mut file =
         File::create(&dest).map_err(|e| ComponentFailure::io(FailureKind::Download, &dest, e))?;
@@ -164,6 +212,13 @@ pub(crate) fn download_package(
             .map_err(|e| ComponentFailure::io(FailureKind::Download, &dest, e))?;
 
         received += bytes_read as u64;
+        if received > limit {
+            fs::remove_file(&dest).ok();
+            return Err(ComponentFailure::new(
+                FailureKind::Download,
+                format!("the download exceeded the {limit}-byte limit"),
+            ));
+        }
         reporter.event(&Event::Downloading {
             name: component.name.clone(),
             id: id.clone(),
@@ -173,7 +228,7 @@ pub(crate) fn download_package(
     }
 
     // verify checksum if provided
-    if let Some(expected) = expected_checksum {
+    if let Some(expected) = update.checksum.as_deref() {
         let actual = format!("{:x}", hasher.finalize());
         if actual != expected.to_lowercase() {
             fs::remove_file(&dest).ok();
@@ -188,8 +243,130 @@ pub(crate) fn download_package(
     Ok(dest)
 }
 
+/// Caps an extraction listing as its lines arrive.
+struct ListingBudget {
+    bytes: u64,
+    members: u64,
+}
+
+impl ListingBudget {
+    fn new() -> Self {
+        Self {
+            bytes: 0,
+            members: 0,
+        }
+    }
+
+    /// Counts one listed member, refusing as soon as either cap is crossed.
+    fn add(&mut self, line: &str) -> Result<(), ComponentFailure> {
+        self.members += 1;
+        if let Some(size) = member_size(line) {
+            self.bytes = self.bytes.saturating_add(size);
+        }
+        if self.bytes > MAX_EXTRACTED_BYTES {
+            return Err(ComponentFailure::new(
+                FailureKind::Extract,
+                format!("the archive unpacks to over the {MAX_EXTRACTED_BYTES}-byte cap"),
+            ));
+        }
+        if self.members > MAX_EXTRACTED_MEMBERS {
+            return Err(ComponentFailure::new(
+                FailureKind::Extract,
+                format!("the archive holds more than the {MAX_EXTRACTED_MEMBERS}-member cap"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The size column of one `bsdtar -tvf` line.
+fn member_size(line: &str) -> Option<u64> {
+    line.split_whitespace().nth(4)?.parse().ok()
+}
+
 /// Extracts a package archive to the destination directory using `bsdtar`.
+///
+/// The archive is listed first, one line at a time: as soon as the members add
+/// up past [`MAX_EXTRACTED_BYTES`] or the archive holds more than
+/// [`MAX_EXTRACTED_MEMBERS`], the listing child is killed and nothing is
+/// written, so a hostile archive cannot fill the disk or hold its whole
+/// listing in memory.
 pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), ComponentFailure> {
+    let mut child = Command::new("bsdtar")
+        // Numeric owners keep the size in the same column whatever user and
+        // group names the archive itself carries.
+        .args(["-t", "-v", "--numeric-owner", "-f"])
+        .arg(archive_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            ComponentFailure::new(FailureKind::Extract, format!("failed to run bsdtar: {e}"))
+        })?;
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ComponentFailure::new(
+            FailureKind::Extract,
+            "bsdtar produced no listing stream".to_string(),
+        ));
+    };
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let mut budget = ListingBudget::new();
+    let mut listing = std::io::BufReader::new(stdout);
+    let mut line = Vec::new();
+    let refusal = loop {
+        line.clear();
+        match listing.read_until(b'\n', &mut line) {
+            Ok(0) => break None,
+            Ok(_) => {
+                if let Err(e) = budget.add(&String::from_utf8_lossy(&line)) {
+                    break Some(e);
+                }
+            }
+            Err(e) => {
+                break Some(ComponentFailure::new(
+                    FailureKind::Extract,
+                    format!("failed to read the archive listing: {e}"),
+                ));
+            }
+        }
+    };
+
+    if let Some(failure) = refusal {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(reader) = stderr_reader {
+            let _ = reader.join();
+        }
+        return Err(failure);
+    }
+
+    let status = child.wait().map_err(|e| {
+        ComponentFailure::new(
+            FailureKind::Extract,
+            format!("failed to wait for bsdtar: {e}"),
+        )
+    })?;
+    let stderr = stderr_reader.map_or_else(Vec::new, |reader| reader.join().unwrap_or_default());
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        let detail = if stderr.trim().is_empty() {
+            format!("bsdtar exited with status {status}")
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(ComponentFailure::new(FailureKind::Extract, detail));
+    }
+
     fs::create_dir_all(dest).map_err(|e| ComponentFailure::io(FailureKind::Extract, dest, e))?;
 
     let output = Command::new("bsdtar")
@@ -220,6 +397,231 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ComponentType, InstalledComponent};
+
+    fn update_fixture(url: &str, checksum: Option<&str>, size: Option<u64>) -> AvailableUpdate {
+        AvailableUpdate {
+            installed: InstalledComponent {
+                name: "Fake Scheme".to_string(),
+                directory_name: "FakeScheme.colors".to_string(),
+                version: "1.0".to_string(),
+                component_type: ComponentType::ColorScheme,
+                path: PathBuf::from("/nonexistent/FakeScheme.colors"),
+                is_system: false,
+                release_date: String::new(),
+            },
+            content_id: 1,
+            latest_version: "2.0".to_string(),
+            download_url: url.to_string(),
+            store_url: String::new(),
+            release_date: String::new(),
+            checksum: checksum.map(str::to_string),
+            download_size: size,
+        }
+    }
+
+    /// Serves `body` once over HTTP on a loopback port and returns its URL.
+    fn serve_once(body: Vec<u8>) -> String {
+        serve_with_length(body, true)
+    }
+
+    /// Serves `body` once, declaring its `Content-Length` or sending it
+    /// close-delimited (no length header) as a chunked or streaming store would.
+    fn serve_with_length(body: Vec<u8>, declare_length: bool) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let head = if declare_length {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
+            };
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        format!("http://127.0.0.1:{port}/package.tar.gz")
+    }
+
+    #[test]
+    fn an_unverified_download_is_capped_at_its_advertised_size_and_warns() {
+        use crate::installer::testutil::{capture_logs, captured_logs};
+
+        capture_logs();
+        let client = reqwest::blocking::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Control: the same body under a limit that covers it is accepted, so
+        // the failure below is the limit and not the fixture.
+        let accepted_url = serve_once(vec![0u8; 4096]);
+        let accepted = download_package(
+            &update_fixture(&accepted_url, None, Some(4096)),
+            &client,
+            dir.path(),
+            &(),
+        );
+        assert!(accepted.is_ok(), "{accepted:?}");
+
+        let capped_url = serve_once(vec![0u8; 2 * 1024 * 1024]);
+        let refusal = download_package(
+            &update_fixture(&capped_url, None, Some(1024)),
+            &client,
+            dir.path(),
+            &(),
+        )
+        .expect_err("an unverified download ran past its advertised size");
+        assert_eq!(refusal.kind, FailureKind::Download);
+        assert!(refusal.message.contains("limit"), "{}", refusal.message);
+
+        let lines = captured_logs();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("download: ") && line.contains("unverified")),
+            "an unverified download was not reported: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_archive_unpacking_past_the_cap_is_refused() {
+        let mut budget = ListingBudget::new();
+        let refusal = budget
+            .add("-rw-r--r--  0 0 0 3000000000 Nov  2 10:00 big")
+            .unwrap_err();
+        assert_eq!(refusal.kind, FailureKind::Extract);
+        assert!(refusal.message.contains("cap"), "{}", refusal.message);
+
+        // Control: a listing under the cap passes.
+        let mut control = ListingBudget::new();
+        control
+            .add("-rw-r--r--  0 0 0 1024 Nov  2 10:00 small")
+            .unwrap();
+    }
+
+    /// The streaming branch bounds a body that advertises no length: the
+    /// `Content-Length` refusal never runs for it.
+    #[test]
+    fn a_download_past_its_limit_without_a_length_header_is_refused() {
+        let client = reqwest::blocking::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Control: a close-delimited body under the limit is accepted, so the
+        // refusal below is the limit and not the missing header.
+        let accepted_url = serve_with_length(vec![0u8; 1024], false);
+        let accepted = download_package(
+            &update_fixture(&accepted_url, None, Some(4096)),
+            &client,
+            dir.path(),
+            &(),
+        );
+        assert!(accepted.is_ok(), "{accepted:?}");
+
+        let capped_url = serve_with_length(vec![0u8; 2 * 1024 * 1024], false);
+        let refusal = download_package(
+            &update_fixture(&capped_url, None, Some(1024)),
+            &client,
+            dir.path(),
+            &(),
+        )
+        .expect_err("a close-delimited download ran past its advertised size");
+        assert_eq!(refusal.kind, FailureKind::Download);
+    }
+
+    #[test]
+    fn an_archive_with_more_members_than_the_cap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("f"), b"").unwrap();
+        let names = dir.path().join("names");
+        std::fs::write(&names, "f\n".repeat(MAX_EXTRACTED_MEMBERS as usize + 1)).unwrap();
+        let archive = dir.path().join("many.tar.gz");
+        let status = std::process::Command::new("tar")
+            .arg("--create")
+            .arg("--gzip")
+            .arg("--file")
+            .arg(&archive)
+            .arg("--directory")
+            .arg(&src)
+            .arg("--files-from")
+            .arg(&names)
+            .status()
+            .unwrap();
+        assert!(status.success(), "tar failed building the fixture archive");
+
+        let dest = dir.path().join("out");
+        let refusal = extract_archive(&archive, &dest).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Extract);
+        assert!(refusal.message.contains("cap"), "{}", refusal.message);
+        assert!(
+            !dest.join("f").exists(),
+            "the over-cap archive was extracted"
+        );
+    }
+
+    /// A sparse member declares a size the archive does not hold, so the cap
+    /// has to be decided from the real listing rather than from the file size.
+    #[test]
+    fn an_archive_claiming_more_than_the_cap_is_refused_through_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::File::create(src.join("big"))
+            .unwrap()
+            .set_len(3 * 1024 * 1024 * 1024)
+            .unwrap();
+        let archive = dir.path().join("sparse.tar");
+        let status = std::process::Command::new("tar")
+            .args(["--create", "--sparse", "--file"])
+            .arg(&archive)
+            .arg("--directory")
+            .arg(&src)
+            .arg("big")
+            .status()
+            .unwrap();
+        assert!(status.success(), "tar failed building the sparse fixture");
+        let stored = std::fs::metadata(&archive).unwrap().len();
+        assert!(
+            stored < 1024 * 1024,
+            "the sparse fixture holds {stored} bytes, so it is not sparse"
+        );
+
+        let dest = dir.path().join("out");
+        let refusal = extract_archive(&archive, &dest).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Extract);
+        assert!(refusal.message.contains("cap"), "{}", refusal.message);
+        assert!(!dest.exists(), "an over-cap archive was extracted");
+    }
+
+    #[test]
+    fn a_verified_download_is_capped_at_the_extraction_cap() {
+        assert_eq!(
+            download_limit(Some("d41d8cd98f00b204e9800998ecf8427e"), Some(4096)),
+            MAX_EXTRACTED_BYTES
+        );
+        assert_eq!(
+            download_limit(Some("d41d8cd98f00b204e9800998ecf8427e"), None),
+            MAX_EXTRACTED_BYTES
+        );
+    }
+
+    #[test]
+    fn an_unverified_download_is_capped_at_twice_its_advertised_size_plus_a_mib() {
+        assert_eq!(download_limit(None, Some(4096)), 2 * 4096 + 1024 * 1024);
+        assert_eq!(download_limit(None, None), MAX_DOWNLOAD_BYTES);
+    }
 
     #[test]
     fn create_temp_dir_is_raii() {

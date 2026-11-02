@@ -137,14 +137,36 @@ impl Sandbox {
         self.root.path().join("pu-config")
     }
 
+    /// A directory searched before the inherited `PATH`, where a test puts
+    /// fake external tools.
+    pub fn bin_dir(&self) -> PathBuf {
+        self.root.path().join("bin")
+    }
+
+    /// Writes an executable `sh` script named `name` into [`Self::bin_dir`].
+    pub fn fake_tool(&self, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.bin_dir();
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// A command for `program` with a cleared environment holding only `PATH`
-    /// and the sandbox's `HOME`, `XDG_*`, `TMPDIR` and config dir.
+    /// (with [`Self::bin_dir`] first) and the sandbox's `HOME`, `XDG_*`,
+    /// `TMPDIR` and config dir.
     pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let root = self.root.path();
+        let mut path = std::ffi::OsString::from(self.bin_dir());
+        if let Some(inherited) = std::env::var_os("PATH") {
+            path.push(":");
+            path.push(inherited);
+        }
         let mut command = Command::new(program);
         command
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("PATH", path)
             .env("HOME", root.join("home"))
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_CONFIG_HOME", root.join("config"))
@@ -233,6 +255,24 @@ pub struct Listing {
     pub widget: Option<CatalogWidget>,
     /// The `<totalitems>` every catalog page reports.
     pub total_items: TotalItems,
+    /// The color scheme's `<download_version1>`; `None` serves `version`.
+    pub link_version: Option<&'static str>,
+    /// Whether the color scheme's entry omits `<downloadmd5sum1>`.
+    pub no_md5: bool,
+    /// The color scheme's `<downloadsize1>` in KiB; `None` serves the
+    /// archive's real size.
+    pub size_kb_override: Option<u64>,
+    /// Zero bytes appended to the served color scheme archive.
+    pub download_padding: usize,
+    /// When set, the widget download is a Plasma widget package whose
+    /// `KPlugin.Id` is this value, named and versioned as `widget` says.
+    pub widget_package_id: Option<&'static str>,
+    /// When set, the widget package's `metadata.json` is a symlink to a file
+    /// outside the package, beside a regular `metadata.desktop`.
+    pub widget_metadata_symlink: bool,
+    /// When set, the widget package carries a chain of links that each stay
+    /// inside the package root on paper but resolve outside it.
+    pub widget_package_link: bool,
 }
 
 impl Default for Listing {
@@ -250,6 +290,13 @@ impl Default for Listing {
             catalog_garbage: false,
             widget: None,
             total_items: TotalItems::Default,
+            link_version: None,
+            no_md5: false,
+            size_kb_override: None,
+            download_padding: 0,
+            widget_package_id: None,
+            widget_metadata_symlink: false,
+            widget_package_link: false,
         }
     }
 }
@@ -263,10 +310,31 @@ pub struct FakeStore {
 
 impl FakeStore {
     pub fn start(listing: Listing) -> Self {
-        let archive = scheme_archive();
+        let mut archive = scheme_archive();
+        let size_kb = listing
+            .size_kb_override
+            .unwrap_or_else(|| archive.len().div_ceil(1024) as u64);
+        archive.resize(archive.len() + listing.download_padding, 0);
         let md5 = listing
             .md5_override
             .map_or_else(|| format!("{:x}", md5::compute(&archive)), str::to_string);
+        let md5_field = if listing.no_md5 {
+            String::new()
+        } else {
+            format!("<downloadmd5sum1>{md5}</downloadmd5sum1>")
+        };
+        let widget_archive = listing
+            .widget
+            .zip(listing.widget_package_id)
+            .map(|(widget, id)| {
+                widget_archive(
+                    id,
+                    widget.name,
+                    widget.version,
+                    listing.widget_metadata_symlink,
+                    listing.widget_package_link,
+                )
+            });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let host = format!("http://127.0.0.1:{port}");
@@ -279,11 +347,11 @@ impl FakeStore {
              <version>{version}</version><typeid>{COLOR_SCHEME_CATEGORY}</typeid>\
              <changed>2026-10-01T00:00:00+00:00</changed>\
              <downloadlink1>{host}/dl/fake-scheme.tar.gz</downloadlink1>\
-             <download_version1>{version}</download_version1>\
-             <downloadmd5sum1>{md5}</downloadmd5sum1>\
+             <download_version1>{link_version}</download_version1>\
+             {md5_field}\
              <downloadsize1>{size_kb}</downloadsize1></content>",
             version = listing.version,
-            size_kb = archive.len().div_ceil(1024),
+            link_version = listing.link_version.unwrap_or(listing.version),
         );
         let widget = listing.widget.map(|widget| {
             let entry = format!(
@@ -300,6 +368,7 @@ impl FakeStore {
             entry,
             widget,
             archive,
+            widget_archive,
             in_catalog: listing.in_catalog,
             per_id_fails: listing.per_id_fails,
             per_id_fails_left: AtomicUsize::new(listing.per_id_fails_first),
@@ -348,6 +417,7 @@ struct Served {
     entry: String,
     widget: Option<(u16, String)>,
     archive: Vec<u8>,
+    widget_archive: Option<Vec<u8>>,
     in_catalog: bool,
     per_id_fails: bool,
     per_id_fails_left: AtomicUsize,
@@ -378,7 +448,11 @@ fn serve(mut stream: TcpStream, served: &Served) {
     let target = request_line.split_whitespace().nth(1).unwrap_or("");
     let entry = served.entry.as_str();
     let mut location: Option<String> = None;
-    let (status, body): (&str, Vec<u8>) = if target.starts_with("/dl/") {
+    let (status, body): (&str, Vec<u8>) = if target == "/dl/fake-widget.tar.gz"
+        && let Some(widget_archive) = &served.widget_archive
+    {
+        ("200 OK", widget_archive.clone())
+    } else if target.starts_with("/dl/") {
         ("200 OK", served.archive.clone())
     } else if target == format!("/ocs/v1/content/data/{SCHEME_ID}") {
         let fail_now = served
@@ -480,6 +554,64 @@ fn scheme_archive() -> Vec<u8> {
         .status()
         .unwrap();
     assert!(status.success(), "tar failed building the fixture archive");
+    std::fs::read(archive).unwrap()
+}
+
+/// A `.tar.gz` holding a Plasma widget package directory `<id>/` whose
+/// `metadata.json` carries `id`, `name` and `version`, built with the system
+/// `tar`. With `symlinked_metadata`, that file is a link out of the package
+/// beside a regular `metadata.desktop`. With `escaping_links`, `contents/ui`
+/// holds a chain of links that lands outside the package.
+fn widget_archive(
+    id: &str,
+    name: &str,
+    version: &str,
+    symlinked_metadata: bool,
+    escaping_links: bool,
+) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let package = dir.path().join("src").join(id);
+    std::fs::create_dir_all(package.join("contents/ui")).unwrap();
+    std::fs::write(
+        package.join("metadata.json"),
+        format!(
+            r#"{{"KPackageStructure": "Plasma/Applet", "KPlugin": {{"Id": "{id}", "Name": "{name}", "Version": "{version}"}}}}"#
+        ),
+    )
+    .unwrap();
+    if symlinked_metadata {
+        let metadata = package.join("metadata.json");
+        std::fs::remove_file(&metadata).unwrap();
+        std::os::unix::fs::symlink("../outside.json", &metadata).unwrap();
+        std::fs::write(
+            package.join("metadata.desktop"),
+            format!("[Desktop Entry]\nX-KDE-PluginInfo-Name={id}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        package.join("contents/ui/main.qml"),
+        "import QtQuick\nItem {}\n",
+    )
+    .unwrap();
+    if escaping_links {
+        // `s` names the package root; `l` walks through it and three more
+        // levels up, so it stays inside only when the target is read as text.
+        std::os::unix::fs::symlink("../..", package.join("contents/ui/s")).unwrap();
+        std::os::unix::fs::symlink("s/../../..", package.join("contents/ui/l")).unwrap();
+    }
+    let archive = dir.path().join("fake-widget.tar.gz");
+    let status = Command::new("tar")
+        .arg("--create")
+        .arg("--gzip")
+        .arg("--file")
+        .arg(&archive)
+        .arg("--directory")
+        .arg(dir.path().join("src"))
+        .arg(id)
+        .status()
+        .unwrap();
+    assert!(status.success(), "tar failed building the widget archive");
     std::fs::read(archive).unwrap()
 }
 

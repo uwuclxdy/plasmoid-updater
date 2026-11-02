@@ -10,7 +10,13 @@ use super::{IdLookup, resolution};
 pub(crate) enum ComponentCheckResult {
     Update(Box<AvailableUpdate>),
     Unresolved(Diagnostic),
-    CheckFailed(Diagnostic),
+    /// The store entry offers no download link this component may take. The
+    /// check reports the diagnostic; `update` turns the carried component into
+    /// a failure, since a component it cannot download for is not skipped.
+    NoMatchingDownload {
+        component: InstalledComponent,
+        diagnostic: Diagnostic,
+    },
     UpToDate,
 }
 
@@ -102,11 +108,14 @@ pub(crate) fn evaluate_store_entry(
         let available_version = (!entry.version.is_empty()).then(|| entry.version.clone());
         let diagnostic = Diagnostic::new(
             component.name.clone(),
-            "no download url available".to_string(),
+            crate::types::NO_DOWNLOAD_URL_REASON.to_string(),
         )
         .with_versions(installed_version, available_version)
         .with_content_id(content_id);
-        return ComponentCheckResult::CheckFailed(diagnostic);
+        return ComponentCheckResult::NoMatchingDownload {
+            component: component.clone(),
+            diagnostic,
+        };
     };
 
     let update = AvailableUpdate::builder(
@@ -117,7 +126,7 @@ pub(crate) fn evaluate_store_entry(
         entry.changed_date.clone(),
     )
     .checksum(download_info.checksum)
-    .download_size(download_info.size_kb.map(|kb| kb * 1024))
+    .download_size(download_info.size_kb.and_then(|kb| kb.checked_mul(1024)))
     .build();
 
     ComponentCheckResult::Update(Box::new(update))
@@ -156,6 +165,27 @@ mod tests {
             }],
             changed_date: "2025-06-01".to_string(),
         }
+    }
+
+    #[test]
+    fn an_advertised_size_past_u64_bytes_does_not_overflow() {
+        let component = make_component("Cool Widget", "org.example.cool");
+        let mut entry = make_entry(222, "Cool Widget", "2.0.0", 705);
+        entry.download_links[0].size_kb = Some(u64::MAX);
+
+        // Reading the KiB count as bytes must neither panic (debug) nor wrap
+        // to a small cap (release).
+        let ComponentCheckResult::Update(update) = evaluate_store_entry(&component, &entry, 222)
+        else {
+            panic!("expected an update");
+        };
+        assert!(
+            update
+                .download_size
+                .is_none_or(|size| size >= u64::MAX / 1024),
+            "the size wrapped to {:?}",
+            update.download_size
+        );
     }
 
     #[test]

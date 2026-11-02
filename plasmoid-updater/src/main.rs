@@ -277,6 +277,17 @@ fn report_diagnostics(result: &lib::CheckResult) {
     }
 }
 
+/// Reports every diagnostic but `except`: a component reported as a failure
+/// row must not also print a diagnostic line.
+fn report_diagnostics_except(result: &lib::CheckResult, except: &[&lib::Diagnostic]) {
+    for diagnostic in &result.diagnostics {
+        if except.contains(&diagnostic) {
+            continue;
+        }
+        report_diagnostic(diagnostic);
+    }
+}
+
 fn report_diagnostic(diagnostic: &lib::Diagnostic) {
     log::error!(
         "failed to check {:?}: {}",
@@ -322,6 +333,13 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
         RestartDecision::Never
     };
 
+    // A killed run's leftovers are put back under the run lock before anything
+    // reads the component directories: the lock-free check would list a
+    // stranded tree as an interrupted install, and `install` would only repair
+    // it after that check already reported the component. The named path needs
+    // the repair first too, since it resolves its name against what is on disk.
+    lib::install(&[], &update_config, reporter(quiet).as_ref())?;
+
     if let Some(ref name) = args.component {
         return do_update_single(name, update_config, restart, quiet);
     }
@@ -330,38 +348,43 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
     reporter.event(&lib::Event::Checking);
 
     let check_result = lib::check(&update_config)?;
-    report_diagnostics(&check_result);
+    let unavailable_diagnostics: Vec<&lib::Diagnostic> =
+        check_result.unavailable_diagnostics().collect();
+    report_diagnostics_except(&check_result, &unavailable_diagnostics);
 
     // The summary counts the same universe `check` reports: everything it set
     // aside (exclusions, components it could not settle) rides along as
-    // skipped, including on the branch that installs nothing.
+    // skipped. A component with no matching download is a failure row instead,
+    // so its diagnostic must not also count it skipped.
     let mut skipped = check_result.skipped.clone();
-    skipped.extend(check_result.diagnostics.iter().map(|d| d.name.clone()));
-    let check_failed = !check_result.diagnostics.is_empty();
+    let mut check_failed = false;
+    for diagnostic in &check_result.diagnostics {
+        if unavailable_diagnostics.contains(&diagnostic) {
+            continue;
+        }
+        skipped.push(diagnostic.name.clone());
+        check_failed = true;
+    }
 
-    let installable = if auto || !std::io::stdin().is_terminal() {
-        check_result.available_updates
+    let (installable, interactive_empty) = if auto || !std::io::stdin().is_terminal() {
+        (check_result.available_updates, false)
     } else if check_result.available_updates.is_empty() {
-        Vec::new()
+        (Vec::new(), false)
     } else {
         let selected = lib::cli::select(&check_result.available_updates)?;
-        if selected.is_empty() {
-            payload(format_args!("nothing to update"))?;
-            return Ok(if check_failed {
-                ExitCode::Failure
-            } else {
-                ExitCode::Success
-            });
-        }
-        selected
+        let empty = selected.is_empty();
+        (selected, empty)
     };
+    if interactive_empty {
+        payload(format_args!("nothing to update"))?;
+    }
 
-    let mut result = if installable.is_empty() {
-        lib::UpdateResult::default()
-    } else {
-        lib::install(&installable, &update_config, reporter.as_ref())?
-    };
+    // `install` runs even for an empty selection: it takes the lock and
+    // repairs what a killed run left stranded, which is what a check's
+    // "run update to restore" tells the user to do.
+    let mut result = lib::install(&installable, &update_config, reporter.as_ref())?;
     result.skipped.extend(skipped);
+    result.failed.extend(check_result.unavailable);
 
     finish_update(result, restart, check_failed)
 }
@@ -385,6 +408,10 @@ fn dry_run(config: &lib::Config, name: Option<&str>, quiet: bool) -> Result<Exit
                 payload(format_args!("no update available for {name:?}"))?;
                 return Ok(ExitCode::Success);
             }
+            Named::Unavailable(failure) => {
+                report_failure_rows(vec![failure]);
+                return Ok(ExitCode::Failure);
+            }
             Named::CheckFailed(diagnostic) => {
                 report_diagnostic(&diagnostic);
                 return Ok(ExitCode::Failure);
@@ -392,7 +419,12 @@ fn dry_run(config: &lib::Config, name: Option<&str>, quiet: bool) -> Result<Exit
             Named::Unknown => return Ok(unknown_component(name)),
         },
         None => {
-            report_diagnostics(&check_result);
+            let unavailable_diagnostics: Vec<&lib::Diagnostic> =
+                check_result.unavailable_diagnostics().collect();
+            report_diagnostics_except(&check_result, &unavailable_diagnostics);
+            report_failure_rows(check_result.unavailable.clone());
+            // A failure row the check settled fails the run even though its
+            // diagnostic line is not printed.
             (
                 check_result.available_updates.clone(),
                 !check_result.diagnostics.is_empty(),
@@ -437,6 +469,14 @@ fn do_update_single(
             payload(format_args!("no update available for {name:?}"))?;
             Ok(ExitCode::Success)
         }
+        Named::Unavailable(failure) => {
+            let result = lib::UpdateResult {
+                succeeded: Vec::new(),
+                failed: vec![failure],
+                skipped: Vec::new(),
+            };
+            finish_update(result, restart, false)
+        }
         Named::CheckFailed(diagnostic) => {
             report_diagnostic(&diagnostic);
             Ok(ExitCode::Failure)
@@ -453,6 +493,9 @@ enum Named {
     Excluded,
     /// The installed component has no pending update.
     UpToDate,
+    /// The installed component's store entry offers no download link for its
+    /// version, so the run reports the failure row the check settled.
+    Unavailable(lib::Failure),
     /// The check could not settle the installed component, with the diagnostic
     /// naming why.
     CheckFailed(lib::Diagnostic),
@@ -475,6 +518,14 @@ fn resolve_named(
         .collect();
     if !matched.is_empty() {
         return Ok(Named::Updates(matched));
+    }
+
+    if let Some(failure) = check_result
+        .unavailable
+        .iter()
+        .find(|failure| failure.component.name == name || failure.component.directory_name == name)
+    {
+        return Ok(Named::Unavailable(failure.clone()));
     }
 
     let installed = lib::get_installed(config)?;
@@ -506,6 +557,19 @@ fn resolve_named(
     } else {
         Ok(Named::UpToDate)
     }
+}
+
+/// Reports failure rows the check already settled, before any install runs.
+fn report_failure_rows(failed: Vec<lib::Failure>) {
+    if failed.is_empty() {
+        return;
+    }
+    let result = lib::UpdateResult {
+        succeeded: Vec::new(),
+        failed,
+        skipped: Vec::new(),
+    };
+    lib::cli::print_failures(&result);
 }
 
 /// A name no installed component answers to is the caller's usage error.

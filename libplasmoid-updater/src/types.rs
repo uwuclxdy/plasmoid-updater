@@ -568,7 +568,7 @@ impl PackageMetadata {
 /// Diagnostic information about a component that could not be checked or updated.
 ///
 /// Returned as part of [`CheckResult::diagnostics`](crate::CheckResult::diagnostics).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     /// Display name of the component.
     pub name: String,
@@ -612,12 +612,47 @@ impl Diagnostic {
     }
 }
 
+/// The diagnostic reason a component whose store entry offers no download link
+/// for its version carries. [`crate::CheckResult::unavailable_diagnostics`]
+/// keys on it.
+pub(crate) const NO_DOWNLOAD_URL_REASON: &str = "no download url available";
+
+/// A component whose store entry offered no download link for its version.
+///
+/// It is neither unresolved nor skipped: `check` reports the diagnostic and
+/// `update` reports a failure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NoMatchingDownload {
+    pub component: InstalledComponent,
+    pub diagnostic: Diagnostic,
+}
+
+impl NoMatchingDownload {
+    /// The failure row a caller reports for this component, naming the version
+    /// the store entry carried.
+    pub(crate) fn into_failure(self) -> Failure {
+        let version = self
+            .diagnostic
+            .available_version
+            .as_deref()
+            .unwrap_or("(unknown)");
+        Failure {
+            component: self.component,
+            kind: FailureKind::NoMatchingDownload,
+            message: format!("no download link matches the store entry's version {version:?}"),
+        }
+    }
+}
+
 /// Internal result of checking for available updates, including diagnostics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct UpdateCheckResult {
     pub updates: Vec<AvailableUpdate>,
     pub unresolved: Vec<Diagnostic>,
     pub check_failures: Vec<Diagnostic>,
+    /// Components whose store entry offers no download link for its version, so
+    /// `update` reports a failure rather than skipping them.
+    pub no_matching_download: Vec<NoMatchingDownload>,
     /// Names of components dropped by the configuration's exclusion rules.
     pub skipped: Vec<String>,
 }
@@ -633,6 +668,17 @@ impl UpdateCheckResult {
 
     pub fn add_check_failure(&mut self, diagnostic: Diagnostic) {
         self.check_failures.push(diagnostic);
+    }
+
+    pub fn add_no_matching_download(
+        &mut self,
+        component: InstalledComponent,
+        diagnostic: Diagnostic,
+    ) {
+        self.no_matching_download.push(NoMatchingDownload {
+            component,
+            diagnostic,
+        });
     }
 }
 
@@ -688,6 +734,31 @@ mod tests {
         assert_eq!(ComponentType::PlasmaStyle.category_id(), 104);
         assert_eq!(ComponentType::SplashScreen.category_id(), 716);
         assert_eq!(ComponentType::GlobalTheme.category_id(), 722);
+    }
+
+    #[test]
+    fn the_no_match_failure_reprs_the_store_version() {
+        let entry = NoMatchingDownload {
+            component: InstalledComponent {
+                name: "Widget".to_string(),
+                directory_name: "org.example.widget".to_string(),
+                version: "1.0".to_string(),
+                component_type: ComponentType::PlasmaWidget,
+                path: PathBuf::from("/plasmoids/org.example.widget"),
+                is_system: false,
+                release_date: String::new(),
+            },
+            diagnostic: Diagnostic::new("Widget".to_string(), NO_DOWNLOAD_URL_REASON.to_string())
+                .with_versions(Some("1.0".to_string()), Some("2.0".to_string())),
+        };
+
+        let failure = entry.into_failure();
+
+        assert_eq!(failure.kind, FailureKind::NoMatchingDownload);
+        assert_eq!(
+            failure.message,
+            "no download link matches the store entry's version \"2.0\""
+        );
     }
 
     #[test]

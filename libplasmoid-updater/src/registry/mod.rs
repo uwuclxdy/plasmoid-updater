@@ -72,6 +72,16 @@ fn user_components(
                 return None;
             }
             let directory_name = utils::extract_directory_name(&path)?;
+            // The installer's hidden siblings carry the component's own
+            // metadata and name; an entry naming one is not a component.
+            if crate::installer::is_installer_sibling(&directory_name) {
+                log::warn!(
+                    target: "registry",
+                    "ignoring {component_type} entry {:?}: its path names an installer sibling",
+                    entry.name,
+                );
+                return None;
+            }
             Some(InstalledComponent {
                 name: entry.name,
                 directory_name,
@@ -140,6 +150,14 @@ fn scan_system_components_trusting(
             let Some(directory_name) = utils::extract_directory_name(&path) else {
                 continue;
             };
+            if crate::installer::is_installer_sibling(&directory_name) {
+                log::warn!(
+                    target: "registry",
+                    "ignoring {component_type} system entry {:?}: its path names an installer sibling",
+                    entry.name,
+                );
+                continue;
+            }
             if !seen.insert(directory_name.clone()) {
                 continue;
             }
@@ -328,6 +346,11 @@ fn build_id_cache_trusting(
                 let Some(dir_name) = utils::extract_directory_name(&installed_path) else {
                     continue;
                 };
+                // An installer sibling is not a component and must not answer
+                // for the component whose name it carries.
+                if crate::installer::is_installer_sibling(&dir_name) {
+                    continue;
+                }
                 // A trusted system registry records the system installs; a user
                 // registry records only what the user's own run may update.
                 if system || ct.registry_only() || !privilege::is_system_path(&installed_path) {
@@ -730,6 +753,31 @@ mod tests {
         assert_eq!(components[0].name, "Good");
         assert_eq!(components[0].path, inside);
         assert!(!components[0].is_system);
+    }
+
+    #[test]
+    fn a_user_registry_entry_naming_an_installer_sibling_is_not_a_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let schemes = root.join("color-schemes");
+        fs::create_dir_all(&schemes).unwrap();
+        let entries = ["old", "new"]
+            .into_iter()
+            .map(|suffix| {
+                let path = schemes.join(format!(".Good.colors.plasmoid-updater-{suffix}"));
+                fs::write(&path, "[General]\n").unwrap();
+                RegistryEntry {
+                    name: format!("Good {suffix}"),
+                    version: "1.0".to_string(),
+                    installed_path: path,
+                    release_date: String::new(),
+                }
+            })
+            .collect();
+
+        let components = user_components(ComponentType::ColorScheme, entries, &[root]);
+
+        assert!(components.is_empty(), "{components:?}");
     }
 
     #[test]

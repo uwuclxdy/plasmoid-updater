@@ -8,10 +8,15 @@ mod store;
 
 use std::collections::HashMap;
 
-use crate::{Result, api::ApiClient, config::Config, types::UpdateCheckResult};
+use crate::{
+    Result,
+    api::ApiClient,
+    config::Config,
+    types::{Diagnostic, UpdateCheckResult},
+};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-pub(crate) use discovery::find_installed;
+pub(crate) use discovery::{find_installed, read_metadata};
 
 /// Pre-built lookup tables for resolving component content IDs.
 ///
@@ -28,8 +33,11 @@ pub(crate) fn check_with_components(
     api_client: &ApiClient,
     components: Vec<crate::types::InstalledComponent>,
 ) -> Result<UpdateCheckResult> {
+    let mut result = UpdateCheckResult::default();
+    add_stranded_diagnostics(config.system, &mut result);
+
     if components.is_empty() {
-        return Ok(UpdateCheckResult::default());
+        return Ok(result);
     }
 
     let (registry_components, regular_components) = store::partition_components(components);
@@ -45,8 +53,6 @@ pub(crate) fn check_with_components(
 
     let store = store::fetch_store_entries(api_client, &regular_components, &lookup)?;
 
-    let mut result = UpdateCheckResult::default();
-
     let regular_results: Vec<evaluation::ComponentCheckResult> = regular_components
         .par_iter()
         .map(|component| evaluation::check_component(component, &store.entries, &lookup))
@@ -58,8 +64,11 @@ pub(crate) fn check_with_components(
             evaluation::ComponentCheckResult::Unresolved(diagnostic) => {
                 result.add_unresolved(diagnostic);
             }
-            evaluation::ComponentCheckResult::CheckFailed(diagnostic) => {
-                result.add_check_failure(diagnostic);
+            evaluation::ComponentCheckResult::NoMatchingDownload {
+                component,
+                diagnostic,
+            } => {
+                result.add_no_matching_download(component, diagnostic);
             }
             evaluation::ComponentCheckResult::UpToDate => {}
         }
@@ -75,6 +84,24 @@ pub(crate) fn check_with_components(
     )?;
 
     Ok(result)
+}
+
+/// Reports every component a killed run stranded in a hidden sibling. `check`
+/// never writes, so the diagnostic is the only thing it can offer; `update`
+/// repairs the tree first, before this check runs.
+///
+/// A hidden sibling seen while another run holds the update lock belongs to
+/// that live run's swap, not to a dead one, so the scan is skipped then.
+fn add_stranded_diagnostics(system: bool, result: &mut UpdateCheckResult) {
+    if crate::installer::run_lock_held() {
+        return;
+    }
+    for name in crate::installer::stranded_components(system) {
+        result.add_unresolved(Diagnostic::new(
+            name,
+            "interrupted install, run update to restore".to_string(),
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +138,79 @@ mod tests {
     /// only from a trusted system registry: a user-writable registry must not
     /// choose the content a privileged update installs. A user run still reads
     /// the user registry.
+    const STRANDED_LOCK_CHILD: &str = "PLASMOID_UPDATER_STRANDED_LOCK_CHILD";
+    const STRANDED_LOCK_MARKER: &str = "PLASMOID_UPDATER_STRANDED_LOCK_MARKER";
+
+    /// A hidden sibling seen while another process holds the run lock belongs
+    /// to that live run, not to a dead one: it must not be reported.
+    #[test]
+    fn a_live_run_lock_hides_its_swap_from_the_stranded_scan() {
+        if std::env::var_os(STRANDED_LOCK_CHILD).is_some() {
+            let data = PathBuf::from(std::env::var("XDG_DATA_HOME").unwrap());
+            let stranded = data
+                .join("plasma/plasmoids")
+                .join(".org.fake.widget.plasmoid-updater-old");
+            std::fs::create_dir_all(&stranded).unwrap();
+            std::fs::write(
+                stranded.join("metadata.json"),
+                r#"{"KPlugin": {"Id": "org.fake.widget", "Name": "Fake Widget"}}"#,
+            )
+            .unwrap();
+
+            let mut result = crate::types::UpdateCheckResult::default();
+            let lock = crate::installer::UpdateLock::acquire().unwrap();
+            super::add_stranded_diagnostics(false, &mut result);
+            assert!(
+                result.unresolved.is_empty(),
+                "a live run's lock did not hide its swap: {:?}",
+                result.unresolved
+            );
+            drop(lock);
+            super::add_stranded_diagnostics(false, &mut result);
+            assert_eq!(
+                result.unresolved.len(),
+                1,
+                "the scan dropped a real stranded tree: {:?}",
+                result.unresolved
+            );
+            std::fs::write(std::env::var(STRANDED_LOCK_MARKER).unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for name in ["home", "data", "cache", "config", "tmp"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let marker = root.join("child-done");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "checker::tests::a_live_run_lock_hides_its_swap_from_the_stranded_scan",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", root.join("home"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("TMPDIR", root.join("tmp"))
+            .env(STRANDED_LOCK_CHILD, "1")
+            .env(STRANDED_LOCK_MARKER, &marker)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && marker.exists(),
+            "child failed ({}; body completed: {})\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            marker.exists(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[test]
     fn a_user_registry_entry_does_not_resolve_a_system_component() {
         if std::env::var_os(CHILD).is_some() {

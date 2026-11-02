@@ -173,9 +173,34 @@ fn scan_directory(
 
 /// Reads a component's metadata, preferring `metadata.json` over
 /// `metadata.desktop`. A file that exists but cannot be read or parsed is
-/// reported, so a present component is never dropped without a trace.
-pub(super) fn read_metadata(package_dir: &Path) -> Option<PackageMetadata> {
+/// reported, so a present component is never dropped without a trace. Only a
+/// regular file is opened: a FIFO, socket or device named `metadata.json` would
+/// otherwise wait for a writer that never comes.
+pub(crate) fn read_metadata(package_dir: &Path) -> Option<PackageMetadata> {
     let json_path = package_dir.join("metadata.json");
+    if !crate::installer::is_regular_file(&json_path) {
+        match json_path.symlink_metadata() {
+            Ok(_) => log::warn!(
+                target: "discovery",
+                "ignoring {}: not a regular file",
+                json_path.display()
+            ),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                log::warn!(target: "discovery", "cannot read {}: {e}", json_path.display());
+            }
+            Err(_) => {}
+        }
+        return read_metadata_desktop(package_dir);
+    }
+    if !crate::installer::metadata_size_ok(&json_path) {
+        log::warn!(
+            target: "discovery",
+            "ignoring {}: larger than the {}-byte metadata cap",
+            json_path.display(),
+            crate::installer::MAX_METADATA_BYTES
+        );
+        return read_metadata_desktop(package_dir);
+    }
     match fs::read_to_string(&json_path) {
         Ok(content) => match serde_json::from_str(&content) {
             Ok(metadata) => return Some(metadata),
@@ -200,6 +225,23 @@ fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
             log::warn!(target: "discovery", "cannot access {}: {e}", path.display());
             return None;
         }
+    }
+    if !crate::installer::is_regular_file(&path) {
+        log::warn!(
+            target: "discovery",
+            "ignoring {}: not a regular file",
+            path.display()
+        );
+        return None;
+    }
+    if !crate::installer::metadata_size_ok(&path) {
+        log::warn!(
+            target: "discovery",
+            "ignoring {}: larger than the {}-byte metadata cap",
+            path.display(),
+            crate::installer::MAX_METADATA_BYTES
+        );
+        return None;
     }
     let entry = match freedesktop_entry_parser::parse_entry(&path) {
         Ok(entry) => entry,
@@ -296,5 +338,86 @@ mod tests {
             "no warning named {}: {warnings:?}",
             dangling.display()
         );
+    }
+
+    /// An unsearchable directory stops `metadata.json` from being statted at
+    /// all; the scan has to name the path it could not reach.
+    #[test]
+    fn read_metadata_warns_when_metadata_json_cannot_be_statted() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::installer::privilege::is_root() {
+            return; // root searches a directory whatever its mode
+        }
+        capture_discovery_warnings();
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let metadata = read_metadata(&blocked);
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            metadata.is_none(),
+            "an unreadable package reported metadata"
+        );
+        let warnings = captured().clone();
+        let json = blocked.join("metadata.json");
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(&json.display().to_string())
+                    && line.contains("cannot read")),
+            "no warning named {}: {warnings:?}",
+            json.display()
+        );
+    }
+
+    #[test]
+    fn read_metadata_skips_a_metadata_json_past_the_cap() {
+        capture_discovery_warnings();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"KPlugin": {{"Name": "Huge"}}, "Pad": "{}"}}"#,
+                "x".repeat(2 * 1024 * 1024)
+            ),
+        )
+        .unwrap();
+
+        let metadata = read_metadata(dir.path());
+
+        assert!(metadata.is_none(), "a capped metadata.json was read");
+        let warnings = captured().clone();
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(&path.display().to_string()) && line.contains("cap")),
+            "no warning named the capped file: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn read_metadata_does_not_block_on_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(dir.path().join("metadata.json"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo failed");
+        let package = dir.path().to_path_buf();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_metadata(&package));
+        });
+        let metadata = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("read_metadata blocked on a FIFO for five seconds");
+
+        assert!(metadata.is_none(), "a FIFO was read as metadata");
     }
 }

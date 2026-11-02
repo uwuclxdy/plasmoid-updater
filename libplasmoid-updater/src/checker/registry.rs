@@ -82,8 +82,11 @@ pub(crate) fn check_components(
                 evaluation::ComponentCheckResult::Update(update) => {
                     result.add_update(*update);
                 }
-                evaluation::ComponentCheckResult::CheckFailed(diagnostic) => {
-                    result.add_check_failure(diagnostic);
+                evaluation::ComponentCheckResult::NoMatchingDownload {
+                    component,
+                    diagnostic,
+                } => {
+                    result.add_no_matching_download(component, diagnostic);
                 }
                 evaluation::ComponentCheckResult::UpToDate => {}
                 evaluation::ComponentCheckResult::Unresolved(diagnostic) => {

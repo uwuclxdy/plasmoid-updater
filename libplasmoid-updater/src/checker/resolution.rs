@@ -136,40 +136,38 @@ fn is_signature_file(url: &str) -> bool {
     url.ends_with(".asc") || url.ends_with(".sig")
 }
 
+/// The one download link this entry offers for `target_version`.
+///
+/// A link whose version matches exactly wins, then one whose version matches
+/// once normalized. With no match, the store's only link is taken when it
+/// carries no version at all; a lone link naming another version, and several
+/// links none of which match, are no match — an older or unrelated archive is
+/// never installed as the requested version.
 pub(crate) fn select_download_with_info(
     entry: &StoreEntry,
     target_version: &str,
 ) -> Option<DownloadInfo> {
-    if entry.download_links.is_empty() {
-        return None;
-    }
-
     let candidates: Vec<_> = entry
         .download_links
         .iter()
         .filter(|l| !is_signature_file(&l.url))
         .collect();
 
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let link = if candidates.len() == 1 {
-        candidates[0]
-    } else {
-        let normalized_target = normalize_version(target_version);
-        // Prefer exact match, then normalized match, then first link
-        candidates
-            .iter()
-            .find(|l| l.version == target_version)
-            .or_else(|| {
-                candidates
-                    .iter()
-                    .find(|l| normalize_version(&l.version) == normalized_target)
-            })
-            .or_else(|| candidates.first())
-            .copied()?
-    };
+    let normalized_target = normalize_version(target_version);
+    let link = candidates
+        .iter()
+        .copied()
+        .find(|l| l.version == target_version)
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|l| normalize_version(&l.version) == normalized_target)
+        })
+        .or(match candidates.as_slice() {
+            [only] if only.version.is_empty() => Some(*only),
+            _ => None,
+        })?;
 
     Some(DownloadInfo {
         url: link.url.clone(),
@@ -458,6 +456,81 @@ mod tests {
             Some(200)
         );
         assert_eq!(resolve_with(&component, &[newer, older]), Some(200));
+    }
+
+    fn entry_with_links(version: &str, links: &[(&str, &str)]) -> StoreEntry {
+        StoreEntry {
+            id: 1,
+            name: "Test".to_string(),
+            author: String::new(),
+            version: version.to_string(),
+            type_id: 705,
+            download_links: links
+                .iter()
+                .map(|(url, version)| crate::types::DownloadLink {
+                    url: (*url).to_string(),
+                    version: (*version).to_string(),
+                    checksum: None,
+                    size_kb: None,
+                })
+                .collect(),
+            changed_date: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_lone_link_carrying_an_older_version_is_no_match() {
+        let entry = entry_with_links("1.1.3", &[("https://example.com/a.tar.gz", "1.1.2")]);
+
+        assert!(select_download_with_info(&entry, "1.1.3").is_none());
+    }
+
+    #[test]
+    fn versioned_links_none_matching_are_no_match() {
+        let entry = entry_with_links(
+            "3.0",
+            &[
+                ("https://example.com/a.tar.gz", "1.0"),
+                ("https://example.com/b.tar.gz", "2.0"),
+            ],
+        );
+
+        assert!(select_download_with_info(&entry, "3.0").is_none());
+    }
+
+    #[test]
+    fn several_links_none_matching_are_no_match_even_when_unversioned() {
+        let entry = entry_with_links(
+            "3.0",
+            &[
+                ("https://example.com/a.tar.gz", ""),
+                ("https://example.com/b.tar.gz", ""),
+            ],
+        );
+
+        assert!(select_download_with_info(&entry, "3.0").is_none());
+    }
+
+    #[test]
+    fn a_lone_link_carrying_no_version_is_installed() {
+        let entry = entry_with_links("1.1.3", &[("https://example.com/a.tar.gz", "")]);
+
+        let info = select_download_with_info(&entry, "1.1.3").unwrap();
+        assert_eq!(info.url, "https://example.com/a.tar.gz");
+    }
+
+    #[test]
+    fn a_lone_unversioned_link_beside_a_signature_is_installed() {
+        let entry = entry_with_links(
+            "1.1.3",
+            &[
+                ("https://example.com/a.tar.gz", ""),
+                ("https://example.com/a.tar.gz.sig", ""),
+            ],
+        );
+
+        let info = select_download_with_info(&entry, "1.1.3").unwrap();
+        assert_eq!(info.url, "https://example.com/a.tar.gz");
     }
 
     #[test]

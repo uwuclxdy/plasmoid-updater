@@ -63,8 +63,14 @@ impl<'a> ExcludeMatcher<'a> {
     }
 
     pub(crate) fn is_excluded(&self, update: &AvailableUpdate) -> bool {
-        let dir = &update.installed.directory_name;
-        let name = &update.installed.name;
+        self.is_excluded_component(&update.installed)
+    }
+
+    /// The same rules against a bare component, for a check result that
+    /// carries no [`AvailableUpdate`] for it.
+    pub(crate) fn is_excluded_component(&self, component: &InstalledComponent) -> bool {
+        let dir = &component.directory_name;
+        let name = &component.name;
 
         if self.exact.iter().any(|e| e == dir || e == name) {
             return true;
@@ -105,6 +111,9 @@ fn compile_exclude_patterns(patterns: &[String]) -> Option<regex::RegexSet> {
 /// Applies `config`'s exclusion rules to a check result: excluded components
 /// leave `updates` and their names land in `skipped`. This is the one place
 /// exclusions are applied; every later stage works on the filtered list.
+///
+/// A component with no matching download is filtered here too: an excluded
+/// component the store could not serve stays a skip, never a failure row.
 pub(crate) fn apply_exclusions(
     mut result: UpdateCheckResult,
     config: &Config,
@@ -119,6 +128,16 @@ pub(crate) fn apply_exclusions(
         }
     }
     result.updates = selected;
+
+    let mut unavailable = Vec::new();
+    for entry in result.no_matching_download.drain(..) {
+        if matcher.is_excluded_component(&entry.component) {
+            result.skipped.push(entry.component.name);
+        } else {
+            unavailable.push(entry);
+        }
+    }
+    result.no_matching_download = unavailable;
     result
 }
 
@@ -264,6 +283,59 @@ mod tests {
     fn compile_returns_none_when_empty_or_all_invalid() {
         assert!(compile_exclude_patterns(&[]).is_none());
         assert!(compile_exclude_patterns(&["(".to_string()]).is_none());
+    }
+
+    #[test]
+    fn an_excluded_component_with_no_matching_download_is_skipped_not_failed() {
+        use std::path::PathBuf;
+
+        use crate::types::{
+            ComponentType, Diagnostic, InstalledComponent, NoMatchingDownload, UpdateCheckResult,
+        };
+
+        fn no_match(name: &str) -> NoMatchingDownload {
+            NoMatchingDownload {
+                component: InstalledComponent {
+                    name: name.to_string(),
+                    directory_name: name.to_string(),
+                    version: "1.0".to_string(),
+                    component_type: ComponentType::PlasmaWidget,
+                    path: PathBuf::from("/plasmoids").join(name),
+                    is_system: false,
+                    release_date: String::new(),
+                },
+                diagnostic: Diagnostic::new(
+                    name.to_string(),
+                    "no download url available".to_string(),
+                ),
+            }
+        }
+
+        let mut result = UpdateCheckResult::default();
+        result.no_matching_download.push(no_match("keep.widget"));
+        result
+            .no_matching_download
+            .push(no_match("excluded.widget"));
+        let config =
+            crate::Config::new().with_excluded_packages(vec!["excluded.widget".to_string()]);
+
+        let filtered = super::apply_exclusions(result, &config);
+
+        assert_eq!(
+            filtered.skipped,
+            vec!["excluded.widget".to_string()],
+            "an excluded component's name did not land in skipped"
+        );
+        let kept: Vec<&str> = filtered
+            .no_matching_download
+            .iter()
+            .map(|entry| entry.component.name.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["keep.widget"],
+            "an excluded no-match stayed a failure row"
+        );
     }
 
     const CHILD_FLAG: &str = "PLASMOID_UPDATER_ENV_CHILD";

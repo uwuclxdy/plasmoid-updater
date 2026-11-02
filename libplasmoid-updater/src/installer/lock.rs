@@ -35,7 +35,7 @@ impl UpdateLock {
     /// by root after a sudo run, which would lock the user out of every run).
     pub(crate) fn acquire() -> Result<Self> {
         let cache_home = paths::cache_home();
-        let lock_path = cache_home.join("plasmoid-updater.lock");
+        let lock_path = lock_path();
         // glibc applies setegid/seteuid to every thread of the process, and no
         // other thread is touching files yet: the idle rayon workers an
         // interactive check has already started only wait for tasks.
@@ -88,6 +88,43 @@ impl UpdateLock {
                 source: std::io::Error::from_raw_os_error(errno as i32),
             }),
         }
+    }
+}
+
+/// The lock file every run takes. The name never moves: a release and an
+/// older release must meet on the same inode to exclude each other.
+fn lock_path() -> PathBuf {
+    paths::cache_home().join("plasmoid-updater.lock")
+}
+
+/// Whether another process holds the update lock right now.
+///
+/// Probes without blocking and releases at once, so a caller that never writes
+/// (`check`) can tell a live run's swap from a dead run's leftovers without
+/// taking the lock itself and without creating it.
+pub(crate) fn run_lock_held() -> bool {
+    lock_held_at(&lock_path())
+}
+
+/// The same probe over a named lock file.
+fn lock_held_at(lock_path: &Path) -> bool {
+    // `flock` needs no write access, and a probe that asked for it would read
+    // an unwritable lock file as free.
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(lock_path)
+    else {
+        // No file means no run has ever taken the lock here; the probe stays
+        // read-only rather than creating one.
+        return false;
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(flock) => {
+            drop(flock);
+            false
+        }
+        Err((_, errno)) => errno == nix::errno::Errno::EWOULDBLOCK,
     }
 }
 
@@ -320,6 +357,33 @@ mod tests {
             b"untouched",
             "the lock open wrote through the symlink"
         );
+    }
+
+    #[test]
+    fn the_probe_reports_a_held_lock_without_taking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("plasmoid-updater.lock");
+
+        assert!(
+            !lock_held_at(&lock_path),
+            "a missing lock file read as held"
+        );
+        assert!(
+            !lock_path.exists(),
+            "the probe created the lock file it only reads"
+        );
+
+        let held = UpdateLock::acquire_at(&lock_path).unwrap();
+        assert!(lock_held_at(&lock_path), "a held lock read as free");
+        assert!(
+            matches!(
+                UpdateLock::acquire_at(&lock_path),
+                Err(Error::AlreadyRunning)
+            ),
+            "the probe took the lock"
+        );
+        drop(held);
+        assert!(!lock_held_at(&lock_path), "a released lock read as held");
     }
 
     #[test]

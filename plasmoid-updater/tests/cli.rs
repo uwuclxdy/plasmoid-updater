@@ -10,7 +10,7 @@ mod common;
 
 use std::process::Stdio;
 
-use common::{FakeStore, Listing, OLD_CONTENT, OLD_VERSION, SCHEME_NAME, Sandbox};
+use common::{CatalogWidget, FakeStore, Listing, OLD_CONTENT, OLD_VERSION, SCHEME_NAME, Sandbox};
 
 const API_URL_VAR: &str = "PLASMOID_UPDATER_API_URL";
 
@@ -230,6 +230,199 @@ fn update_dry_run_lists_the_update_and_changes_nothing() {
             .contains(&format!("<version>{OLD_VERSION}</version>")),
         "the registry moved on a dry run"
     );
+}
+
+#[test]
+fn a_component_with_no_matching_download_is_a_failure_not_a_skip() {
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing {
+        link_version: Some("1.5"),
+        ..Listing::default()
+    });
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update", "-y"],
+    );
+    assert_eq!(run.code, 1, "{run}");
+    assert!(run.stdout.contains("1 failed"), "{run}");
+    assert!(run.stdout.contains("0 skipped"), "{run}");
+    common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
+#[test]
+fn a_named_component_with_no_matching_download_fails_the_update() {
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing {
+        link_version: Some("1.5"),
+        ..Listing::default()
+    });
+    let run = run(
+        &sandbox,
+        store.url(),
+        &[
+            "--skip-plasma-detection",
+            "update",
+            "-y",
+            common::SCHEME_FILE,
+        ],
+    );
+    assert_eq!(run.code, 1, "{run}");
+    assert!(run.stdout.contains("1 failed"), "{run}");
+    assert!(run.stderr.contains(SCHEME_NAME), "{run}");
+}
+
+#[test]
+fn a_named_component_with_no_matching_download_fails_the_dry_run() {
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing {
+        link_version: Some("1.5"),
+        ..Listing::default()
+    });
+    let run = run(
+        &sandbox,
+        store.url(),
+        &[
+            "--skip-plasma-detection",
+            "update",
+            "-y",
+            "--dry-run",
+            common::SCHEME_FILE,
+        ],
+    );
+    assert_eq!(run.code, 1, "{run}");
+    assert!(run.stderr.contains("no matching download"), "{run}");
+    assert!(run.stderr.contains(SCHEME_NAME), "{run}");
+}
+
+#[test]
+fn update_repairs_a_component_a_killed_run_stranded() {
+    let sandbox = Sandbox::new();
+    let plasmoids = sandbox.data_home().join("plasma/plasmoids");
+    let stranded = plasmoids.join(".org.fake.widget.plasmoid-updater-old");
+    std::fs::create_dir_all(&stranded).unwrap();
+    std::fs::write(
+        stranded.join("metadata.json"),
+        r#"{"KPlugin": {"Name": "Fake Widget", "Id": "org.fake.widget", "Version": "1.0"}}"#,
+    )
+    .unwrap();
+    let store = FakeStore::start(Listing::default());
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update", "-y"],
+    );
+    assert!(
+        plasmoids.join("org.fake.widget/metadata.json").is_file(),
+        "the stranded widget was not restored: {run}"
+    );
+}
+
+/// A component a killed run stranded is repaired by the run that reports it:
+/// the check must not still count it skipped or make the run fail.
+#[test]
+fn an_update_that_repairs_a_stranded_component_does_not_fail_the_run() {
+    let sandbox = Sandbox::new();
+    let plasmoids = sandbox.data_home().join("plasma/plasmoids");
+    let stranded = plasmoids.join(".org.fake.widget.plasmoid-updater-old");
+    std::fs::create_dir_all(&stranded).unwrap();
+    std::fs::write(
+        stranded.join("metadata.json"),
+        r#"{"KPlugin": {"Name": "Fake Widget", "Id": "org.fake.widget", "Version": "1.0"}}"#,
+    )
+    .unwrap();
+    let store = FakeStore::start(Listing {
+        widget: Some(CatalogWidget {
+            id: 424_242,
+            name: "Fake Widget",
+            type_id: 713,
+            version: OLD_VERSION,
+        }),
+        ..Listing::default()
+    });
+
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update", "-y"],
+    );
+
+    assert_eq!(run.code, 0, "{run}");
+    assert!(!run.stderr.contains("interrupted install"), "{run}");
+    assert!(
+        plasmoids.join("org.fake.widget/metadata.json").is_file(),
+        "{run}"
+    );
+}
+
+#[test]
+fn a_named_update_restores_a_stranded_component() {
+    let sandbox = Sandbox::new();
+    let plasmoids = sandbox.data_home().join("plasma/plasmoids");
+    let stranded = plasmoids.join(".org.fake.widget.plasmoid-updater-old");
+    std::fs::create_dir_all(&stranded).unwrap();
+    std::fs::write(
+        stranded.join("metadata.json"),
+        r#"{"KPlugin": {"Name": "Fake Widget", "Id": "org.fake.widget", "Version": "1.0"}}"#,
+    )
+    .unwrap();
+    let store = FakeStore::start(Listing {
+        widget: Some(CatalogWidget {
+            id: 424_242,
+            name: "Fake Widget",
+            type_id: 713,
+            version: OLD_VERSION,
+        }),
+        ..Listing::default()
+    });
+
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update", "-y", "Fake Widget"],
+    );
+
+    assert_eq!(run.code, 0, "{run}");
+    assert!(
+        plasmoids.join("org.fake.widget/metadata.json").is_file(),
+        "the named update did not restore the stranded component: {run}"
+    );
+}
+
+/// A component whose store entry offers no download link is a failure row; it
+/// must not also print a "failed to check" diagnostic line, on the update or
+/// on a dry run.
+#[test]
+fn a_no_matching_download_prints_one_failure_row_not_a_diagnostic() {
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing {
+        link_version: Some("1.5"),
+        ..Listing::default()
+    });
+
+    let update_run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update", "-y"],
+    );
+    assert_eq!(update_run.code, 1, "{update_run}");
+    assert!(update_run.stdout.contains("1 failed"), "{update_run}");
+    assert!(
+        !update_run.stderr.contains("failed to check"),
+        "{update_run}"
+    );
+
+    let dry_run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update", "-y", "--dry-run"],
+    );
+    assert_eq!(dry_run.code, 1, "{dry_run}");
+    assert!(!dry_run.stderr.contains("failed to check"), "{dry_run}");
 }
 
 #[test]
