@@ -496,6 +496,55 @@ fn a_bare_run_prints_help_and_installs_nothing() {
     common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
 }
 
+/// The refusal comes before the run touches anything: no repair of a stranded
+/// component and no store request.
+#[test]
+fn a_refused_update_repairs_and_checks_nothing() {
+    let sandbox = Sandbox::new();
+    let plasmoids = sandbox.data_home().join("plasma/plasmoids");
+    let stranded = plasmoids.join(".org.fake.widget.plasmoid-updater-old");
+    std::fs::create_dir_all(&stranded).unwrap();
+    std::fs::write(
+        stranded.join("metadata.json"),
+        r#"{"KPlugin": {"Name": "Fake Widget", "Id": "org.fake.widget", "Version": "1.0"}}"#,
+    )
+    .unwrap();
+    let store = FakeStore::start(Listing::default());
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "update"],
+    );
+    assert_eq!(run.code, 2, "{run}");
+    assert!(
+        !plasmoids.join("org.fake.widget").exists(),
+        "refused only after the repair: {run}"
+    );
+    assert_eq!(
+        store.catalog_requests(),
+        0,
+        "refused only after the check: {run}"
+    );
+}
+
+/// A refused `--system` update never asks for credentials. Whether sudo runs
+/// before a real update's repair has no sandboxed seam: a system repair
+/// touches the real system data directories.
+#[test]
+fn a_refused_system_update_never_authenticates() {
+    let (sandbox, store) = pending_update();
+    let (run, calls) = run_with_fake_sudo(
+        &sandbox,
+        store.url(),
+        &["--system", "--skip-plasma-detection", "update"],
+    );
+    assert_eq!(run.code, 2, "{run}");
+    assert!(
+        calls.is_empty(),
+        "a refused update ran sudo {calls:?}: {run}"
+    );
+}
+
 #[test]
 fn update_without_yes_on_a_non_tty_stdin_is_refused_naming_yes() {
     let (sandbox, store) = pending_update();

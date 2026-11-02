@@ -449,6 +449,17 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
     result.skipped.extend(skipped);
     result.failed.extend(check_result.unavailable);
 
+    // The user declined every offered update and nothing else happened:
+    // `nothing to update` already said so, and the summary's "no updates
+    // available" would claim the store offered none.
+    if interactive_empty
+        && result.succeeded.is_empty()
+        && result.failed.is_empty()
+        && result.skipped.is_empty()
+    {
+        return Ok(ExitCode::Success);
+    }
+
     finish_update(result, restart, check_failed)
 }
 
