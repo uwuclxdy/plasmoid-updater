@@ -134,6 +134,12 @@ fn scan_directory(
             continue;
         };
 
+        // The installer's in-progress siblings hold the same metadata as the
+        // component they belong to; reading them lists one install twice.
+        if crate::installer::is_installer_sibling(&directory_name) {
+            continue;
+        }
+
         let Some(metadata) = read_metadata(&path) else {
             continue;
         };

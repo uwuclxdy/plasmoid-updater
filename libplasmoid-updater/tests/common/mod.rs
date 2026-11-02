@@ -81,6 +81,11 @@ impl Sandbox {
         self.root.path().join("data")
     }
 
+    /// The sandbox's `TMPDIR`, where downloads are unpacked.
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.root.path().join("tmp")
+    }
+
     pub fn scheme_path(&self) -> PathBuf {
         self.data_home().join("color-schemes").join(SCHEME_FILE)
     }

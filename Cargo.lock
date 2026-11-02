@@ -967,7 +967,6 @@ dependencies = [
  "comfy-table",
  "dirs",
  "freedesktop_entry_parser",
- "fs_extra",
  "inquire",
  "log",
  "md5",

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
+    collections::BTreeSet,
     fs,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
 };
 
@@ -9,6 +11,51 @@ use super::ComponentFailure;
 use crate::{FailureKind, types::InstalledComponent};
 
 const MAX_BACKUPS_PER_TYPE: usize = 5;
+
+/// The timestamp directories one run's backups land in, so retention can leave
+/// every one of them alone.
+#[derive(Default)]
+pub(crate) struct BackupLedger {
+    created: std::sync::Mutex<Vec<(PathBuf, &'static str)>>,
+}
+
+impl BackupLedger {
+    fn record(&self, timestamp_dir: &Path, type_subdir: &'static str) {
+        let mut created = self
+            .created
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        created.push((timestamp_dir.to_path_buf(), type_subdir));
+    }
+}
+
+/// Keeps the newest [`MAX_BACKUPS_PER_TYPE`] backups of every component type
+/// this run backed up, never taking away one this run made.
+///
+/// Called once the run's installs have all finished: pruning inside one
+/// component's backup could take away a backup a still-running component of the
+/// same type will need for its restore.
+pub(crate) fn prune_backups(ledger: &BackupLedger) {
+    let created = {
+        let mut guard = ledger
+            .created
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *guard)
+    };
+    prune_backups_in(&backup_base_dir(), &created, MAX_BACKUPS_PER_TYPE);
+}
+
+fn prune_backups_in(base: &Path, created: &[(PathBuf, &'static str)], max_keep: usize) {
+    let types: BTreeSet<&str> = created
+        .iter()
+        .map(|(_, type_subdir)| *type_subdir)
+        .collect();
+    let skip: Vec<PathBuf> = created.iter().map(|(path, _)| path.clone()).collect();
+    for type_subdir in types {
+        cleanup_old_backups_in(base, type_subdir, max_keep, &skip);
+    }
+}
 
 /// Returns the base backup directory.
 fn backup_base_dir() -> PathBuf {
@@ -20,63 +67,127 @@ fn timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string()
 }
 
-/// Creates a backup of the component before updating.
+/// Creates a backup of the component before updating, recording the timestamp
+/// directory it lands in so this run's retention leaves it alone.
 /// Returns the path to the backup, or `None` if the component path
 /// does not exist on disk (nothing to back up).
 pub(crate) fn backup_component(
     component: &InstalledComponent,
+    backups: &BackupLedger,
 ) -> Result<Option<PathBuf>, ComponentFailure> {
-    if !component.path.exists() {
-        log::debug!(
-            target: "backup",
-            "nothing to back up for {}: {}",
-            component.name,
-            component.path.display(),
-        );
-        return Ok(None);
+    let backup = backup_component_in(&backup_base_dir(), component)?;
+    if let Some(backup) = &backup
+        && let Some(timestamp_dir) = backup.parent().and_then(Path::parent)
+    {
+        backups.record(timestamp_dir, component.component_type.backup_subdir());
+    }
+    Ok(backup)
+}
+
+fn backup_component_in(
+    base: &Path,
+    component: &InstalledComponent,
+) -> Result<Option<PathBuf>, ComponentFailure> {
+    match component.path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            log::debug!(
+                target: "backup",
+                "nothing to back up for {}: {}",
+                component.name,
+                component.path.display(),
+            );
+            return Ok(None);
+        }
+        // An unreadable path is not an absent one: backing up nothing here
+        // would let the update overwrite a component no restore can bring back.
+        Err(e) => {
+            return Err(ComponentFailure::io(
+                FailureKind::Install,
+                &component.path,
+                e,
+            ));
+        }
     }
 
     let timestamp = timestamp();
-    let base = backup_base_dir();
     let type_dir = component.component_type.backup_subdir();
+    let timestamp_dir = base.join(&timestamp);
 
     // handle single files (e.g., color schemes, static wallpapers)
     if component.path.is_file() {
-        let backup_dir = base.join(&timestamp).join(type_dir);
+        let backup_dir = timestamp_dir.join(type_dir);
         fs::create_dir_all(&backup_dir)
             .map_err(|e| ComponentFailure::io(FailureKind::Install, &backup_dir, e))?;
 
         let backup_path = backup_dir.join(&component.directory_name);
-        fs::copy(&component.path, &backup_path)
-            .map_err(|e| ComponentFailure::io(FailureKind::Install, &component.path, e))?;
-
-        // Prune old backups for this component type
-        cleanup_old_backups(component.component_type);
+        if let Err(e) = fs::copy(&component.path, &backup_path) {
+            // A failed copy may leave a partial file; a removal that fails
+            // leaves a file a restore could pick up, so it cannot be dropped.
+            match fs::remove_file(&backup_path) {
+                Ok(()) => {}
+                Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(remove_error) => log::warn!(
+                    target: "backup",
+                    "failed to remove partial backup {}: {remove_error}",
+                    backup_path.display()
+                ),
+            }
+            remove_empty_backup_dirs(&backup_path);
+            return Err(ComponentFailure::io(
+                FailureKind::Install,
+                &component.path,
+                e,
+            ));
+        }
 
         return Ok(Some(backup_path));
     }
 
-    let backup_path = base
-        .join(&timestamp)
-        .join(type_dir)
-        .join(&component.directory_name);
+    let backup_path = timestamp_dir.join(type_dir).join(&component.directory_name);
 
     fs::create_dir_all(&backup_path)
         .map_err(|e| ComponentFailure::io(FailureKind::Install, &backup_path, e))?;
 
-    copy_dir_recursive(&component.path, &backup_path)?;
-
-    // Prune old backups for this component type
-    cleanup_old_backups(component.component_type);
+    if let Err(e) = copy_dir_recursive(&component.path, &backup_path) {
+        remove_partial_backup(&backup_path);
+        return Err(e);
+    }
 
     Ok(Some(backup_path))
 }
 
-/// Restores a component from backup atomically.
+/// Removes a backup left half-written by a failed copy, so a later restore
+/// cannot pick it up as a whole tree.
+fn remove_partial_backup(backup_path: &Path) {
+    if let Err(e) = fs::remove_dir_all(backup_path) {
+        log::warn!(target: "backup", "failed to remove partial backup {}: {e}", backup_path.display());
+        return;
+    }
+    remove_empty_backup_dirs(backup_path);
+}
+
+/// Removes the timestamp and type directories a failed backup left empty, so no
+/// empty directory counts as a backup of the component's type.
+fn remove_empty_backup_dirs(backup_path: &Path) {
+    if let Some(type_dir) = backup_path.parent() {
+        let _ = fs::remove_dir(type_dir);
+        if let Some(timestamp_dir) = type_dir.parent() {
+            let _ = fs::remove_dir(timestamp_dir);
+        }
+    }
+}
+
+/// Restores a component from its backup.
 ///
-/// Uses `atomic_install_file` / `atomic_install_dir` so the original path is
-/// never absent during the restore — a failed restore leaves the new backup
-/// content in a temp sibling, not an empty destination.
+/// A directory is swapped in with one atomic exchange where the platform offers
+/// it — `renameat2(RENAME_EXCHANGE)` on a filesystem that supports it, or
+/// `mv --exchange` under sudo for a system path — so the original path holds
+/// either the backup tree or the tree it replaces at every moment. Otherwise the
+/// two-rename fallback runs, which has a brief window where the original path is
+/// absent and puts the old tree back if its second rename fails. A file is
+/// replaced by an atomic rename. A failed copy leaves the original path
+/// untouched.
 pub(crate) fn restore_component(
     backup_path: &Path,
     original_path: &Path,
@@ -110,75 +221,139 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), Component
         ));
     }
 
+    copy_tree(src, dst)
+}
+
+/// Copies the contents of `src` into `dst`, reporting the path that failed and
+/// the operating system's own error for it.
+///
+/// A symlink is recreated as a link rather than followed, so a link inside a
+/// package cannot pull in content from outside it. An entry that is neither a
+/// file, a directory nor a link (a FIFO, a socket, a device node) is refused
+/// before it is opened: opening a FIFO for reading waits for a writer that may
+/// never come. A directory's permission bits are applied after its contents are
+/// copied, so a directory the copy may not write into does not stop its own
+/// copy, and the owner keeps write access whatever the package shipped:
+/// unlinking an entry needs write permission on the directory holding it, so a
+/// copied 0555 directory would make the install's own replaced tree, and every
+/// later temp copy of it, undeletable. The top-level `src` may itself be a link
+/// to the directory (a component's path can be one): its mode is read through
+/// the link, the way `cp -r` copies the target.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), ComponentFailure> {
+    let metadata =
+        fs::metadata(src).map_err(|e| ComponentFailure::io(FailureKind::Install, src, e))?;
     fs::create_dir_all(dst).map_err(|e| ComponentFailure::io(FailureKind::Install, dst, e))?;
 
-    let options = fs_extra::dir::CopyOptions::new()
-        .content_only(true)
-        .overwrite(true);
+    let entries =
+        fs::read_dir(src).map_err(|e| ComponentFailure::io(FailureKind::Install, src, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| ComponentFailure::io(FailureKind::Install, src, e))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, &from, e))?;
+        if file_type.is_symlink() {
+            let target = fs::read_link(&from)
+                .map_err(|e| ComponentFailure::io(FailureKind::Install, &from, e))?;
+            std::os::unix::fs::symlink(&target, &to)
+                .map_err(|e| ComponentFailure::io(FailureKind::Install, &to, e))?;
+        } else if file_type.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)
+                .map_err(|e| ComponentFailure::io(FailureKind::Install, &from, e))?;
+        } else {
+            return Err(ComponentFailure::io(
+                FailureKind::Install,
+                &from,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file or directory",
+                ),
+            ));
+        }
+    }
 
-    fs_extra::dir::copy(src, dst, &options).map_err(|e| {
-        ComponentFailure::new(FailureKind::Install, format!("{}: {e}", dst.display()))
-    })?;
-
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() | 0o200);
+    fs::set_permissions(dst, permissions)
+        .map_err(|e| ComponentFailure::io(FailureKind::Install, dst, e))?;
     Ok(())
 }
 
-/// Removes old backup directories, keeping only the most recent `max_keep`.
-fn cleanup_old_backups_in(base: &Path, type_subdir: &str, max_keep: usize) {
+/// The timestamp [`timestamp`] encodes in a backup directory's name.
+const BACKUP_TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H-%M-%S";
+
+/// Orders backups oldest first: by the instant the name encodes, and a shared
+/// instant by name, so the order never follows the order the directory was
+/// listed in.
+fn oldest_first(backups: &mut [(chrono::NaiveDateTime, PathBuf)]) {
+    backups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+}
+
+/// Removes old backup directories, keeping the most recent `max_keep` and
+/// never one of `skip`, the directories the current run created.
+///
+/// Only a directory whose name parses as a timestamp is a backup, and only a
+/// backup is ever pruned: a stray directory is neither counted toward the limit
+/// nor removed in a real backup's place. The encoded timestamp orders the
+/// backups, since a cache restored from a tarball or written on another clock
+/// carries mtimes that say nothing about when the backups were taken.
+fn cleanup_old_backups_in(base: &Path, type_subdir: &str, max_keep: usize, skip: &[PathBuf]) {
     let Ok(entries) = fs::read_dir(base) else {
         return;
     };
 
-    // Collect timestamp dirs that contain this component type's backup
-    let mut dirs: Vec<(String, PathBuf)> = entries
+    let mut backups: Vec<(chrono::NaiveDateTime, PathBuf)> = entries
         .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let type_path = path.join(type_subdir);
-            if !type_path.exists() {
-                return None;
-            }
-            let name = e.file_name().to_string_lossy().to_string();
-            Some((name, path))
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join(type_subdir).is_dir())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let created =
+                chrono::NaiveDateTime::parse_from_str(name, BACKUP_TIMESTAMP_FORMAT).ok()?;
+            Some((created, path))
         })
         .collect();
 
-    if dirs.len() <= max_keep {
+    let mut to_remove = backups.len().saturating_sub(max_keep);
+    if to_remove == 0 {
         return;
     }
 
-    // Sort by timestamp name (lexicographic = chronological for ISO format)
-    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    oldest_first(&mut backups);
 
-    // Remove oldest, keep last max_keep
-    let to_remove = dirs.len() - max_keep;
-    for (_, path) in dirs.into_iter().take(to_remove) {
-        let type_path = path.join(type_subdir);
-        if let Err(e) = fs::remove_dir_all(&type_path) {
-            log::warn!(target: "backup", "failed to remove old backup {}: {e}", type_path.display());
+    for (_, path) in backups {
+        if to_remove == 0 {
+            return;
         }
-        // Remove the timestamp dir too if it's now empty
-        if path.read_dir().map_or(true, |mut d| d.next().is_none()) {
-            let _ = fs::remove_dir(&path);
+        // This run's own backups are chosen by identity: clock skew can sort
+        // one oldest, and restoring an update's own backup is the one thing
+        // retention must never take away.
+        if skip.contains(&path) {
+            continue;
         }
+        remove_backup(&path, type_subdir);
+        to_remove -= 1;
     }
 }
 
-/// Removes old backups for a component type, keeping the most recent ones.
-pub(crate) fn cleanup_old_backups(component_type: crate::types::ComponentType) {
-    cleanup_old_backups_in(
-        &backup_base_dir(),
-        component_type.backup_subdir(),
-        MAX_BACKUPS_PER_TYPE,
-    );
+fn remove_backup(path: &Path, type_subdir: &str) {
+    let type_path = path.join(type_subdir);
+    if let Err(e) = fs::remove_dir_all(&type_path) {
+        log::warn!(target: "backup", "failed to remove old backup {}: {e}", type_path.display());
+    }
+    // Remove the timestamp dir too if it's now empty
+    if path.read_dir().map_or(true, |mut d| d.next().is_none()) {
+        let _ = fs::remove_dir(path);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::installer::testutil::{capture_logs, captured_logs};
     use crate::types::ComponentType;
 
     #[test]
@@ -203,7 +378,7 @@ mod tests {
         assert_eq!(count_before, 7);
 
         // Run cleanup keeping 5
-        cleanup_old_backups_in(base.path(), subdir, 5);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[]);
 
         // Verify only 5 remain
         let count_after = std::fs::read_dir(base.path())
@@ -305,7 +480,7 @@ mod tests {
             std::fs::create_dir_all(&type_dir).unwrap();
         }
 
-        cleanup_old_backups_in(base.path(), subdir, 5);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[]);
 
         // All 3 should still exist
         let count = std::fs::read_dir(base.path())
@@ -314,5 +489,531 @@ mod tests {
             .filter(|e| e.path().join(subdir).exists())
             .count();
         assert_eq!(count, 3);
+    }
+
+    fn make_backup(base: &Path, name: &str, subdir: &str) -> PathBuf {
+        let type_dir = base.join(name).join(subdir);
+        fs::create_dir_all(&type_dir).unwrap();
+        type_dir
+    }
+
+    fn component_at(path: PathBuf) -> InstalledComponent {
+        widget_at(path, "org.test.widget")
+    }
+
+    fn widget_at(path: PathBuf, directory_name: &str) -> InstalledComponent {
+        InstalledComponent {
+            name: "Test Widget".to_string(),
+            directory_name: directory_name.to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::PlasmaWidget,
+            path,
+            is_system: false,
+            release_date: String::new(),
+        }
+    }
+
+    fn write_package(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("metadata.json"), b"{}").unwrap();
+    }
+
+    /// A backup directory name a day or more after this run's own clock, so
+    /// the run's backups sort oldest in the retention window.
+    fn timestamp_ahead_of_now(days: i64) -> String {
+        (chrono::Local::now() + chrono::Duration::days(days))
+            .format(BACKUP_TIMESTAMP_FORMAT)
+            .to_string()
+    }
+
+    /// Waits out the one-second resolution of a backup name, so two backups of
+    /// one component type land in two timestamp directories.
+    fn wait_for_next_backup_second() {
+        let first = timestamp();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while timestamp() == first {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the backup clock did not tick"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_backup_made_this_run_survives_a_later_backup_of_its_type() {
+        let base = tempfile::tempdir().unwrap();
+        let subdir = ComponentType::PlasmaWidget.backup_subdir();
+        for day in 1..=5 {
+            make_backup(base.path(), &timestamp_ahead_of_now(day), subdir);
+        }
+        let first_src = base.path().join("first");
+        write_package(&first_src);
+        let second_src = base.path().join("second");
+        write_package(&second_src);
+
+        let first = backup_component_in(base.path(), &widget_at(first_src, "org.test.first"))
+            .unwrap()
+            .unwrap();
+        wait_for_next_backup_second();
+        let second = backup_component_in(base.path(), &widget_at(second_src, "org.test.second"))
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            first.exists(),
+            "a later backup of the same type pruned this run's earlier one"
+        );
+        assert!(second.exists());
+    }
+
+    #[test]
+    fn pruning_skips_every_directory_this_run_created() {
+        let base = tempfile::tempdir().unwrap();
+        let subdir = ComponentType::PlasmaWidget.backup_subdir();
+        for day in 1..=6 {
+            make_backup(base.path(), &format!("2024-01-0{day}T00-00-00"), subdir);
+        }
+        // Three of the six belong to this run, all named oldest.
+        let created: Vec<(PathBuf, &'static str)> = [
+            "2024-01-01T00-00-00",
+            "2024-01-02T00-00-00",
+            "2024-01-03T00-00-00",
+        ]
+        .iter()
+        .map(|name| (base.path().join(*name), subdir))
+        .collect();
+
+        prune_backups_in(base.path(), &created, 5);
+
+        for day in 1..=3 {
+            assert!(
+                base.path()
+                    .join(format!("2024-01-0{day}T00-00-00"))
+                    .join(subdir)
+                    .is_dir(),
+                "a backup this run made was pruned"
+            );
+        }
+        assert!(
+            !base
+                .path()
+                .join("2024-01-04T00-00-00")
+                .join(subdir)
+                .exists(),
+            "the oldest backup this run did not make must go"
+        );
+        assert!(
+            base.path()
+                .join("2024-01-06T00-00-00")
+                .join(subdir)
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn cleanup_keeps_the_backup_the_current_run_made() {
+        let base = tempfile::tempdir().unwrap();
+        let subdir = ComponentType::PlasmaWidget.backup_subdir();
+        // The other five are named by a clock ahead of this run, so a name
+        // sort puts the run's own backup oldest and would prune it.
+        for day in 1..=5 {
+            make_backup(base.path(), &format!("2099-01-0{day}T00-00-00"), subdir);
+        }
+        let current = base.path().join("2026-11-01T09-00-00");
+        let current_type = current.join(subdir);
+        fs::create_dir_all(&current_type).unwrap();
+
+        cleanup_old_backups_in(base.path(), subdir, 5, std::slice::from_ref(&current));
+
+        assert!(current_type.is_dir(), "the run's own backup was pruned");
+        assert!(
+            !base
+                .path()
+                .join("2099-01-01T00-00-00")
+                .join(subdir)
+                .exists(),
+            "the oldest other backup must go instead"
+        );
+        assert!(
+            base.path()
+                .join("2099-01-05T00-00-00")
+                .join(subdir)
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn cleanup_ignores_a_directory_whose_name_is_not_a_backup() {
+        let base = tempfile::tempdir().unwrap();
+        let subdir = ComponentType::PlasmaWidget.backup_subdir();
+        for day in 1..=5 {
+            make_backup(base.path(), &format!("2024-01-0{day}T00-00-00"), subdir);
+        }
+        make_backup(base.path(), "not-a-date", subdir);
+
+        cleanup_old_backups_in(base.path(), subdir, 5, &[]);
+
+        for day in 1..=5 {
+            assert!(
+                base.path()
+                    .join(format!("2024-01-0{day}T00-00-00"))
+                    .join(subdir)
+                    .is_dir(),
+                "backup {day} was pruned for a directory that is not a backup"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_orders_backups_by_their_encoded_time() {
+        let base = tempfile::tempdir().unwrap();
+        let subdir = ComponentType::PlasmaWidget.backup_subdir();
+        make_backup(base.path(), "2099-01-01T00-00-00", subdir);
+        let older = base.path().join("2020-01-01T00-00-00");
+        make_backup(base.path(), "2020-01-01T00-00-00", subdir);
+        // A restored cache dir gets fresh mtimes: the backup whose name says
+        // it is oldest must still be the one pruned.
+        let touched = std::process::Command::new("touch")
+            .args(["-d", "2030-01-01T00:00:00"])
+            .arg(&older)
+            .status()
+            .unwrap();
+        assert!(touched.success());
+
+        cleanup_old_backups_in(base.path(), subdir, 1, &[]);
+
+        assert!(
+            base.path()
+                .join("2099-01-01T00-00-00")
+                .join(subdir)
+                .is_dir()
+        );
+        assert!(!older.join(subdir).exists());
+    }
+
+    #[test]
+    fn cleanup_orders_equal_instants_by_name() {
+        let instant =
+            chrono::NaiveDateTime::parse_from_str("2024-01-01T00-00-00", BACKUP_TIMESTAMP_FORMAT)
+                .unwrap();
+        // The same instant under the two spellings a one-digit hour allows,
+        // handed over newest-first so nothing but the tie-break can order them.
+        let mut backups = vec![
+            (instant, PathBuf::from("2024-01-01T00-00-00")),
+            (instant, PathBuf::from("2024-01-01T0-00-00")),
+        ];
+
+        oldest_first(&mut backups);
+
+        let names: Vec<&str> = backups
+            .iter()
+            .map(|(_, path)| path.to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["2024-01-01T0-00-00", "2024-01-01T00-00-00"]);
+    }
+
+    #[test]
+    fn a_failed_copy_reports_the_os_error_and_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::installer::privilege::is_root() {
+            return; // root reads a 000 directory, so no failure can be injected
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let locked = src.join("locked");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(src.join("kept.txt"), b"kept").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = copy_dir_recursive(&src, &dst).unwrap_err();
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            error.message.contains(&locked.display().to_string()),
+            "{error:?}"
+        );
+        assert!(error.message.contains("Permission denied"), "{error:?}");
+    }
+
+    #[test]
+    fn a_failed_backup_leaves_no_partial_backup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::installer::privilege::is_root() {
+            return; // root reads a 000 directory, so no failure can be injected
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("backups");
+        let src = dir.path().join("pkg");
+        let locked = src.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(src.join("metadata.json"), b"{}").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let component = component_at(src.clone());
+
+        let error = backup_component_in(&base, &component).unwrap_err();
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(error.message.contains("Permission denied"), "{error:?}");
+        let leftovers: Vec<PathBuf> = fs::read_dir(&base)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "a partial backup survived: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn a_present_component_with_an_unreadable_parent_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::installer::privilege::is_root() {
+            return; // root reads a 000 directory, so no failure can be injected
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("backups");
+        let parent = dir.path().join("parent");
+        let component_path = parent.join("org.test.widget");
+        fs::create_dir_all(&component_path).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+        let component = component_at(component_path);
+
+        let error = backup_component_in(&base, &component).unwrap_err();
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(error.message.contains("Permission denied"), "{error:?}");
+    }
+
+    #[test]
+    fn copy_tree_refuses_a_fifo_before_opening_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("kept.txt"), b"kept").unwrap();
+        let fifo = src.join("pipe");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        // Opening a FIFO waits for a writer, so the copy runs on its own
+        // thread: a block then reads as a failed check, not a hung suite.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (src_owned, dst_owned) = (src.clone(), dst.clone());
+        std::thread::spawn(move || {
+            let outcome = copy_dir_recursive(&src_owned, &dst_owned).map_err(|e| e.message);
+            let _ = sender.send(outcome);
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the copy opened the FIFO and blocked");
+
+        let message = outcome.expect_err("a FIFO must be refused");
+        assert!(message.contains(&fifo.display().to_string()), "{message}");
+        assert!(message.contains("not a regular file"), "{message}");
+    }
+
+    #[test]
+    fn copy_tree_refuses_a_socket_and_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        let socket = src.join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let error = copy_dir_recursive(&src, &dst).unwrap_err();
+
+        assert!(
+            error.message.contains(&socket.display().to_string()),
+            "{error:?}"
+        );
+        assert!(error.message.contains("not a regular file"), "{error:?}");
+    }
+
+    #[test]
+    fn copy_tree_copies_a_symlink_as_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("link")).unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        let copied = dst.join("link");
+        assert!(
+            fs::symlink_metadata(&copied)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was followed and its target copied in"
+        );
+        assert_eq!(fs::read_link(&copied).unwrap(), outside);
+    }
+
+    #[test]
+    fn copy_tree_preserves_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let sub = src.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("file.txt"), b"x").unwrap();
+        // Neither the 0o755 nor the 0o700 a fresh directory gets under a
+        // common umask.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o750)).unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        let mode = fs::metadata(dst.join("sub")).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750);
+    }
+
+    #[test]
+    fn copy_tree_takes_a_symlinked_source_mode_from_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let dst = dir.path().join("dst");
+        let sub = real.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("file.txt"), b"x").unwrap();
+        // Neither the link's own 0o777 nor a common umask's directory mode.
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o750)).unwrap();
+        let linked = dir.path().join("linked_component");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+        copy_dir_recursive(&linked, &dst).unwrap();
+
+        let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750, "the link's own mode was copied as the tree's");
+        assert!(dst.join("sub").join("file.txt").is_file());
+    }
+
+    #[test]
+    fn cleanup_prunes_real_backups_past_the_limit_despite_a_junk_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let subdir = ComponentType::PlasmaWidget.backup_subdir();
+        for day in 1..=6 {
+            make_backup(base.path(), &format!("2024-01-0{day}T00-00-00"), subdir);
+        }
+        let junk = make_backup(base.path(), "not-a-date", subdir);
+        // The junk directory looks oldest by mtime, so a loop that prunes in
+        // that order spends its one removal on it and leaves six backups.
+        let touched = std::process::Command::new("touch")
+            .args(["-d", "2000-01-01T00:00:00"])
+            .arg(junk.parent().unwrap())
+            .status()
+            .unwrap();
+        assert!(touched.success());
+
+        cleanup_old_backups_in(base.path(), subdir, 5, &[]);
+
+        let named = std::fs::read_dir(base.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("2024-01-"))
+                    && entry.path().join(subdir).is_dir()
+            })
+            .count();
+        assert_eq!(named, 5, "a real backup outlived the limit");
+        assert!(
+            !base
+                .path()
+                .join("2024-01-01T00-00-00")
+                .join(subdir)
+                .exists(),
+            "the oldest real backup must go"
+        );
+    }
+
+    #[test]
+    fn a_failed_file_backup_leaves_no_empty_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::installer::privilege::is_root() {
+            return; // root reads a 000 file, so no failure can be injected
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("backups");
+        let file = dir.path().join("org.test.widget.colors");
+        fs::write(&file, b"[Colors:Window]").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        let component = component_at(file.clone());
+
+        let error = backup_component_in(&base, &component).unwrap_err();
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(error.message.contains("Permission denied"), "{error:?}");
+        let leftovers: Vec<PathBuf> = fs::read_dir(&base)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "an empty backup directory survived: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_removal_of_the_partial_backup_file_is_logged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::installer::privilege::is_root() {
+            return; // root unlinks out of a 0o500 directory too
+        }
+        capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("backups");
+        let file = dir.path().join("org.test.widget.colors");
+        fs::write(&file, b"[Colors:Window]").unwrap();
+        let component = component_at(file);
+
+        // The backup path is timestamped inside the call, so the fixture takes
+        // its timestamp from a backup this run just made. A clock tick between
+        // the two calls lands the second backup in a fresh directory where the
+        // copy succeeds: retry, then fail loudly if no attempt reached the
+        // refusal.
+        let mut logged = None;
+        for _ in 0..5 {
+            let Ok(Some(backup)) = backup_component_in(&base, &component) else {
+                panic!("the fixture's first backup failed");
+            };
+            let type_dir = backup.parent().unwrap();
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o400)).unwrap();
+            fs::set_permissions(type_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+            let failed = backup_component_in(&base, &component);
+
+            fs::set_permissions(type_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o644)).unwrap();
+            let lines = captured_logs();
+            let named = lines.iter().any(|line| {
+                line.starts_with("backup: ")
+                    && line.contains("failed to remove partial backup")
+                    && line.contains(&backup.display().to_string())
+            });
+            if failed.is_err() && named {
+                logged = Some(lines);
+                break;
+            }
+        }
+
+        assert!(
+            logged.is_some(),
+            "a failed removal of the partial backup file was dropped: {:?}",
+            captured_logs()
+        );
     }
 }

@@ -146,19 +146,28 @@ pub(crate) fn install_updates(
         .build()
         .map_err(|e| Error::Config(format!("failed to build install thread pool: {e}")))?;
 
+    let backups = installer::BackupLedger::default();
     let outcomes: Vec<(InstalledComponent, Result<InstallOutcome, ComponentFailure>)> = pool
         .install(|| {
             updates
                 .par_iter()
                 .map(|update| {
                     let component = update.installed.clone();
-                    let outcome =
-                        installer::update_component(update, api_client.http_client(), reporter);
+                    let outcome = installer::update_component(
+                        update,
+                        api_client.http_client(),
+                        reporter,
+                        &backups,
+                    );
                     report_outcome(&component, &outcome, reporter);
                     (component, outcome)
                 })
                 .collect()
         });
+    // Retention runs once every install has finished, so no component's backup
+    // can be pruned by a later component of its own type while it is still
+    // being installed.
+    installer::prune_backups(&backups);
 
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();

@@ -106,18 +106,6 @@ pub(crate) fn is_trusted_system_path(path: &Path) -> bool {
     true
 }
 
-/// Returns the XDG runtime directory, or a UID-namespaced /tmp fallback.
-pub(crate) fn runtime_dir() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(format!(
-                "/tmp/plasmoid-updater-{}",
-                nix::unistd::Uid::effective()
-            ))
-        })
-}
-
 /// Returns the KNewStuff3 registry directory.
 pub(crate) fn knewstuff_dir() -> PathBuf {
     data_home().join("knewstuff3")
@@ -164,11 +152,21 @@ fn resolve_user_home() -> PathBuf {
                 log::warn!(
                     target: "paths",
                     "could not determine home directory; \
-                     defaulting to /tmp/plasmoid-updater-fallback"
+                     defaulting to {}",
+                    fallback_home().display()
                 );
-                PathBuf::from("/tmp/plasmoid-updater-fallback")
+                fallback_home()
             })
         })
+}
+
+/// The home directory used when neither `HOME` nor a passwd entry resolves.
+///
+/// The name deliberately does not start with `plasmoid-updater-`: the download
+/// sweep removes every directory of that shape under the temp dir, and a home
+/// directory is the one thing it must never take for a dead download.
+pub(crate) fn fallback_home() -> PathBuf {
+    PathBuf::from("/tmp/.plasmoid-updater-fallback-home")
 }
 
 #[cfg(test)]

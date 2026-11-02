@@ -11,6 +11,8 @@ mod install;
 mod lock;
 mod plasmashell;
 pub(crate) mod privilege;
+#[cfg(test)]
+mod testutil;
 
 use std::{
     fs,
@@ -26,7 +28,10 @@ use backup::{backup_component, restore_component};
 
 use crate::version::normalize_version;
 
+pub(crate) use backup::{BackupLedger, prune_backups};
+pub(crate) use download::remove_stale_temp_dirs;
 pub(crate) use inhibit::InhibitGuard;
+pub(crate) use install::{is_installer_sibling, recover_interrupted_installs};
 pub(crate) use lock::UpdateLock;
 pub(crate) use plasmashell::{requires_restart, restart_plasmashell};
 
@@ -76,16 +81,19 @@ pub(crate) struct InstallOutcome {
 /// as the download progresses. On failure the original component is restored
 /// from its backup; if the restore itself fails, the returned
 /// [`ComponentFailure`] carries kind
-/// [`FailureKind::RestoreFailed`] and both messages.
+/// [`FailureKind::RestoreFailed`] and both messages. `backups` records the
+/// backup's directory for the run's retention, which runs once the pool has
+/// finished every component.
 pub(crate) fn update_component(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
     reporter: &dyn Reporter,
+    backups: &BackupLedger,
 ) -> Result<InstallOutcome, ComponentFailure> {
     let component = &update.installed;
     let temp = download::create_temp_dir()?;
 
-    let backup_path = create_backup(component)?;
+    let backup_path = create_backup(component, backups)?;
 
     match perform_installation(update, client, temp.path(), reporter) {
         Ok(()) => {
@@ -102,8 +110,11 @@ pub(crate) fn update_component(
     // temp is dropped here, auto-cleanup
 }
 
-fn create_backup(component: &InstalledComponent) -> Result<Option<PathBuf>, ComponentFailure> {
-    backup_component(component)
+fn create_backup(
+    component: &InstalledComponent,
+    backups: &BackupLedger,
+) -> Result<Option<PathBuf>, ComponentFailure> {
+    backup_component(component, backups)
 }
 
 fn perform_installation(

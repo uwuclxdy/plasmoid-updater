@@ -171,6 +171,8 @@ impl CheckResult {
 /// Returns an [`Error`] when the run cannot start or finish:
 /// - [`Error::AlreadyRunning`] — another run holds the update lock
 /// - [`Error::MissingTool`] — `bsdtar` is missing, needed to extract archives
+/// - [`Error::Io`] naming the lock file — a sudo run could not take the
+///   invoking user's ids to create it in that user's cache
 /// - the environment and store errors [`check`] documents
 ///
 /// A component that fails to download, extract or install is not an `Error` —
@@ -180,6 +182,7 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
     let _lock = installer::UpdateLock::acquire()?;
     crate::utils::validate_environment(config.skip_plasma_detection)?;
     crate::utils::require_extractor()?;
+    repair_after_interrupted_run(config);
 
     reporter.event(&Event::Checking);
 
@@ -228,6 +231,8 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
 /// Returns an [`Error`] when the run cannot start or finish:
 /// - [`Error::AlreadyRunning`] — another run holds the update lock
 /// - [`Error::MissingTool`] — `bsdtar` is missing, needed to extract archives
+/// - [`Error::Io`] naming the lock file — a sudo run could not take the
+///   invoking user's ids to create it in that user's cache
 /// - the environment and store errors [`check`] documents
 ///
 /// Per-component problems become [`Failure`] rows in [`UpdateResult::failed`].
@@ -243,10 +248,22 @@ pub fn install(
     let _lock = installer::UpdateLock::acquire()?;
     crate::utils::validate_environment(config.skip_plasma_detection)?;
     crate::utils::require_extractor()?;
+    repair_after_interrupted_run(config);
 
     let api_client = api::ApiClient::new(config)?;
 
     crate::utils::install_updates(updates, &api_client, config, reporter, Vec::new())
+}
+
+/// Clears what a run killed mid-install left behind, before this run scans or
+/// installs anything.
+///
+/// The caller holds the run lock, which is what makes every one of these
+/// leftovers a dead run's: component trees stranded in hidden siblings by a
+/// swap that never finished, and download directories in the temp dir.
+fn repair_after_interrupted_run(config: &Config) {
+    installer::recover_interrupted_installs(config.system);
+    installer::remove_stale_temp_dirs();
 }
 
 /// The outcome of an [`update`] or [`install`] run.
