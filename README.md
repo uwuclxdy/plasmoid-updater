@@ -8,6 +8,7 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 ## Requirements
 
 - bsdtar and kpackagetool6, for `update` and `install` only (`check` needs neither); `systemctl` too, for the optional plasmashell restart
+- `sh` and `stty`, for the interactive selection menu
 - [Rust](https://rust-lang.org/tools/install/)
 
 ## Installation
@@ -80,9 +81,11 @@ Options:
 
 `--ignore` works on both `check` and `update` and skips the named components for that run only, on top of the config exclusions. Example: `plasmoid-updater update --ignore weather,clock`.
 
-Running `plasmoid-updater` without a subcommand is the same as `update`. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; without a TTY it applies all non-excluded updates. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing.
+Running `plasmoid-updater` without a subcommand prints its help and exits 0. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; on a non-interactive stdin it refuses without `-y` (exit 2) rather than guessing, unless it names a COMPONENT. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing. At the selection menu, Escape selects nothing and Ctrl-C ends the run as interrupted (exit status 130).
 
-By default a run restarts nothing. After updates to widgets, plasma styles, global themes, splash screens or KWin switchers, `--restart-plasma` restarts plasmashell, `prompt_restart = true` in the config asks first (on a terminal only), and `--no-restart-plasma` skips it (when both flags are given, `--restart-plasma` wins).
+With `--system`, only a real `update` authenticates through `sudo -v`; `check`, `list-installed` and `update --dry-run` never ask for a password.
+
+By default a run restarts nothing. After updates to widgets, plasma styles, global themes, splash screens or KWin switchers, `--restart-plasma` restarts plasmashell, `prompt_restart = true` in the config asks first (on a terminal only; on a non-interactive stdin the prompt is skipped with a warning naming `--restart-plasma`), and `--no-restart-plasma` skips it. The two flags conflict at parse time (exit 2).
 
 Components that fail to update don't stop the run: failures are summarized at the end, and the run exits 1 when any component failed or could not be checked. An install whose post-install version cannot be verified counts as a failure too, so it exits 1 as well.
 
@@ -92,7 +95,7 @@ Components that fail to update don't stop the run: failures are summarized at th
 | ---- | ------- |
 | 0 | success |
 | 1 | at least one component failed, or an install's version could not be verified, or `check`, `update` or `update --dry-run` could not settle a component |
-| 2 | usage error: an unknown option or subcommand, or `update <name>` naming no installed component |
+| 2 | usage error: an unknown option or subcommand, `update <name>` naming no installed component, `update` naming no component without `-y` on a non-interactive stdin, conflicting restart flags, or a config directory that is not a directory |
 | 3 | the run could not start or finish |
 | 100 | `check` found updates to install |
 
@@ -136,7 +139,7 @@ assume_yes = false        # confirm all updates without prompting
 prompt_restart = true     # ask before restarting plasmashell
 ```
 
-`--edit-config` creates the file with commented examples if it does not exist and opens it in `$EDITOR` (`nano` when unset). Excluded components are skipped during updates and hidden from `check`. Invalid regex patterns are dropped instead of aborting the run.
+`--edit-config` creates the file with commented examples if it does not exist and opens it in `$EDITOR` (`nano` when unset). `$EDITOR` may name a command with arguments (`EDITOR="code --wait"`), which runs through the shell; a path containing spaces needs quoting inside the variable (`EDITOR="'/opt/my editor/ed'"`). A non-zero editor exit fails the run. Excluded components are skipped during updates and hidden from `check`. Invalid regex patterns are dropped instead of aborting the run.
 
 ## Topgrade integration (preview)
 

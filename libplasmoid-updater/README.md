@@ -97,7 +97,7 @@ Default features: `cli`, `inhibit`.
 
 | feature | description |
 | --- | --- |
-| `cli` | Terminal kit: `cli::ProgressReporter` (stderr progress; uncoloured and non-animated under `NO_COLOR`, `TERM=dumb` or a non-TTY stderr), `cli::select` (multi-select prompt; an empty list returns empty, a non-empty one needs a TTY stdin), `cli::print_failures` (failure table on stderr), and the check/installed tables as strings the caller prints (`updates_table`, `components_table`). Pulls in comfy-table, bytesize, inquire. |
+| `cli` | Terminal kit: `cli::ProgressReporter` (stderr progress; uncoloured and non-animated under `NO_COLOR`, `TERM=dumb` or a non-TTY stderr), `cli::select` (multi-select prompt; an empty list returns empty, a non-empty one needs a TTY stdin, and Ctrl-C raises SIGINT in the calling process so a caller that handles it gets an empty selection back while a killed run's terminal is restored by a watchdog process; needs `sh` and `stty` while the prompt is open), `cli::print_failures` (failure table on stderr), and the check/installed tables as strings the caller prints (`updates_table`, `components_table`). Pulls in comfy-table, bytesize, inquire. |
 | `inhibit` | Inhibit system sleep/shutdown via logind DBus during installs. Pulls in zbus. Without this feature the library falls back to spawning `systemd-inhibit` as a subprocess. |
 
 To use the library without terminal dependencies:
