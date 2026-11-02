@@ -8,7 +8,7 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 ## Requirements
 
 - bsdtar and kpackagetool6, for `update` and `install` only (`check` needs neither); `systemctl` too, for the optional plasmashell restart
-- `sh` and `stty`, for the interactive selection menu
+- `sh` and `stty`, for the interactive selection menu (`sh` also runs `$EDITOR` for `--edit-config`)
 - [Rust](https://rust-lang.org/tools/install/)
 
 ## Installation
@@ -81,7 +81,7 @@ Options:
 
 `--ignore` works on both `check` and `update` and skips the named components for that run only, on top of the config exclusions. Example: `plasmoid-updater update --ignore weather,clock`.
 
-Running `plasmoid-updater` without a subcommand prints its help and exits 0. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; on a non-interactive stdin it refuses without `-y` (exit 2) rather than guessing, unless it names a COMPONENT. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing. At the selection menu, Escape selects nothing and Ctrl-C ends the run as interrupted (exit status 130).
+Running `plasmoid-updater` without a subcommand prints its help and exits 0. On a terminal, `update` opens an interactive selection menu unless `-y`, `assume_yes`, `update_all_by_default` or a COMPONENT is given; on a non-interactive stdin it refuses without `-y` (exit 2) rather than guessing, unless it names a COMPONENT. `update [COMPONENT]` matches a component by its display name or directory name — a store ID matches nothing. At the selection menu, Escape selects nothing and Ctrl-C ends the run by SIGINT (a shell reports exit status 130). Every update run first puts back what a killed run left stranded, even when there is nothing to install.
 
 With `--system`, only a real `update` authenticates through `sudo -v`; `check`, `list-installed` and `update --dry-run` never ask for a password.
 

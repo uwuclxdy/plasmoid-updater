@@ -12,6 +12,7 @@ Runtime dependencies:
 - `kpackagetool6` – KDE package installation
 - `systemctl` – plasmashell restart, when a restart is requested
 - `sudo` – only for `--system` operations
+- `sh` and `stty` – for `cli::select` (the `cli` feature), while its prompt is open
 
 ## Features
 
