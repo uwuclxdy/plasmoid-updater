@@ -21,6 +21,20 @@ const CATEGORY_SPLASH_SCREEN: u16 = 716;
 const CATEGORY_SDDM_THEME: u16 = 101;
 const CATEGORY_ICON_THEME: u16 = 132;
 const CATEGORY_WALLPAPER: u16 = 299;
+/// The store files wallpaper images under the "KDE Wallpaper (other)" category
+/// (299), but KNewStuff's `wallpaper.knsrc` installs from six sibling
+/// categories, and an entry carries the category id it was filed under.
+/// Measured 2026-11-03 against `GET /content/categories`, where all six have an
+/// empty `parent_id`: "KDE Wallpaper 800x600" (360), "1024x768" (296),
+/// "1280x1024" (297), "1440x900" (298), "1600x1200" (307), "(other)" (299).
+const CATEGORY_WALLPAPER_SIZES: [u16; 6] = [360, 296, 297, 298, 307, 299];
+/// The store files cursor themes here; KNewStuff's `xcursor.knsrc` uses the
+/// same id. The live name is "X11 Mouse Theme", displayed as "Cursors"
+/// (measured 2026-11-02 against `GET /content/categories`).
+const CATEGORY_CURSOR_THEME: u16 = 107;
+/// The live name is "Plasma Comic", displayed as "Plasma Comic Sources"
+/// (measured 2026-11-02 against `GET /content/categories`).
+const CATEGORY_COMIC_PLUGIN: u16 = 155;
 
 /// Type of KDE Plasma component.
 ///
@@ -58,6 +72,11 @@ pub enum ComponentType {
     IconTheme,
     /// A wallpaper package or image.
     Wallpaper,
+    /// A cursor theme (`index.theme` and `cursors/`, installed under
+    /// `~/.icons`).
+    CursorTheme,
+    /// A Plasma Comic plugin (`Plasma/Comic`).
+    ComicPlugin,
 }
 
 impl ComponentType {
@@ -76,6 +95,8 @@ impl ComponentType {
             Self::SddmTheme => CATEGORY_SDDM_THEME,
             Self::IconTheme => CATEGORY_ICON_THEME,
             Self::Wallpaper => CATEGORY_WALLPAPER,
+            Self::CursorTheme => CATEGORY_CURSOR_THEME,
+            Self::ComicPlugin => CATEGORY_COMIC_PLUGIN,
         }
     }
 
@@ -100,23 +121,57 @@ impl ComponentType {
             Self::SddmTheme => &[CATEGORY_SDDM_THEME],
             Self::IconTheme => &[CATEGORY_ICON_THEME],
             Self::Wallpaper => &[CATEGORY_WALLPAPER],
+            Self::CursorTheme => &[CATEGORY_CURSOR_THEME],
+            Self::ComicPlugin => &[CATEGORY_COMIC_PLUGIN],
         }
     }
 
-    /// Returns true if the given store `type_id` belongs to this component type.
+    /// The store category ids whose entries belong to this component type: the
+    /// type's catalog category plus every category its own `.knsrc` installs
+    /// from.
     ///
-    /// The OCS API returns the subcategory id in an entry's `typeid` field, so
-    /// a widget filed under "Plasma 6 Clocks" carries 708, not 705. Only the
-    /// live widget subcategories 706-713 match: the rest of the 700-range is
-    /// other component kinds (715 wallpaper plugins, 716 splash screens, 717
-    /// window decorations, 722 global themes, 724 sysmon applet designs;
-    /// measured 2026-11-02 against `GET /content/categories`). The 723
-    /// category lists only typeid 724 entries, so no entry carries 723.
-    pub(crate) const fn matches_type_id(self, type_id: u16) -> bool {
-        if self.category_id() == type_id {
-            return true;
+    /// A widget is filed under its widget subcategory ("Plasma 6 Clocks"
+    /// carries 708, not 705), so every live widget subcategory 706-713 matches.
+    /// The rest of the 700-range is other component kinds (715 wallpaper
+    /// plugins, 716 splash screens, 717 window decorations, 722 global themes,
+    /// 724 sysmon applet designs; measured 2026-11-02 against
+    /// `GET /content/categories`). The 723 category lists only typeid 724
+    /// entries, so no entry carries 723. A wallpaper carries whichever of
+    /// `wallpaper.knsrc`'s six categories it was filed under.
+    pub(crate) fn accepted_type_ids(self) -> &'static [u16] {
+        match self {
+            Self::PlasmaWidget => &[
+                CATEGORY_PLASMA_WIDGET,
+                706,
+                707,
+                708,
+                709,
+                710,
+                711,
+                712,
+                CATEGORY_PLASMA_WIDGET_IMPROVEMENTS,
+            ],
+            Self::WallpaperPlugin => &[CATEGORY_WALLPAPER_PLUGIN],
+            Self::KWinEffect => &[CATEGORY_KWIN_EFFECT],
+            Self::KWinScript => &[CATEGORY_KWIN_SCRIPT],
+            Self::KWinSwitcher => &[CATEGORY_KWIN_SWITCHER],
+            Self::GlobalTheme => &[CATEGORY_GLOBAL_THEME],
+            Self::PlasmaStyle => &[CATEGORY_PLASMA_STYLE],
+            Self::AuroraeDecoration => &[CATEGORY_AURORAE_DECORATION],
+            Self::ColorScheme => &[CATEGORY_COLOR_SCHEME],
+            Self::SplashScreen => &[CATEGORY_SPLASH_SCREEN],
+            Self::SddmTheme => &[CATEGORY_SDDM_THEME],
+            Self::IconTheme => &[CATEGORY_ICON_THEME],
+            Self::Wallpaper => &CATEGORY_WALLPAPER_SIZES,
+            Self::CursorTheme => &[CATEGORY_CURSOR_THEME],
+            Self::ComicPlugin => &[CATEGORY_COMIC_PLUGIN],
         }
-        matches!((self, type_id), (Self::PlasmaWidget, 706..=713))
+    }
+
+    /// Returns true if the given store `type_id` belongs to this component type:
+    /// membership in [`accepted_type_ids`](Self::accepted_type_ids).
+    pub(crate) fn matches_type_id(self, type_id: u16) -> bool {
+        self.accepted_type_ids().contains(&type_id)
     }
 
     pub(crate) const fn kpackage_type(self) -> Option<&'static str> {
@@ -129,7 +184,13 @@ impl ComponentType {
             Self::GlobalTheme => Some("Plasma/LookAndFeel"),
             Self::PlasmaStyle => Some("Plasma/Theme"),
             Self::SplashScreen => Some("Plasma/LookAndFeel"),
-            _ => None,
+            Self::ComicPlugin => Some("Plasma/Comic"),
+            Self::AuroraeDecoration
+            | Self::ColorScheme
+            | Self::SddmTheme
+            | Self::IconTheme
+            | Self::Wallpaper
+            | Self::CursorTheme => None,
         }
     }
 
@@ -150,14 +211,22 @@ impl ComponentType {
     /// Returns true if this type uses registry-based discovery only
     /// (no metadata files on disk).
     pub(crate) const fn registry_only(self) -> bool {
-        matches!(self, Self::IconTheme | Self::Wallpaper | Self::ColorScheme)
+        matches!(
+            self,
+            Self::IconTheme | Self::Wallpaper | Self::ColorScheme | Self::CursorTheme
+        )
     }
 
-    /// Returns all component types that share the same filesystem path.
+    /// Returns the component types whose registry files decide the type of a
+    /// component found by scanning this type's directory: itself, plus every
+    /// other directory-scanned type that scans the same path.
     ///
     /// `GlobalTheme` and `SplashScreen` both use `plasma/look-and-feel`.
-    /// During discovery, components in shared directories need to be
-    /// checked against all possible types to assign the correct `ComponentType`.
+    /// Discovery reads each returned type's registry map and assigns an entry
+    /// the type whose registry names it. A registry-only type is discovered
+    /// from its own registry file, so its list is never consulted, even where
+    /// its path coincides with another type's (`IconTheme` and `CursorTheme`
+    /// both use `/usr/share/icons`).
     pub(crate) fn shared_path_types(self) -> &'static [ComponentType] {
         match self {
             Self::GlobalTheme | Self::SplashScreen => &[Self::GlobalTheme, Self::SplashScreen],
@@ -172,12 +241,16 @@ impl ComponentType {
             Self::SddmTheme => &[Self::SddmTheme],
             Self::IconTheme => &[Self::IconTheme],
             Self::Wallpaper => &[Self::Wallpaper],
+            Self::CursorTheme => &[Self::CursorTheme],
+            Self::ComicPlugin => &[Self::ComicPlugin],
         }
     }
 
     // -- Filesystem paths --
 
-    /// Returns the user-local data directory suffix, or `None` for system-only types (e.g., SDDM).
+    /// Returns the user-local data directory suffix, or `None` for system-only
+    /// types (e.g. SDDM) and for types whose user path is not under a data
+    /// directory (cursor themes live in `~/.icons`).
     pub(crate) const fn user_suffix(self) -> Option<&'static str> {
         match self {
             Self::PlasmaWidget => Some("plasma/plasmoids"),
@@ -192,11 +265,19 @@ impl ComponentType {
             Self::SddmTheme => None,
             Self::IconTheme => Some("icons"),
             Self::Wallpaper => Some("wallpapers"),
+            Self::CursorTheme => None,
+            Self::ComicPlugin => Some("plasma/comics"),
         }
     }
 
     /// Returns the full user-local installation path for this component type.
     pub fn user_path(self) -> PathBuf {
+        // KNewStuff's `xcursor.knsrc` installs with `InstallPath=.icons`
+        // (measured 2026-11-02), so a cursor theme lives under the home
+        // directory rather than under a data directory.
+        if self == Self::CursorTheme {
+            return crate::paths::user_home().join(".icons");
+        }
         match self.user_suffix() {
             Some(suffix) => crate::paths::data_home().join(suffix),
             None => PathBuf::new(),
@@ -216,8 +297,9 @@ impl ComponentType {
             Self::AuroraeDecoration => "/usr/share/aurorae/themes",
             Self::ColorScheme => "/usr/share/color-schemes",
             Self::SddmTheme => "/usr/share/sddm/themes",
-            Self::IconTheme => "/usr/share/icons",
+            Self::IconTheme | Self::CursorTheme => "/usr/share/icons",
             Self::Wallpaper => "/usr/share/wallpapers",
+            Self::ComicPlugin => "/usr/share/plasma/comics",
         })
     }
 
@@ -237,6 +319,8 @@ impl ComponentType {
             Self::SddmTheme => "sddm-themes",
             Self::IconTheme => "icons",
             Self::Wallpaper => "wallpapers",
+            Self::CursorTheme => "cursor-themes",
+            Self::ComicPlugin => "comic-plugins",
         }
     }
 
@@ -257,6 +341,8 @@ impl ComponentType {
             Self::SddmTheme => Some("sddmtheme.knsregistry"),
             Self::IconTheme => Some("icons.knsregistry"),
             Self::Wallpaper => Some("wallpaper.knsregistry"),
+            Self::CursorTheme => Some("xcursor.knsregistry"),
+            Self::ComicPlugin => Some("comic.knsregistry"),
         }
     }
 
@@ -278,6 +364,8 @@ impl ComponentType {
             Self::SddmTheme,
             Self::IconTheme,
             Self::Wallpaper,
+            Self::CursorTheme,
+            Self::ComicPlugin,
         ]
     }
 
@@ -297,6 +385,8 @@ impl ComponentType {
             Self::SplashScreen,
             Self::IconTheme,
             Self::Wallpaper,
+            Self::CursorTheme,
+            Self::ComicPlugin,
         ]
     }
 }
@@ -317,6 +407,8 @@ impl std::fmt::Display for ComponentType {
             Self::SddmTheme => write!(f, "SDDM Theme"),
             Self::IconTheme => write!(f, "Icon Theme"),
             Self::Wallpaper => write!(f, "Wallpaper"),
+            Self::CursorTheme => write!(f, "Cursor Theme"),
+            Self::ComicPlugin => write!(f, "Comic Plugin"),
         }
     }
 }
@@ -740,6 +832,24 @@ mod tests {
     }
 
     #[test]
+    fn a_wallpaper_matches_every_category_wallpaper_knsrc_installs_from() {
+        assert_eq!(
+            ComponentType::Wallpaper.accepted_type_ids(),
+            &[360, 296, 297, 298, 307, 299][..]
+        );
+    }
+
+    #[test]
+    fn a_cursor_theme_and_an_icon_theme_do_not_match_each_other() {
+        assert!(ComponentType::CursorTheme.matches_type_id(107));
+        assert!(ComponentType::IconTheme.matches_type_id(132));
+        assert!(!ComponentType::CursorTheme.matches_type_id(132));
+        assert!(!ComponentType::IconTheme.matches_type_id(107));
+        assert!(ComponentType::ComicPlugin.matches_type_id(155));
+        assert!(!ComponentType::ComicPlugin.matches_type_id(107));
+    }
+
+    #[test]
     fn the_no_match_failure_reprs_the_store_version() {
         let entry = NoMatchingDownload {
             component: InstalledComponent {
@@ -777,6 +887,64 @@ mod tests {
         assert_eq!(
             ComponentType::IconTheme.shared_path_types(),
             &[ComponentType::IconTheme]
+        );
+    }
+
+    const CURSOR_PATH_CHILD: &str = "PLASMOID_UPDATER_CURSOR_PATH_TEST_CHILD";
+    const CURSOR_PATH_MARKER: &str = "PLASMOID_UPDATER_CURSOR_PATH_TEST_MARKER";
+
+    /// A cursor theme is installed by KNewStuff's `xcursor.knsrc`, whose
+    /// `InstallPath=.icons` resolves against the home directory, not against an
+    /// XDG data directory. The probe runs in a child process because setting
+    /// `HOME` in-process needs `unsafe`.
+    #[test]
+    fn a_cursor_theme_installs_under_the_home_dot_icons_directory() {
+        if std::env::var_os(CURSOR_PATH_CHILD).is_some() {
+            let home = PathBuf::from(std::env::var("HOME").unwrap());
+            let data = PathBuf::from(std::env::var("XDG_DATA_HOME").unwrap());
+            assert_eq!(
+                ComponentType::IconTheme.user_path(),
+                data.join("icons"),
+                "the control: an icon theme lives under XDG_DATA_HOME"
+            );
+            assert_eq!(
+                ComponentType::CursorTheme.user_path(),
+                home.join(".icons"),
+                "a cursor theme must install under ~/.icons"
+            );
+            std::fs::write(std::env::var(CURSOR_PATH_MARKER).unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let data = root.join("data");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let marker = root.join("child-done");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "types::tests::a_cursor_theme_installs_under_the_home_dot_icons_directory",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .env(CURSOR_PATH_CHILD, "1")
+            .env(CURSOR_PATH_MARKER, &marker)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && marker.exists(),
+            "child failed ({}; body completed: {})\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            marker.exists(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 }

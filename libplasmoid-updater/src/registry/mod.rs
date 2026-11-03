@@ -8,7 +8,7 @@ mod utils;
 mod xml;
 
 pub(crate) use manager::{RegistryEntry, RegistryManager};
-pub(crate) use utils::extract_date_from_iso;
+pub(crate) use utils::{extract_date_from_iso, normalize_path};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -60,11 +60,17 @@ fn user_components(
     entries: Vec<RegistryEntry>,
     roots: &[PathBuf],
 ) -> Vec<InstalledComponent> {
+    // A registry records the resolved spelling, while an XDG variable can be
+    // spelled with `.` or `..`: compare both sides the same way.
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|root| utils::normalize_path(root))
+        .collect();
     entries
         .into_iter()
         .filter_map(|entry| {
             let path = utils::resolve_component_path(entry.installed_path);
-            if !is_contained(&path, roots) {
+            if !is_contained(&path, &roots) {
                 log::warn!(
                     target: "registry",
                     "ignoring {component_type} entry {:?}: {path:?} is outside the user data directories",
@@ -279,16 +285,32 @@ pub(crate) fn registry_path(component_type: ComponentType) -> Option<PathBuf> {
         .map(|f| crate::paths::knewstuff_dir().join(f))
 }
 
-/// Builds a directory_name -> content_id lookup cache from the registry files
-/// that may name this mode's components.
+/// The install a KNewStuff registry recorded a store id for.
 ///
-/// Reads each registry file once and maps each installed directory name to the
-/// store id recorded for it, eliminating the need for per-component file I/O
-/// during resolution. A user run reads the user's KNewStuff directory. A
-/// `--system` run reads only the trusted system registries: the user's registry
-/// is writable by anything running as the user, so an entry in it must never
-/// choose the store content a privileged update installs.
-pub(crate) fn build_id_cache(system: bool) -> HashMap<String, u64> {
+/// A directory name does not identify a component: one theme family ships
+/// `Breeze` as an icon theme, a cursor theme and a Plasma style at once, each
+/// with its own registry entry and store id, and one type can name two installs
+/// with the same directory name under different roots. The component type and
+/// the component's own root directory together do.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RegistryInstall {
+    pub(crate) component_type: ComponentType,
+    pub(crate) path: PathBuf,
+}
+
+/// Maps each install a registry names to the store id it recorded for it.
+pub(crate) type RegistryIdCache = HashMap<RegistryInstall, u64>;
+
+/// Builds an install -> content_id lookup cache from the registry files that
+/// may name this mode's components.
+///
+/// Reads each registry file once and maps each install to the store id recorded
+/// for it, eliminating the need for per-component file I/O during resolution. A
+/// user run reads the user's KNewStuff directory. A `--system` run reads only
+/// the trusted system registries: the user's registry is writable by anything
+/// running as the user, so an entry in it must never choose the store content a
+/// privileged update installs.
+pub(crate) fn build_id_cache(system: bool) -> RegistryIdCache {
     build_id_cache_trusting(
         system,
         &crate::paths::knewstuff_dir(),
@@ -304,7 +326,7 @@ fn build_id_cache_trusting(
     user_knewstuff: &Path,
     system_roots: &[PathBuf],
     trusted: fn(&Path) -> bool,
-) -> HashMap<String, u64> {
+) -> RegistryIdCache {
     let mut cache = HashMap::new();
 
     for &ct in ComponentType::all() {
@@ -344,6 +366,8 @@ fn build_id_cache_trusting(
                 let Some(installed_path) = raw.first_installed_path() else {
                     continue;
                 };
+                let installed_path =
+                    utils::normalize_path(&utils::resolve_component_path(installed_path));
                 let Some(dir_name) = utils::extract_directory_name(&installed_path) else {
                     continue;
                 };
@@ -355,7 +379,13 @@ fn build_id_cache_trusting(
                 // A trusted system registry records the system installs; a user
                 // registry records only what the user's own run may update.
                 if system || ct.registry_only() || !privilege::is_system_path(&installed_path) {
-                    cache.insert(dir_name, id);
+                    cache.insert(
+                        RegistryInstall {
+                            component_type: ct,
+                            path: installed_path,
+                        },
+                        id,
+                    );
                 }
             }
         }
@@ -474,6 +504,7 @@ fn update_registry_file(registry: &Path, update: &AvailableUpdate, system: bool)
 
     let fields = xml::UpdateFields {
         directory_name: &component.directory_name,
+        component_type: component.component_type,
         content_id: update.content_id,
         new_version: &update.latest_version,
         download_url: &update.download_url,
@@ -922,7 +953,13 @@ mod tests {
             |_| true,
         );
 
-        assert_eq!(cache.get("system-widget"), Some(&5150));
+        assert_eq!(
+            cache.get(&RegistryInstall {
+                component_type: ComponentType::PlasmaWidget,
+                path: PathBuf::from("/usr/share/plasma/plasmoids/system-widget"),
+            }),
+            Some(&5150)
+        );
     }
 
     #[test]

@@ -31,11 +31,7 @@ pub(crate) fn resolve_content_id(
     store_entries: &[StoreEntry],
     lookup: &IdLookup,
 ) -> Option<u64> {
-    if let Some(id) = lookup
-        .registry_id_cache
-        .get(&component.directory_name)
-        .copied()
-    {
+    if let Some(id) = lookup.registry_id(component) {
         return Some(id);
     }
 
@@ -229,7 +225,7 @@ mod tests {
         }
     }
 
-    fn empty_lookup() -> (HashMap<String, u64>, HashMap<String, u64>) {
+    fn empty_lookup() -> (HashMap<String, u64>, crate::registry::RegistryIdCache) {
         (HashMap::new(), HashMap::new())
     }
 
@@ -607,7 +603,13 @@ mod tests {
         let entries = vec![make_entry(200, "My Widget", 705)];
         let wid = HashMap::new();
         let mut reg = HashMap::new();
-        reg.insert("org.example.widget".to_string(), 100);
+        reg.insert(
+            crate::registry::RegistryInstall {
+                component_type: ComponentType::PlasmaWidget,
+                path: component.path.clone(),
+            },
+            100,
+        );
         let lookup = IdLookup {
             widgets_id_table: &wid,
             registry_id_cache: &reg,
@@ -615,6 +617,52 @@ mod tests {
 
         let result = resolve_content_id(&component, &entries, &lookup);
         assert_eq!(result, Some(100));
+    }
+
+    #[test]
+    fn a_registry_id_answers_only_for_its_own_type_and_install_root() {
+        let mut component = make_component("Breeze", "Breeze", ComponentType::IconTheme);
+        component.path = PathBuf::from("/home/u/.local/share/icons/Breeze");
+        let mut reg = HashMap::new();
+        reg.insert(
+            crate::registry::RegistryInstall {
+                component_type: ComponentType::CursorTheme,
+                path: PathBuf::from("/home/u/.icons/Breeze"),
+            },
+            107,
+        );
+        reg.insert(
+            crate::registry::RegistryInstall {
+                component_type: ComponentType::IconTheme,
+                path: PathBuf::from("/home/u/.icons/Breeze"),
+            },
+            108,
+        );
+        let wid = HashMap::new();
+        {
+            let lookup = IdLookup {
+                widgets_id_table: &wid,
+                registry_id_cache: &reg,
+            };
+            assert_eq!(
+                resolve_content_id(&component, &[], &lookup),
+                None,
+                "an id for another type or another install root answered"
+            );
+        }
+
+        reg.insert(
+            crate::registry::RegistryInstall {
+                component_type: ComponentType::IconTheme,
+                path: component.path.clone(),
+            },
+            132,
+        );
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+        assert_eq!(resolve_content_id(&component, &[], &lookup), Some(132));
     }
 
     #[test]

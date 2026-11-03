@@ -90,6 +90,7 @@ pub(super) struct NewEntry<'a> {
 /// Fields to update in a registry entry.
 pub(super) struct UpdateFields<'a> {
     pub directory_name: &'a str,
+    pub component_type: ComponentType,
     pub content_id: u64,
     pub new_version: &'a str,
     pub download_url: &'a str,
@@ -247,7 +248,8 @@ fn escape_xml_text(s: &str) -> Cow<'_, str> {
 pub(super) fn add_entry(xml: &str, entry: &NewEntry) -> Result<String> {
     let category_id = entry.component_type.category_id();
     let store_url = format!("https://store.kde.org/p/{}", entry.content_id);
-    let installed_file = utils::registry_installed_file_path(entry.installed_path);
+    let installed_file =
+        utils::registry_installed_file_path(entry.installed_path, entry.component_type);
 
     let new_entry = format!(
         r#"  <stuff category="{category_id}">
@@ -590,6 +592,7 @@ fn get_field_replacement<'a>(element_name: &str, fields: &'a UpdateFields) -> Op
         "status" => Some(Cow::Borrowed("installed")),
         "installedfile" => Some(Cow::Owned(utils::registry_installed_file_path(
             fields.installed_path,
+            fields.component_type,
         ))),
         _ => None,
     }
@@ -614,6 +617,7 @@ mod tests {
     fn update_fields<'a>(directory_name: &'a str, installed_path: &'a Path) -> UpdateFields<'a> {
         UpdateFields {
             directory_name,
+            component_type: ComponentType::ColorScheme,
             content_id: 777,
             new_version: "2.0",
             download_url: "https://example.test/dl?new=1",

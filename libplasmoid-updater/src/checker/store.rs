@@ -85,16 +85,12 @@ pub(crate) fn fetch_store_entries(
 }
 
 fn resolve_id_locally(component: &InstalledComponent, lookup: &IdLookup) -> Option<u64> {
-    lookup
-        .registry_id_cache
-        .get(&component.directory_name)
-        .copied()
-        .or_else(|| {
-            lookup
-                .widgets_id_table
-                .get(&component.directory_name)
-                .copied()
-        })
+    lookup.registry_id(component).or_else(|| {
+        lookup
+            .widgets_id_table
+            .get(&component.directory_name)
+            .copied()
+    })
 }
 
 fn distinct_types(components: &[InstalledComponent]) -> Vec<ComponentType> {

@@ -88,6 +88,27 @@ pub(crate) fn evaluate_store_entry(
     entry: &StoreEntry,
     content_id: u64,
 ) -> ComponentCheckResult {
+    // Resolution returns a content id, not an entry type: the widgets-id table
+    // is keyed by directory name alone, so the entry that id now names may
+    // belong to another component type. Installing that archive would
+    // overwrite the component with a different kind of package.
+    if !component.component_type.matches_type_id(entry.type_id) {
+        log::warn!(
+            target: "resolver",
+            "store entry {} is type {}, not {}: refusing it for '{}'",
+            entry.id,
+            entry.type_id,
+            component.component_type,
+            component.name,
+        );
+        let diagnostic = Diagnostic::new(
+            component.name.clone(),
+            format!("store entry {} is a different component type", entry.id),
+        )
+        .with_content_id(content_id);
+        return ComponentCheckResult::Unresolved(diagnostic);
+    }
+
     if !version::is_update_available_with_date(
         &component.version,
         &entry.version,
@@ -135,7 +156,10 @@ pub(crate) fn evaluate_store_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ComponentType, DownloadLink};
+    use crate::{
+        registry::RegistryInstall,
+        types::{ComponentType, DownloadLink},
+    };
     use std::{collections::HashMap, path::PathBuf};
 
     fn make_component(name: &str, dir_name: &str) -> InstalledComponent {
@@ -194,7 +218,13 @@ mod tests {
         let store_entries = vec![make_entry(222, "Cool Widget", "2.0.0", 705)];
 
         let mut reg = HashMap::new();
-        reg.insert("org.example.cool".to_string(), 111_u64);
+        reg.insert(
+            RegistryInstall {
+                component_type: ComponentType::PlasmaWidget,
+                path: PathBuf::from("/tmp/test"),
+            },
+            111_u64,
+        );
         let wid = HashMap::new();
         let lookup = IdLookup {
             widgets_id_table: &wid,
@@ -211,7 +241,13 @@ mod tests {
         let store_entries = vec![make_entry(100, "My Widget", "2.0.0", 705)];
 
         let mut reg = HashMap::new();
-        reg.insert("org.example.widget".to_string(), 100_u64);
+        reg.insert(
+            RegistryInstall {
+                component_type: ComponentType::PlasmaWidget,
+                path: PathBuf::from("/tmp/test"),
+            },
+            100_u64,
+        );
         let wid = HashMap::new();
         let lookup = IdLookup {
             widgets_id_table: &wid,
@@ -252,7 +288,13 @@ mod tests {
         let store_entries = vec![make_entry(222, "Other Widget", "2.0.0", 705)];
 
         let mut reg = HashMap::new();
-        reg.insert("org.example.missing".to_string(), 111_u64);
+        reg.insert(
+            RegistryInstall {
+                component_type: ComponentType::PlasmaWidget,
+                path: PathBuf::from("/tmp/test"),
+            },
+            111_u64,
+        );
         let wid = HashMap::new();
         let lookup = IdLookup {
             widgets_id_table: &wid,
@@ -261,5 +303,29 @@ mod tests {
 
         let result = check_component(&component, &store_entries, &lookup);
         assert!(matches!(result, ComponentCheckResult::Unresolved(_)));
+    }
+
+    #[test]
+    fn a_store_entry_of_another_type_is_never_evaluated_for_a_component() {
+        let mut component = make_component("Shared", "Shared");
+        component.component_type = ComponentType::IconTheme;
+        let foreign = make_entry(500, "Shared", "2.0.0", 107);
+
+        assert!(
+            !matches!(
+                evaluate_store_entry(&component, &foreign, 500),
+                ComponentCheckResult::Update(_)
+            ),
+            "a cursor theme entry was evaluated as an icon theme update"
+        );
+
+        let own = make_entry(501, "Shared", "2.0.0", 132);
+        assert!(
+            matches!(
+                evaluate_store_entry(&component, &own, 501),
+                ComponentCheckResult::Update(_)
+            ),
+            "an icon theme entry was refused for an icon theme"
+        );
     }
 }

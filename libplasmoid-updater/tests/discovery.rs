@@ -85,6 +85,108 @@ fn a_broken_shared_path_registry_does_not_hide_other_types() {
     );
 }
 
+/// A cursor theme installed the way Discover records it: a metadata-less
+/// `~/.icons/<dir>` named by an `xcursor.knsregistry` entry (shape copied from
+/// a real registry: category 107, `installedfile` ending in `/*`).
+fn cursor_theme(sandbox: &Sandbox) -> std::path::PathBuf {
+    let home = sandbox.data_home().parent().unwrap().join("home");
+    let theme = home.join(".icons/Test-cursors");
+    std::fs::create_dir_all(theme.join("cursors")).unwrap();
+    std::fs::write(theme.join("cursors/left_ptr"), b"cursor").unwrap();
+    std::fs::write(
+        theme.join("index.theme"),
+        "[Icon Theme]\nName=Test Cursors\n",
+    )
+    .unwrap();
+    let registry = sandbox.data_home().join("knewstuff3");
+    std::fs::create_dir_all(&registry).unwrap();
+    std::fs::write(
+        registry.join("xcursor.knsregistry"),
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE khotnewstuff3>
+<hotnewstuffregistry>
+ <stuff category="107">
+  <name>Test Cursors</name>
+  <providerid>api.kde-look.org</providerid>
+  <version>1.0</version>
+  <installedfile>{}/*</installedfile>
+  <id>999003</id>
+  <status>installed</status>
+ </stuff>
+</hotnewstuffregistry>
+"#,
+            theme.display()
+        ),
+    )
+    .unwrap();
+    theme
+}
+
+#[test]
+fn a_registered_cursor_theme_is_listed_as_a_cursor_theme() {
+    if let Some(child) = common::child() {
+        let installed = get_installed(&config()).unwrap();
+        let cursor = installed
+            .iter()
+            .find(|c| c.name == "Test Cursors")
+            .unwrap_or_else(|| panic!("cursor theme not listed: {installed:?}"));
+        assert_eq!(cursor.component_type, ComponentType::CursorTheme);
+        assert_eq!(cursor.version, "1.0");
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(cursor.path, home.join(".icons/Test-cursors"));
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    cursor_theme(&sandbox);
+    sandbox.run_child(
+        "a_registered_cursor_theme_is_listed_as_a_cursor_theme",
+        &common::dead_store_url(),
+    );
+}
+
+#[test]
+fn a_comic_plugin_with_metadata_is_listed_as_a_comic_plugin() {
+    if let Some(child) = common::child() {
+        let installed = get_installed(&config()).unwrap();
+        let comic = installed
+            .iter()
+            .find(|c| c.name == "Test Comic")
+            .unwrap_or_else(|| panic!("comic plugin not listed: {installed:?}"));
+        assert_eq!(comic.component_type, ComponentType::ComicPlugin);
+        assert_eq!(comic.version, "1.0");
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let package = sandbox
+        .data_home()
+        .join("plasma/comics/org.example.testcomic");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("metadata.json"),
+        r#"{"KPackageStructure":"Plasma/Comic","KPlugin":{"Id":"org.example.testcomic","Name":"Test Comic","Version":"1.0"}}"#,
+    )
+    .unwrap();
+    sandbox.run_child(
+        "a_comic_plugin_with_metadata_is_listed_as_a_comic_plugin",
+        &common::dead_store_url(),
+    );
+}
+
+#[test]
+fn the_new_types_serialize_in_snake_case() {
+    assert_eq!(
+        serde_json::to_value(ComponentType::CursorTheme).unwrap(),
+        serde_json::Value::String("cursor_theme".to_string())
+    );
+    assert_eq!(
+        serde_json::to_value(ComponentType::ComicPlugin).unwrap(),
+        serde_json::Value::String("comic_plugin".to_string())
+    );
+}
+
 const BREEZE_DARK: &str = "org.kde.breezedark.desktop";
 
 fn system_theme_dir() -> std::path::PathBuf {

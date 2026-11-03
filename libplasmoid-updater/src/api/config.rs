@@ -7,10 +7,11 @@ pub(crate) const DEFAULT_MAX_RETRIES: u8 = 3;
 pub(crate) const DEFAULT_INITIAL_BACKOFF_MS: u32 = 100;
 /// Hard cap on catalog pages fetched in one run.
 ///
-/// Registry-only types (color schemes, icon themes, wallpapers) never reach the
-/// catalog. The other supported categories joined held 4189 entries on
-/// 2026-11-01, plus 18 in widget category 713 on 2026-11-02: 43 pages at 100
-/// per page; 64 pages is about 1.5 times that.
+/// Registry-only types (color schemes, icon themes, wallpapers, cursor themes)
+/// never reach the catalog. The other supported categories joined held 4189
+/// entries on 2026-11-01, plus 18 in widget category 713 and 192 in comic
+/// category 155 on 2026-11-02: 44 pages at 100 per page; 64 pages is about 1.5
+/// times that.
 pub(crate) const DEFAULT_MAX_PAGES: u32 = 64;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);

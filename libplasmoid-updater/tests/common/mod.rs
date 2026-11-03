@@ -81,6 +81,16 @@ impl Sandbox {
         self.root.path().join("data")
     }
 
+    /// The sandbox's `HOME`, the parent of every `XDG_*` directory.
+    pub fn home_dir(&self) -> PathBuf {
+        self.root.path().join("home")
+    }
+
+    /// The sandbox's `XDG_CACHE_HOME`, where backups land.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.path().join("cache")
+    }
+
     /// The sandbox's `TMPDIR`, where downloads are unpacked.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.path().join("tmp")
@@ -185,6 +195,13 @@ impl Sandbox {
     /// Re-runs this test binary filtered to `test` inside the sandbox, and
     /// panics with the child's output unless it ran the test body to the end.
     pub fn run_child(&self, test: &str, store_url: &str) {
+        self.run_child_with_data_home(test, store_url, &self.root.path().join("data"));
+    }
+
+    /// Like [`run_child`](Self::run_child), with `XDG_DATA_HOME` overridden to
+    /// `data_home` (the later `env` wins over [`command`](Self::command)'s
+    /// default), for a test that needs a differently-spelled data directory.
+    pub fn run_child_with_data_home(&self, test: &str, store_url: &str, data_home: &Path) {
         let marker = self.root.path().join("child-done");
         let output = self
             .command(std::env::current_exe().unwrap())
@@ -192,6 +209,7 @@ impl Sandbox {
             .env(CHILD_FLAG, "1")
             .env(STORE_URL_VAR, store_url)
             .env(MARKER_VAR, &marker)
+            .env("XDG_DATA_HOME", data_home)
             .output()
             .unwrap();
         assert!(
@@ -222,6 +240,18 @@ pub enum TotalItems {
     Default,
     /// A fixed count on every page.
     Items(u32),
+}
+
+/// One store entry the fake store serves beyond the fake color scheme: listed
+/// in the catalog under `type_id`, answered by its per-id lookup, and
+/// downloadable as a `.tar.gz` of `files`.
+pub struct ExtraEntry {
+    pub id: u64,
+    pub name: &'static str,
+    pub type_id: u16,
+    pub version: &'static str,
+    /// Archive members, as `(relative path, contents)`.
+    pub files: &'static [(&'static str, &'static str)],
 }
 
 /// What the fake store advertises for the fake color scheme.
@@ -276,6 +306,8 @@ pub struct Listing {
     /// When set, the widget package carries a chain of links that each stay
     /// inside the package root on paper but resolve outside it.
     pub widget_package_link: bool,
+    /// Store entries served beside the color scheme, each with its own archive.
+    pub extras: Vec<ExtraEntry>,
 }
 
 impl Default for Listing {
@@ -301,6 +333,7 @@ impl Default for Listing {
             widget_package_id: None,
             widget_metadata_symlink: false,
             widget_package_link: false,
+            extras: Vec::new(),
         }
     }
 }
@@ -368,11 +401,22 @@ impl FakeStore {
             );
             (widget.type_id, entry)
         });
+        let extras: Vec<ServedExtra> = listing
+            .extras
+            .iter()
+            .map(|extra| ServedExtra {
+                id: extra.id,
+                type_id: extra.type_id,
+                xml: extra_entry_xml(&host, extra),
+                archive: files_archive(extra.files),
+            })
+            .collect();
         let state = Arc::new(Served {
             entry,
             widget,
             archive,
             widget_archive,
+            extras,
             in_catalog: listing.in_catalog,
             per_id_fails: listing.per_id_fails,
             per_id_fails_left: AtomicUsize::new(listing.per_id_fails_first),
@@ -418,11 +462,20 @@ pub fn dead_store_url() -> String {
     format!("http://127.0.0.1:{port}/ocs/v1")
 }
 
+/// One extra entry the fake store answers with, its XML and archive prepared.
+struct ServedExtra {
+    id: u64,
+    type_id: u16,
+    xml: String,
+    archive: Vec<u8>,
+}
+
 struct Served {
     entry: String,
     widget: Option<(u16, String)>,
     archive: Vec<u8>,
     widget_archive: Option<Vec<u8>>,
+    extras: Vec<ServedExtra>,
     in_catalog: bool,
     per_id_fails: bool,
     per_id_fails_left: AtomicUsize,
@@ -458,6 +511,12 @@ fn serve(mut stream: TcpStream, served: &Served) {
         && let Some(widget_archive) = &served.widget_archive
     {
         ("200 OK", widget_archive.clone())
+    } else if let Some(extra) = served
+        .extras
+        .iter()
+        .find(|extra| target == format!("/dl/extra-{}.tar.gz", extra.id))
+    {
+        ("200 OK", extra.archive.clone())
     } else if target.starts_with("/dl/") {
         if served.download_stalls {
             std::thread::sleep(std::time::Duration::from_secs(60));
@@ -483,6 +542,12 @@ fn serve(mut stream: TcpStream, served: &Served) {
         } else {
             ("200 OK", ocs(Some(1), entry).into_bytes())
         }
+    } else if let Some(extra) = served
+        .extras
+        .iter()
+        .find(|extra| target == format!("/ocs/v1/content/data/{}", extra.id))
+    {
+        ("200 OK", ocs(Some(1), &extra.xml).into_bytes())
     } else if let Some(query) = target.strip_prefix("/ocs/v1/content/data?") {
         served.catalog_requests.fetch_add(1, Ordering::SeqCst);
         if served.catalog_connects_nowhere {
@@ -509,6 +574,12 @@ fn serve(mut stream: TcpStream, served: &Served) {
             {
                 content.push_str(widget);
                 listed += 1;
+            }
+            for extra in &served.extras {
+                if first_page && names(extra.type_id) {
+                    content.push_str(&extra.xml);
+                    listed += 1;
+                }
             }
             let total = match served.total_items {
                 TotalItems::Items(items) => Some(items),
@@ -543,6 +614,51 @@ fn ocs(total: Option<u32>, content: &str) -> String {
          <message></message>{total_items}<itemsperpage>100</itemsperpage>\
          </meta><data>{content}</data></ocs>"
     )
+}
+
+/// The OCS `<content>` entry extra entry `entry` is served as, downloading
+/// from the archive [`files_archive`] builds for it.
+fn extra_entry_xml(host: &str, entry: &ExtraEntry) -> String {
+    format!(
+        "<content details=\"full\"><id>{id}</id><name>{name}</name>\
+         <version>{version}</version><typeid>{type_id}</typeid>\
+         <changed>2026-10-01T00:00:00+00:00</changed>\
+         <downloadlink1>{host}/dl/extra-{id}.tar.gz</downloadlink1>\
+         <download_version1>{version}</download_version1></content>",
+        id = entry.id,
+        name = entry.name,
+        version = entry.version,
+        type_id = entry.type_id,
+    )
+}
+
+/// A `.tar.gz` holding `files`, each at its relative path, built with the
+/// system `tar`.
+fn files_archive(files: &[(&str, &str)]) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let mut roots = std::collections::BTreeSet::new();
+    for (relative, content) in files {
+        let path = src.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        if let Some(root) = relative.split('/').next() {
+            roots.insert(root.to_string());
+        }
+    }
+    let archive = dir.path().join("extra.tar.gz");
+    let mut command = Command::new("tar");
+    command
+        .args(["--create", "--gzip", "--file"])
+        .arg(&archive)
+        .arg("--directory")
+        .arg(&src);
+    for root in &roots {
+        command.arg(root);
+    }
+    let status = command.status().unwrap();
+    assert!(status.success(), "tar failed building the fixture archive");
+    std::fs::read(archive).unwrap()
 }
 
 /// A `.tar.gz` holding the new color scheme file, built with the system `tar`.

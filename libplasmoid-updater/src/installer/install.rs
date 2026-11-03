@@ -67,6 +67,36 @@ where
     None
 }
 
+/// Searches a directory tree breadth-first for every directory matching the
+/// predicate. A matched directory is not descended into: its children are part
+/// of the match, not further matches.
+fn find_all_in_dir<F>(dir: &Path, predicate: F) -> Vec<PathBuf>
+where
+    F: Fn(&Path) -> bool + Copy,
+{
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), 0)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        if predicate(&dir) {
+            found.push(dir);
+            continue;
+        }
+        if depth >= MAX_SEARCH_DEPTH {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                // A link is not followed: it may point anywhere, including outside
+                // the extract directory this search must stay in.
+                if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                    queue.push_back((entry.path(), depth + 1));
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Searches breadth-first for a file (not a directory) matching the predicate.
 fn find_file_in_dir<F>(dir: &Path, predicate: F) -> Option<PathBuf>
 where
@@ -1219,12 +1249,20 @@ fn has_component_structure(dir: &Path, component_type: ComponentType) -> bool {
         ComponentType::KWinSwitcher => {
             is_regular_file(&dir.join("metadata.json")) || is_directory(&dir.join("contents"))
         }
-        _ => false,
+        ComponentType::PlasmaWidget
+        | ComponentType::WallpaperPlugin
+        | ComponentType::KWinEffect
+        | ComponentType::KWinScript
+        | ComponentType::IconTheme
+        | ComponentType::Wallpaper
+        | ComponentType::ColorScheme
+        | ComponentType::CursorTheme
+        | ComponentType::ComicPlugin => false,
     }
 }
 
-fn find_icon_theme_dir(extract_dir: &Path) -> Option<PathBuf> {
-    find_in_dir(extract_dir, |d| is_regular_file(&d.join("index.theme")))
+fn find_index_theme_dirs(extract_dir: &Path) -> Vec<PathBuf> {
+    find_all_in_dir(extract_dir, |d| is_regular_file(&d.join("index.theme")))
 }
 
 fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
@@ -1265,7 +1303,9 @@ pub(super) fn install_direct(
 ) -> Result<(), ComponentFailure> {
     match component.component_type {
         ComponentType::ColorScheme => install_color_scheme(extract_dir, &component.path),
-        ComponentType::IconTheme => install_icon_theme(extract_dir, &component.path),
+        ComponentType::IconTheme | ComponentType::CursorTheme => {
+            install_index_theme(extract_dir, &component.path, &component.directory_name)
+        }
         ComponentType::Wallpaper => install_wallpaper(extract_dir, component),
         ComponentType::AuroraeDecoration
         | ComponentType::GlobalTheme
@@ -1274,7 +1314,12 @@ pub(super) fn install_direct(
         | ComponentType::SddmTheme => {
             install_theme_dir(extract_dir, &component.path, component.component_type)
         }
-        _ => Err(install_failure(format!(
+        ComponentType::PlasmaWidget
+        | ComponentType::WallpaperPlugin
+        | ComponentType::KWinEffect
+        | ComponentType::KWinScript
+        | ComponentType::KWinSwitcher
+        | ComponentType::ComicPlugin => Err(install_failure(format!(
             "{} should use kpackagetool",
             component.component_type
         ))),
@@ -1290,12 +1335,43 @@ fn install_color_scheme(extract_dir: &Path, dest_path: &Path) -> Result<(), Comp
     Ok(())
 }
 
-fn install_icon_theme(extract_dir: &Path, dest_dir: &Path) -> Result<(), ComponentFailure> {
-    let source_dir = find_icon_theme_dir(extract_dir)
-        .ok_or_else(|| install_failure("no icon theme (index.theme) found in archive"))?;
+/// Installs the directory holding `index.theme` (an icon or cursor theme).
+///
+/// A multi-variant pack ships several theme dirs in one archive; the variant
+/// named like the component is the one it owns. With no same-named variant, a
+/// single-theme archive still installs as before, and several variants none of
+/// which match is an error rather than a guess.
+fn install_index_theme(
+    extract_dir: &Path,
+    dest_dir: &Path,
+    directory_name: &str,
+) -> Result<(), ComponentFailure> {
+    let themes = find_index_theme_dirs(extract_dir);
+    if themes.is_empty() {
+        return Err(install_failure("no theme (index.theme) found in archive"));
+    }
+    let source_dir = themes
+        .iter()
+        .map(PathBuf::as_path)
+        .find(|dir| dir.file_name().is_some_and(|name| name == directory_name))
+        .or_else(|| (themes.len() == 1).then(|| themes[0].as_path()))
+        .ok_or_else(|| {
+            // Sorted: directory iteration order is not stable, and the message
+            // names the variants in a fixed order.
+            let mut variants: Vec<String> = themes
+                .iter()
+                .filter_map(|dir| dir.file_name().and_then(|name| name.to_str()))
+                .map(|name| format!("{name:?}"))
+                .collect();
+            variants.sort();
+            install_failure(format!(
+                "archive holds several themes ({}) and none is named {directory_name:?}",
+                variants.join(", ")
+            ))
+        })?;
 
-    atomic_install_dir(&source_dir, dest_dir)?;
-    log::debug!(target: "install", "copied icon theme to {}", dest_dir.display());
+    atomic_install_dir(source_dir, dest_dir)?;
+    log::debug!(target: "install", "copied theme to {}", dest_dir.display());
     Ok(())
 }
 
@@ -1988,7 +2064,7 @@ exit 0
             "a link to an outside component root became the package root"
         );
         assert!(
-            find_icon_theme_dir(&extract).is_none(),
+            find_index_theme_dirs(&extract).is_empty(),
             "a link to an outside icon theme became the source"
         );
         assert!(
@@ -2550,6 +2626,113 @@ exit 0
         std::os::unix::fs::symlink("..", package.join("scalable/apps/loop")).unwrap();
 
         verify_package_tree(&package, ComponentType::IconTheme).unwrap();
+    }
+
+    fn theme_component(
+        path: &Path,
+        directory_name: &str,
+        component_type: ComponentType,
+    ) -> InstalledComponent {
+        InstalledComponent {
+            name: directory_name.to_string(),
+            directory_name: directory_name.to_string(),
+            version: "1.0".to_string(),
+            component_type,
+            path: path.to_path_buf(),
+            is_system: false,
+            release_date: String::new(),
+        }
+    }
+
+    /// A two-variant cursor pack: `left` and `right` each carry an `index.theme`
+    /// and one cursor file whose content names the variant.
+    fn two_variant_extract(root: &Path, left: &str, right: &str) -> PathBuf {
+        let extract = root.join("extract");
+        for name in [left, right] {
+            let variant = extract.join(name);
+            std::fs::create_dir_all(variant.join("cursors")).unwrap();
+            std::fs::write(variant.join("index.theme"), "[Icon Theme]\n").unwrap();
+            std::fs::write(variant.join("cursors/left_ptr"), name).unwrap();
+        }
+        extract
+    }
+
+    #[test]
+    fn a_variant_pack_installs_the_variant_named_like_the_component() {
+        for names in [
+            ("Aaa-cursors", "Zzz-cursors"),
+            ("Zzz-cursors", "Aaa-cursors"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let extract = two_variant_extract(dir.path(), names.0, names.1);
+            let dest = dir.path().join("Aaa-cursors");
+            let component = theme_component(&dest, "Aaa-cursors", ComponentType::CursorTheme);
+
+            install_direct(&extract, &component).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(dest.join("cursors/left_ptr")).unwrap(),
+                "Aaa-cursors",
+                "installed a sibling variant (extract order {names:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_variant_pack_with_no_matching_variant_name_fails_the_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let extract = two_variant_extract(dir.path(), "Aaa-cursors", "Zzz-cursors");
+        let dest = dir.path().join("Other-cursors");
+        let component = theme_component(&dest, "Other-cursors", ComponentType::CursorTheme);
+
+        let failure = install_direct(&extract, &component).unwrap_err();
+
+        assert_eq!(failure.kind, FailureKind::Install);
+        assert!(
+            failure.message.contains("Aaa-cursors") && failure.message.contains("Zzz-cursors"),
+            "the failure did not name the variants: {}",
+            failure.message
+        );
+        assert_eq!(
+            failure.message,
+            "archive holds several themes (\"Aaa-cursors\", \"Zzz-cursors\") and none is named \"Other-cursors\""
+        );
+    }
+
+    #[test]
+    fn an_archive_without_a_theme_fails_with_the_no_theme_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let extract = dir.path().join("extract");
+        let variant = extract.join("Lonely-cursors");
+        std::fs::create_dir_all(&variant).unwrap();
+        std::fs::write(variant.join("README"), "no theme here").unwrap();
+        let dest = dir.path().join("Lonely-cursors");
+        let component = theme_component(&dest, "Lonely-cursors", ComponentType::CursorTheme);
+
+        let failure = install_direct(&extract, &component).unwrap_err();
+
+        assert_eq!(failure.kind, FailureKind::Install);
+        assert_eq!(failure.message, "no theme (index.theme) found in archive");
+    }
+
+    #[test]
+    fn a_single_theme_archive_with_another_name_still_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let extract = dir.path().join("extract");
+        let variant = extract.join("Other-cursors");
+        std::fs::create_dir_all(variant.join("cursors")).unwrap();
+        std::fs::write(variant.join("index.theme"), "[Icon Theme]\n").unwrap();
+        std::fs::write(variant.join("cursors/left_ptr"), "single").unwrap();
+        let dest = dir.path().join("Aaa-cursors");
+        let component = theme_component(&dest, "Aaa-cursors", ComponentType::CursorTheme);
+
+        install_direct(&extract, &component).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("cursors/left_ptr")).unwrap(),
+            "single",
+            "the single-theme fallback no longer installs"
+        );
     }
 
     #[test]

@@ -12,7 +12,8 @@ use crate::{
     Result,
     api::ApiClient,
     config::Config,
-    types::{Diagnostic, UpdateCheckResult},
+    registry::{RegistryIdCache, RegistryInstall},
+    types::{Diagnostic, InstalledComponent, UpdateCheckResult},
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
@@ -24,7 +25,20 @@ pub(crate) use discovery::{find_installed, read_metadata};
 /// reducing parameter count across the checker module.
 pub(crate) struct IdLookup<'a> {
     pub widgets_id_table: &'a HashMap<String, u64>,
-    pub registry_id_cache: &'a HashMap<String, u64>,
+    pub registry_id_cache: &'a RegistryIdCache,
+}
+
+impl IdLookup<'_> {
+    /// The store id the registry recorded for `component`'s own type and
+    /// install root: a same-named component of another type never answers.
+    pub(crate) fn registry_id(&self, component: &InstalledComponent) -> Option<u64> {
+        self.registry_id_cache
+            .get(&RegistryInstall {
+                component_type: component.component_type,
+                path: crate::registry::normalize_path(&component.path),
+            })
+            .copied()
+    }
 }
 
 /// Checks for updates using pre-discovered components.
@@ -122,13 +136,18 @@ mod tests {
     const WIDGET: &str = "org.frapell.networkspeed";
     const USER_WIDGET: &str = "user-widget";
 
-    fn component(directory_name: &str, is_system: bool) -> InstalledComponent {
+    fn component(path: PathBuf, is_system: bool) -> InstalledComponent {
+        let directory_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_string();
         InstalledComponent {
-            name: directory_name.to_string(),
-            directory_name: directory_name.to_string(),
+            name: directory_name.clone(),
+            directory_name,
             version: "1.0".to_string(),
             component_type: ComponentType::PlasmaWidget,
-            path: PathBuf::from(format!("/plasmoids/{directory_name}")),
+            path,
             is_system,
             release_date: String::new(),
         }
@@ -224,7 +243,14 @@ mod tests {
                 registry_id_cache: &system_cache,
             };
             assert_eq!(
-                resolution::resolve_content_id(&component(WIDGET, true), &[], &system_lookup),
+                resolution::resolve_content_id(
+                    &component(
+                        PathBuf::from("/usr/share/plasma/plasmoids").join(WIDGET),
+                        true,
+                    ),
+                    &[],
+                    &system_lookup,
+                ),
                 Some(TABLE_ID),
                 "the user registry chose a system component's store content: {system_cache:?}"
             );
@@ -234,8 +260,9 @@ mod tests {
                 widgets_id_table: &table,
                 registry_id_cache: &user_cache,
             };
+            let user_widget = root.join("data/plasma/plasmoids").join(USER_WIDGET);
             assert_eq!(
-                resolution::resolve_content_id(&component(USER_WIDGET, false), &[], &user_lookup),
+                resolution::resolve_content_id(&component(user_widget, false), &[], &user_lookup),
                 Some(USER_ID),
                 "a user component no longer resolves through the user registry: {user_cache:?}"
             );

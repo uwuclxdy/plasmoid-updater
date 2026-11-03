@@ -124,7 +124,7 @@ static USER_HOME: OnceLock<PathBuf> = OnceLock::new();
 
 /// Gets the user's home directory, even when running with sudo.
 /// Cached after first call via `OnceLock`.
-fn user_home() -> &'static Path {
+pub(crate) fn user_home() -> &'static Path {
     USER_HOME.get_or_init(resolve_user_home)
 }
 
