@@ -32,6 +32,15 @@ pub enum Error {
         tool: &'static str,
     },
 
+    /// A command the library ran exited nonzero.
+    #[error("{}", command_failure(.command, .status))]
+    Command {
+        /// The command that failed (e.g. `systemctl`).
+        command: &'static str,
+        /// The exit status the command reported.
+        status: std::process::ExitStatus,
+    },
+
     /// A network request to the KDE Store or a download server failed.
     #[error("network request failed: {0}")]
     Network(#[from] reqwest::Error),
@@ -70,4 +79,61 @@ pub enum Error {
     /// A configuration or environment problem the caller can fix.
     #[error("configuration error: {0}")]
     Config(String),
+}
+
+/// Renders a failed command's exit status the way an error line names it: the
+/// code it exited with, or the signal that killed it. Shared with the
+/// installers that spawn external commands, so every site reads the same.
+pub(crate) fn command_failure(command: &str, status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("{command} exited with status {code}"),
+        (None, Some(signal)) => match nix::sys::signal::Signal::try_from(signal) {
+            Ok(name) => format!("{command} was killed by signal {signal} ({name:?})"),
+            Err(_) => format!("{command} was killed by signal {signal}"),
+        },
+        (None, None) => format!("{command} exited without a status code"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+
+    use super::Error;
+
+    #[test]
+    fn a_command_error_names_an_exit_status_code() {
+        let error = Error::Command {
+            command: "systemctl",
+            status: ExitStatus::from_raw(1 << 8),
+        };
+
+        assert_eq!(error.to_string(), "systemctl exited with status 1");
+    }
+
+    #[test]
+    fn a_command_error_names_a_signal_death() {
+        let error = Error::Command {
+            command: "systemctl",
+            status: ExitStatus::from_raw(9),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "systemctl was killed by signal 9 (SIGKILL)"
+        );
+    }
+
+    #[test]
+    fn a_command_error_names_a_missing_status() {
+        let error = Error::Command {
+            command: "systemctl",
+            status: ExitStatus::from_raw(0x7f),
+        };
+
+        assert_eq!(error.to_string(), "systemctl exited without a status code");
+    }
 }

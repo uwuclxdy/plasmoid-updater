@@ -393,9 +393,9 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::MissingTool`] when `systemctl` is not on `PATH`, and
-/// [`Error::Config`] naming the command when it cannot be spawned or exits
-/// nonzero.
+/// Returns [`Error::MissingTool`] when `systemctl` is not on `PATH`,
+/// [`Error::Config`] naming the command when it cannot be spawned, and
+/// [`Error::Command`] naming `systemctl` and its status when it exits nonzero.
 pub fn restart_plasmashell() -> Result<()> {
     installer::restart_plasmashell()
 }

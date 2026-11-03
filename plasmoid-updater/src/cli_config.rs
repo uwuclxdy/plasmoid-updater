@@ -180,10 +180,16 @@ fn open_in_editor(path: &Path) -> libplasmoid_updater::Result<()> {
             },
         ))
     } else {
-        Err(libplasmoid_updater::Error::Config(format!(
-            "editor '{editor}' exited with {status}"
-        )))
+        Err(editor_failure(&editor, &status))
     }
+}
+
+/// A failed editor run names the exit status the way every other command does.
+fn editor_failure(editor: &str, status: &std::process::ExitStatus) -> libplasmoid_updater::Error {
+    libplasmoid_updater::Error::Config(crate::command_failure(
+        &format!("editor '{editor}'"),
+        status,
+    ))
 }
 
 /// A failed shell spawn names the editor. `Error::MissingTool` holds only a
@@ -194,5 +200,22 @@ fn editor_spawn_error(editor: &str, e: &std::io::Error) -> libplasmoid_updater::
         libplasmoid_updater::Error::Config(format!("editor '{editor}' not found on PATH"))
     } else {
         libplasmoid_updater::Error::Config(format!("failed to run editor '{editor}': {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A failed editor run names the exit status, never the doubled
+    /// `exited with exit status: 1` shape an `ExitStatus` interpolates.
+    #[test]
+    fn a_failed_editor_names_the_exit_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let error = super::editor_failure("nano", &std::process::ExitStatus::from_raw(1 << 8));
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: editor 'nano' exited with status 1"
+        );
     }
 }

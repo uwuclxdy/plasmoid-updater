@@ -36,9 +36,9 @@ impl UpdateLock {
     pub(crate) fn acquire() -> Result<Self> {
         let cache_home = paths::cache_home();
         let lock_path = lock_path();
-        // glibc applies setegid/seteuid to every thread of the process, and no
-        // other thread is touching files yet: the idle rayon workers an
-        // interactive check has already started only wait for tasks.
+        // glibc applies setgroups/setegid/seteuid to every thread of the
+        // process, and no other thread is touching files yet: the idle rayon
+        // workers an interactive check has already started only wait for tasks.
         let _invoking_user = DelegatedIds::enter(delegated_ids(), IdCalls::PROCESS, &lock_path)?;
         create_dir_chain(&cache_home).map_err(|source| Error::Io {
             path: cache_home.clone(),
@@ -154,18 +154,55 @@ fn delegated_ids() -> Option<(Uid, Gid)> {
     delegated_ids_for(Uid::effective(), sudo_uid.as_deref(), sudo_gid.as_deref())
 }
 
-/// The two effective-id calls the switch makes, behind fields so a test can
-/// watch the order and the restore without root.
+/// The id calls the switch makes, behind fields so a test can watch the order
+/// and the restore without root.
 struct IdCalls {
+    /// The groups the switch drops to: the invoking user's own.
+    invoking_groups: fn(Uid, Gid) -> Vec<Gid>,
+    /// The process's groups before the switch, to put back on the way out.
+    current_groups: fn() -> Vec<Gid>,
+    set_groups: fn(&[Gid]) -> nix::Result<()>,
     set_egid: fn(Gid) -> nix::Result<()>,
     set_euid: fn(Uid) -> nix::Result<()>,
 }
 
 impl IdCalls {
     const PROCESS: Self = Self {
+        invoking_groups: invoking_user_groups,
+        current_groups: process_groups,
+        set_groups: nix::unistd::setgroups,
         set_egid: nix::unistd::setegid,
         set_euid: nix::unistd::seteuid,
     };
+}
+
+/// The invoking user's groups: the primary group plus every supplementary one
+/// from the passwd and group databases, so root's supplementary groups do not
+/// survive the switch.
+fn invoking_user_groups(uid: Uid, gid: Gid) -> Vec<Gid> {
+    let Ok(Some(user)) = nix::unistd::User::from_uid(uid) else {
+        return vec![gid];
+    };
+    let Ok(name) = std::ffi::CString::new(user.name) else {
+        return vec![gid];
+    };
+    nix::unistd::getgrouplist(&name, gid).unwrap_or_else(|_| vec![gid])
+}
+
+fn process_groups() -> Vec<Gid> {
+    match nix::unistd::getgroups() {
+        Ok(groups) => groups,
+        Err(e) => {
+            // A failed read must not silently "restore" root to no
+            // supplementary groups: the capture's own failure is logged, and
+            // the switch still drops to a known state.
+            log::error!(
+                target: "lock",
+                "failed to read the current supplementary groups: {e}"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Runs its scope on the invoking user's effective ids, then puts root's back.
@@ -177,6 +214,8 @@ impl IdCalls {
 struct DelegatedIds {
     calls: IdCalls,
     switched: bool,
+    /// The supplementary groups to put back when the switch ends.
+    original_groups: Vec<Gid>,
 }
 
 impl DelegatedIds {
@@ -185,18 +224,27 @@ impl DelegatedIds {
             return Ok(Self {
                 calls,
                 switched: false,
+                original_groups: Vec::new(),
             });
         };
+        let original_groups = (calls.current_groups)();
         let mut guard = Self {
             calls,
             switched: false,
+            original_groups,
         };
-        // The group goes first: only while the effective uid is still root is
-        // the change permitted, and a failure past it is what the drop undoes.
-        if let Err(source) = (guard.calls.set_egid)(gid) {
+        // The group changes go while the effective uid is still root: only
+        // then may the process setgroups and setegid. The supplementary groups
+        // go first, then the effective gid, then the uid that ends the
+        // privilege.
+        let groups = (guard.calls.invoking_groups)(uid, gid);
+        if let Err(source) = (guard.calls.set_groups)(&groups) {
             return Err(switch_error(lock_path, uid, gid, source));
         }
         guard.switched = true;
+        if let Err(source) = (guard.calls.set_egid)(gid) {
+            return Err(switch_error(lock_path, uid, gid, source));
+        }
         if let Err(source) = (guard.calls.set_euid)(uid) {
             return Err(switch_error(lock_path, uid, gid, source));
         }
@@ -215,6 +263,12 @@ impl Drop for DelegatedIds {
         }
         if let Err(e) = (self.calls.set_egid)(Gid::from_raw(0)) {
             log::error!(target: "lock", "failed to restore the effective gid 0: {e}");
+        }
+        if let Err(e) = (self.calls.set_groups)(&self.original_groups) {
+            log::error!(
+                target: "lock",
+                "failed to restore the supplementary groups: {e}"
+            );
         }
     }
 }
@@ -281,7 +335,7 @@ fn prepare_backups_dir(cache_home: &Path) -> Option<PathBuf> {
 /// step and reports its own error. The mode bits decide, not `access(2)`:
 /// during a delegated switch the real ids are still root's, so `access` answers
 /// for root instead of for the user the run acts as.
-fn writable_by_current_ids(dir: &Path) -> bool {
+pub(super) fn writable_by_current_ids(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
     let Ok(metadata) = std::fs::metadata(dir) else {
@@ -298,12 +352,13 @@ fn writable_by_current_ids(dir: &Path) -> bool {
 }
 
 fn writable_by(mode: u32, owner: u32, group: u32, groups: &[Gid], euid: Uid, egid: Gid) -> bool {
+    // Creating entries in a directory needs both write and execute.
     if owner == euid.as_raw() {
-        mode & 0o200 != 0
+        mode & 0o300 == 0o300
     } else if group == egid.as_raw() || groups.iter().any(|g| g.as_raw() == group) {
-        mode & 0o020 != 0
+        mode & 0o030 == 0o030
     } else {
-        mode & 0o002 != 0
+        mode & 0o003 == 0o003
     }
 }
 
@@ -450,6 +505,21 @@ mod tests {
         Ok(())
     }
 
+    fn record_groups(groups: &[Gid]) -> nix::Result<()> {
+        for gid in groups {
+            record("groups", gid.as_raw());
+        }
+        Ok(())
+    }
+
+    fn recording_invoking_groups(_uid: Uid, gid: Gid) -> Vec<Gid> {
+        vec![gid]
+    }
+
+    fn recording_current_groups() -> Vec<Gid> {
+        vec![Gid::from_raw(0)]
+    }
+
     fn refuse_nonroot_egid(gid: Gid) -> nix::Result<()> {
         record("egid", gid.as_raw());
         match gid.as_raw() {
@@ -467,9 +537,19 @@ mod tests {
     }
 
     fn recording_calls() -> IdCalls {
+        calls_with(record_egid, record_euid)
+    }
+
+    fn calls_with(
+        set_egid: fn(Gid) -> nix::Result<()>,
+        set_euid: fn(Uid) -> nix::Result<()>,
+    ) -> IdCalls {
         IdCalls {
-            set_egid: record_egid,
-            set_euid: record_euid,
+            invoking_groups: recording_invoking_groups,
+            current_groups: recording_current_groups,
+            set_groups: record_groups,
+            set_egid,
+            set_euid,
         }
     }
 
@@ -491,14 +571,14 @@ mod tests {
             .unwrap();
             assert_eq!(
                 take_switches(),
-                [("egid", 1000), ("euid", 1000)],
-                "the group must change while the uid is still root"
+                [("groups", 1000), ("egid", 1000), ("euid", 1000)],
+                "the groups and gid must change while the uid is still root"
             );
         }
         assert_eq!(
             take_switches(),
-            [("euid", 0), ("egid", 0)],
-            "the guard did not put root's ids back"
+            [("euid", 0), ("egid", 0), ("groups", 0)],
+            "the guard did not put root's ids and groups back"
         );
     }
 
@@ -507,10 +587,7 @@ mod tests {
         let owner = Some((Uid::from_raw(1000), Gid::from_raw(1000)));
         let lock_path = Path::new("/home/user/.cache/plasmoid-updater.lock");
 
-        let calls = IdCalls {
-            set_egid: refuse_nonroot_egid,
-            set_euid: record_euid,
-        };
+        let calls = calls_with(refuse_nonroot_egid, record_euid);
         let err = match DelegatedIds::enter(owner, calls, lock_path) {
             Ok(_) => panic!("the refused group switch reported success"),
             Err(e) => e,
@@ -524,14 +601,17 @@ mod tests {
         }
         assert_eq!(
             take_switches(),
-            [("egid", 1000)],
-            "a failed group switch left nothing to restore"
+            [
+                ("groups", 1000),
+                ("egid", 1000),
+                ("euid", 0),
+                ("egid", 0),
+                ("groups", 0),
+            ],
+            "a failed group switch must restore the dropped groups"
         );
 
-        let calls = IdCalls {
-            set_egid: recording_calls().set_egid,
-            set_euid: refuse_nonroot_euid,
-        };
+        let calls = calls_with(record_egid, refuse_nonroot_euid);
         let err = match DelegatedIds::enter(owner, calls, lock_path) {
             Ok(_) => panic!("the refused user switch reported success"),
             Err(e) => e,
@@ -545,8 +625,15 @@ mod tests {
         }
         assert_eq!(
             take_switches(),
-            [("egid", 1000), ("euid", 1000), ("euid", 0), ("egid", 0)],
-            "a failed user switch must put the group back"
+            [
+                ("groups", 1000),
+                ("egid", 1000),
+                ("euid", 1000),
+                ("euid", 0),
+                ("egid", 0),
+                ("groups", 0),
+            ],
+            "a failed user switch must put the groups back"
         );
     }
 
@@ -557,19 +644,56 @@ mod tests {
 
         assert!(writable_by(0o700, 1000, 1000, &[], user, group));
         assert!(!writable_by(0o500, 1000, 1000, &[], user, group));
+        assert!(writable_by(0o300, 1000, 1000, &[], user, group));
+        assert!(
+            !writable_by(0o200, 1000, 1000, &[], user, group),
+            "creating entries also needs the execute bit"
+        );
         assert!(
             writable_by(0o070, 0, 1000, &[], user, group),
             "a group member writes through the group bits"
         );
         assert!(
-            writable_by(0o020, 0, 2000, &[Gid::from_raw(2000)], user, group),
+            writable_by(0o030, 0, 2000, &[Gid::from_raw(2000)], user, group),
             "a supplementary group counts as the file's group"
         );
-        assert!(writable_by(0o002, 0, 0, &[], user, group));
+        assert!(writable_by(0o003, 0, 0, &[], user, group));
+        assert!(
+            !writable_by(0o002, 0, 0, &[], user, group),
+            "creating entries also needs the execute bit"
+        );
         assert!(
             !writable_by(0o020, 0, 0, &[], user, group),
             "a non-member must not write through the group bits"
         );
+    }
+
+    #[test]
+    fn invoking_user_groups_matches_the_systems_group_list() {
+        let uid = nix::unistd::Uid::current();
+        let gid = nix::unistd::Gid::current();
+
+        let groups = invoking_user_groups(uid, gid);
+        assert!(
+            groups.contains(&gid),
+            "the primary group is missing: {groups:?}"
+        );
+
+        // `id -G <user>` reads the passwd and group databases, the same source
+        // getgrouplist uses. A bare `id -G` prints the PROCESS's groups, which
+        // a stale session or `newgrp` can make differ from the database.
+        let user = nix::unistd::User::from_uid(uid).unwrap().unwrap();
+        let output = std::process::Command::new("id")
+            .args(["-G", &user.name])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "id -G {} failed", user.name);
+        let listed: std::collections::BTreeSet<u32> = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .map(|g| g.parse().unwrap())
+            .collect();
+        let ours: std::collections::BTreeSet<u32> = groups.iter().map(|g| g.as_raw()).collect();
+        assert_eq!(ours, listed, "the group lookup disagreed with `id -G`");
     }
 
     #[test]
@@ -720,9 +844,16 @@ mod tests {
         let Some(role) = std::env::var_os("PU_TEST_LOCK_ROLE") else {
             let root = tempfile::tempdir().unwrap();
             let cache = root.path().join("cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            // An older release's root run left `plasmoid-updater/` root-owned:
+            // link the subdir to a directory this user cannot write, so the
+            // refusal the lock survives is the real one (EPERM), not a chmod
+            // of a directory the user owns.
+            let locked = root.path().join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            set_mode(&locked, 0o555);
             let subdir = cache.join("plasmoid-updater");
-            std::fs::create_dir_all(&subdir).unwrap();
-            set_mode(&subdir, 0o555);
+            std::os::unix::fs::symlink(&locked, &subdir).unwrap();
 
             let out = child(
                 STALE_SUBDIR_CHILD,

@@ -850,8 +850,7 @@ fn edit_config_error_names_the_editor_without_repeating_status() {
     let run = edit_config(&sandbox, "false");
     assert_eq!(run.code, 3, "{run}");
     assert!(
-        run.stderr
-            .contains("editor 'false' exited with exit status: 1"),
+        run.stderr.contains("editor 'false' exited with status 1"),
         "{run}"
     );
 }

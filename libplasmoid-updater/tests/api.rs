@@ -382,6 +382,43 @@ fn update_reports_a_checksum_failure_and_keeps_the_old_version() {
     );
 }
 
+/// A backups dir this user cannot write (an older release's root run left it
+/// root-owned) fails the update with a message naming the fix.
+#[test]
+fn an_unwritable_backups_dir_fails_naming_the_chown_fix() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Some(child) = common::child() {
+        let cache = std::path::PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap());
+        let locked = cache.join("locked-backups");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::create_dir_all(cache.join("plasmoid-updater")).unwrap();
+        std::os::unix::fs::symlink(&locked, cache.join("plasmoid-updater/backups")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = update(&config(&child.store_url), &Quiet).unwrap();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.succeeded.is_empty(), "{result:?}");
+        assert_eq!(result.failed.len(), 1, "{result:?}");
+        let message = &result.failed[0].message;
+        assert!(message.contains("sudo chown -R"), "{message}");
+        assert!(
+            message.contains(&cache.join("plasmoid-updater").display().to_string()),
+            "the hint names no path under the cache dir: {message}"
+        );
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing::default());
+    sandbox.run_child(
+        "an_unwritable_backups_dir_fails_naming_the_chown_fix",
+        store.url(),
+    );
+    assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
 #[test]
 fn install_of_an_empty_selection_changes_nothing() {
     if let Some(child) = common::child() {

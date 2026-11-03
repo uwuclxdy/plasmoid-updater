@@ -48,6 +48,10 @@ pub(crate) struct ComponentFailure {
     /// A process the failed step started may still be writing the component's
     /// tree, so restoring the backup would race it.
     pub process_may_still_run: bool,
+    /// The operating system's error, when the failure is one it named. A
+    /// caller that must key on the error's kind reads it here instead of from
+    /// the rendered message.
+    source: Option<std::io::Error>,
 }
 
 impl ComponentFailure {
@@ -56,11 +60,17 @@ impl ComponentFailure {
             kind,
             message: message.into(),
             process_may_still_run: false,
+            source: None,
         }
     }
 
     pub(crate) fn io(kind: FailureKind, path: &Path, source: std::io::Error) -> Self {
-        Self::new(kind, format!("{}: {source}", path.display()))
+        Self {
+            kind,
+            message: format!("{}: {source}", path.display()),
+            process_may_still_run: false,
+            source: Some(source),
+        }
     }
 
     pub(crate) fn into_failure(self, component: InstalledComponent) -> Failure {
@@ -272,10 +282,27 @@ fn post_install_tasks(update: &AvailableUpdate) -> Result<(), ComponentFailure> 
 }
 
 fn verify_installed_version(update: &AvailableUpdate) -> InstallOutcome {
+    verify_installed_version_trusting(
+        update,
+        &crate::paths::system_data_dirs(),
+        &crate::paths::knewstuff_dir(),
+        crate::paths::is_trusted_system_path,
+    )
+}
+
+/// `system_roots`, `user_knewstuff` and `trusted` decide which registry the
+/// version read uses, so a test can point a `--system` read at a trusted
+/// fixture a tempdir root could never make pass the real trust check.
+fn verify_installed_version_trusting(
+    update: &AvailableUpdate,
+    system_roots: &[PathBuf],
+    user_knewstuff: &Path,
+    trusted: fn(&Path) -> bool,
+) -> InstallOutcome {
     let component = &update.installed;
     let expected = &update.latest_version;
 
-    let actual = read_installed_version(component);
+    let actual = read_installed_version_trusting(component, system_roots, user_knewstuff, trusted);
 
     let verified = match &actual {
         Some(v) => normalize_version(v) == normalize_version(expected),
@@ -305,10 +332,22 @@ fn verify_installed_version(update: &AvailableUpdate) -> InstallOutcome {
     }
 }
 
-fn read_installed_version(component: &InstalledComponent) -> Option<String> {
-    // For registry-only types, read from the KNewStuff registry
+fn read_installed_version_trusting(
+    component: &InstalledComponent,
+    system_roots: &[PathBuf],
+    user_knewstuff: &Path,
+    trusted: fn(&Path) -> bool,
+) -> Option<String> {
+    // For registry-only types, read from the KNewStuff registry the update
+    // wrote: the user registry for a user component, the trusted system
+    // registry for a system one.
     if component.component_type.registry_only() {
-        return read_version_from_registry(component);
+        return crate::registry::read_component_version_trusting(
+            component,
+            system_roots,
+            user_knewstuff,
+            trusted,
+        );
     }
 
     // Try metadata.json first
@@ -343,22 +382,6 @@ fn read_installed_version(component: &InstalledComponent) -> Option<String> {
     }
 
     None
-}
-
-fn read_version_from_registry(component: &InstalledComponent) -> Option<String> {
-    use crate::registry::RegistryManager;
-
-    let manager = RegistryManager::for_component_type(component.component_type)?;
-    let entries = manager.read_entries().ok()?;
-    entries
-        .iter()
-        .find(|e| {
-            e.name == component.name
-                || e.installed_path
-                    .components()
-                    .eq(component.path.components())
-        })
-        .map(|e| e.version.clone())
 }
 
 /// Puts the backup back after a failed install, unless a process the failure
@@ -590,6 +613,158 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&dest).unwrap(),
             "[Colors:View]\n# old\n"
+        );
+    }
+
+    fn system_scheme_update(path: PathBuf, latest: &str, content_id: u64) -> AvailableUpdate {
+        AvailableUpdate::builder(
+            InstalledComponent {
+                name: "Fake Scheme".to_string(),
+                directory_name: "FakeScheme.colors".to_string(),
+                version: "1.0".to_string(),
+                component_type: ComponentType::ColorScheme,
+                path,
+                is_system: true,
+                release_date: String::new(),
+            },
+            content_id,
+            latest.to_string(),
+            "https://example.test/dl".to_string(),
+            "2026-02-02".to_string(),
+        )
+        .build()
+    }
+
+    fn write_scheme_registry(registry_dir: &Path, version: &str, installed: &Path) {
+        std::fs::create_dir_all(registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("colorschemes.knsregistry"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Fake Scheme</name>
+    <version>{version}</version>
+    <installedfile>{installed}</installedfile>
+    <id>42</id>
+  </stuff>
+</hotnewstuffregistry>
+"#,
+                installed = installed.display(),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The post-install version read for a `--system` registry-only component
+    /// reads the trusted system registry the update wrote; a planted user
+    /// registry entry naming the same component must not decide the outcome.
+    #[test]
+    fn a_system_registry_version_read_reports_the_update_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let installed = PathBuf::from("/usr/share/color-schemes/FakeScheme.colors");
+        let update = system_scheme_update(installed.clone(), "2.0", 42);
+
+        let system = root.join("system");
+        write_scheme_registry(&system.join("knewstuff3"), "2.0", &installed);
+        let user = root.join("user-knewstuff3");
+        write_scheme_registry(&user, "9.9", &installed);
+
+        let outcome = verify_installed_version_trusting(
+            &update,
+            std::slice::from_ref(&system),
+            &user,
+            |_| true,
+        );
+
+        assert!(outcome.verified, "the update read as unverified");
+        assert_eq!(outcome.actual_version.as_deref(), Some("2.0"));
+    }
+
+    fn user_scheme_update(path: PathBuf, latest: &str, content_id: u64) -> AvailableUpdate {
+        AvailableUpdate::builder(
+            InstalledComponent {
+                name: "Fake Scheme".to_string(),
+                directory_name: "FakeScheme.colors".to_string(),
+                version: "1.0".to_string(),
+                component_type: ComponentType::ColorScheme,
+                path,
+                is_system: false,
+                release_date: String::new(),
+            },
+            content_id,
+            latest.to_string(),
+            "https://example.test/dl".to_string(),
+            "2026-02-02".to_string(),
+        )
+        .build()
+    }
+
+    /// The production version read supplies the run's own registry inputs: the
+    /// user registry from `XDG_DATA_HOME` and the system roots from
+    /// `XDG_DATA_DIRS`, whose user-owned entries the real trust check drops.
+    #[test]
+    fn the_production_version_read_takes_its_inputs_from_the_environment() {
+        const CHILD: &str = "PU_TEST_VERSION_READ_CHILD";
+        const ROOT: &str = "PU_TEST_VERSION_READ_ROOT";
+
+        if std::env::var_os(CHILD).is_some() {
+            crate::installer::testutil::capture_logs();
+            let root = PathBuf::from(std::env::var(ROOT).unwrap());
+            let share = root.join("share");
+            let data = root.join("data");
+
+            let user_path = root.join("installed/FakeScheme.colors");
+            std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+            write_scheme_registry(&data.join("knewstuff3"), "2.0", &user_path);
+            let outcome = verify_installed_version(&user_scheme_update(user_path, "2.0", 42));
+            assert!(
+                outcome.verified,
+                "the user registry under XDG_DATA_HOME was not read: {:?}",
+                outcome.actual_version
+            );
+
+            let system_path = PathBuf::from("/usr/share/color-schemes/FakeScheme.colors");
+            let outcome = verify_installed_version(&system_scheme_update(system_path, "2.0", 42));
+            assert!(!outcome.verified);
+            let logs = crate::installer::testutil::captured_logs();
+            assert!(
+                logs.iter().any(|line| line.starts_with("paths: ")
+                    && line.contains(&share.display().to_string())),
+                "the system roots did not come from XDG_DATA_DIRS: {logs:?}"
+            );
+
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("share")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::tests::the_production_version_read_takes_its_inputs_from_the_environment",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", root.join("home"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_DATA_DIRS", root.join("share"))
+            .env(CHILD, "1")
+            .env(ROOT, &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && root.join("done").exists(),
+            "child failed ({}; body completed: {})\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            root.join("done").exists(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 }

@@ -37,6 +37,12 @@ fn is_blank(xml: &str) -> bool {
     xml.trim_start_matches('\u{feff}').trim().is_empty()
 }
 
+/// An element's text without the surrounding whitespace a pretty-printed
+/// document adds, the spelling both the reader and the writer compare.
+fn element_text(raw: &str) -> &str {
+    raw.trim()
+}
+
 /// Raw fields collected from a single `<stuff>` entry during XML parsing.
 #[derive(Default)]
 pub(super) struct RawEntry {
@@ -61,7 +67,7 @@ impl RawEntry {
 
     /// Records one finished element's text into the field it names.
     fn assign(&mut self, element: &str, raw: &str) {
-        let value = raw.trim();
+        let value = element_text(raw);
         match element {
             "name" => self.name = value.to_string(),
             "version" => self.version = value.to_string(),
@@ -96,6 +102,10 @@ pub(super) struct UpdateFields<'a> {
     pub download_url: &'a str,
     pub installed_path: &'a Path,
     pub release_date: &'a str,
+    /// Whether a unique directory-name match may select the entry when no
+    /// `installedfile` names the install path: true for a user write, false for
+    /// a `--system` write, which must never pick an entry by name.
+    pub name_fallback: bool,
 }
 
 fn parse_error(detail: impl Into<String>) -> Error {
@@ -347,28 +357,76 @@ fn root_end(xml: &str) -> Result<RootEnd> {
 /// Updates an existing entry in the registry XML.
 /// Returns `Some(new_xml)` if entry was found and updated, `None` if not found.
 pub(super) fn update_entry(xml: &str, fields: &UpdateFields) -> Result<Option<String>> {
-    let Some(target) = find_target_index(xml, fields.directory_name)? else {
+    let Some(target) = find_target_index(
+        xml,
+        fields.installed_path,
+        fields.directory_name,
+        fields.name_fallback,
+    )?
+    else {
         return Ok(None);
     };
 
     rewrite_with_updates(xml, target, fields)
 }
 
-/// Locates the `<stuff>` entry whose `installedfile` names `directory_name` as
-/// a path segment, and which of that entry's `installedfile` elements matched.
+/// Locates the `<stuff>` entry an update belongs to, and which of that entry's
+/// `installedfile` elements matched.
 ///
-/// `uninstalledfile` records files a component removed, so it never names the
-/// entry an update belongs to.
-fn find_target_index(xml: &str, directory_name: &str) -> Result<Option<(usize, usize)>> {
+/// An entry whose `installedfile` names the normalized resolved install root,
+/// the spelling the id cache keys an install by, wins, so an entry naming
+/// another root's same-named install never answers. When none does and
+/// `name_fallback` is set (a user write), the one entry of this registry whose
+/// `installedfile` names `directory_name` as a path segment answers instead:
+/// that repairs a record made under a spelling normalization cannot fold, such
+/// as a moved or symlinked data directory. Two such entries are ambiguous, and
+/// appending a record beats guessing which one is stale. A `--system` write
+/// never falls back. `uninstalledfile` records files a component removed, so it
+/// never names the entry an update belongs to.
+fn find_target_index(
+    xml: &str,
+    installed_path: &Path,
+    directory_name: &str,
+    name_fallback: bool,
+) -> Result<Option<(usize, usize)>> {
+    let wanted = utils::normalize_installed_path(&installed_path.to_string_lossy());
+    let entries = installed_files_by_entry(xml)?;
+
+    let exact = entries.iter().enumerate().find_map(|(entry, files)| {
+        files
+            .iter()
+            .position(|file| utils::normalize_installed_path(file) == wanted)
+            .map(|ordinal| (entry, ordinal + 1))
+    });
+    if exact.is_some() || !name_fallback {
+        return Ok(exact);
+    }
+
+    let mut named = entries.iter().enumerate().filter_map(|(entry, files)| {
+        files
+            .iter()
+            .position(|file| file.split('/').any(|segment| segment == directory_name))
+            .map(|ordinal| (entry, ordinal + 1))
+    });
+    let Some(first) = named.next() else {
+        return Ok(None);
+    };
+    if named.next().is_some() {
+        return Ok(None);
+    }
+    Ok(Some(first))
+}
+
+/// Every `<stuff>` entry's `installedfile` values, in document order. An
+/// entry's file ordinal is its index here plus one, empty elements included,
+/// which is how the rewrite counts them.
+fn installed_files_by_entry(xml: &str) -> Result<Vec<Vec<String>>> {
     let mut reader = Reader::from_str(xml);
 
     let mut current_element = String::new();
     let mut text = String::new();
-    let mut entry_index: Option<usize> = None;
+    let mut entries: Vec<Vec<String>> = Vec::new();
     let mut in_entry = false;
-    let mut current_matches = false;
-    let mut installed_ordinal = 0usize;
-    let mut matched_ordinal = 0usize;
     let mut open = 0usize;
 
     loop {
@@ -381,15 +439,13 @@ fn find_target_index(xml: &str, directory_name: &str) -> Result<Option<(usize, u
 
                 if current_element == "stuff" {
                     in_entry = true;
-                    entry_index = Some(entry_index.map_or(0, |index| index + 1));
-                    current_matches = false;
-                    installed_ordinal = 0;
-                } else if in_entry && current_element == "installedfile" {
-                    installed_ordinal += 1;
+                    entries.push(Vec::new());
                 }
             }
             Ok(Event::Empty(e)) if in_entry && e.name().as_ref() == "installedfile" => {
-                installed_ordinal += 1;
+                if let Some(files) = entries.last_mut() {
+                    files.push(String::new());
+                }
             }
             Ok(Event::Text(e)) if in_entry && current_element == "installedfile" => {
                 text.push_str(&e);
@@ -403,14 +459,13 @@ fn find_target_index(xml: &str, directory_name: &str) -> Result<Option<(usize, u
             Ok(Event::End(e)) => {
                 open = open.saturating_sub(1);
                 let name = e.name();
-                if in_entry && name.as_ref() == "installedfile" && !current_matches {
-                    current_matches = text.split('/').any(|segment| segment == directory_name);
-                    matched_ordinal = installed_ordinal;
+                if in_entry
+                    && name.as_ref() == "installedfile"
+                    && let Some(files) = entries.last_mut()
+                {
+                    files.push(element_text(&text).to_string());
                 }
                 if in_entry && name.as_ref() == "stuff" {
-                    if current_matches {
-                        return Ok(entry_index.map(|index| (index, matched_ordinal)));
-                    }
                     in_entry = false;
                 }
                 text.clear();
@@ -428,7 +483,7 @@ fn find_target_index(xml: &str, directory_name: &str) -> Result<Option<(usize, u
         }
     }
 
-    Ok(None)
+    Ok(entries)
 }
 
 /// Rewrites the registry XML, updating fields in the target entry.
@@ -623,6 +678,7 @@ mod tests {
             download_url: "https://example.test/dl?new=1",
             installed_path,
             release_date: "2026-02-02",
+            name_fallback: true,
         }
     }
 
@@ -736,6 +792,178 @@ mod tests {
         );
         assert_eq!(parsed[1].id_text, "777");
         assert_eq!(parsed[1].version, "2.0");
+    }
+
+    /// A registry holding two same-dir entries under different roots: the
+    /// update rewrites only the entry whose `installedfile` names the
+    /// component's own install path.
+    #[test]
+    fn update_targets_the_entry_whose_installedfile_names_the_install_path() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Fake</name>
+    <version>1.0</version>
+    <installedfile>/usr/local/share/color-schemes/Fake.colors</installedfile>
+    <id>111</id>
+  </stuff>
+  <stuff category="112">
+    <name>Fake</name>
+    <version>1.0</version>
+    <installedfile>/usr/share/color-schemes/Fake.colors</installedfile>
+    <id>222</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let fields = UpdateFields {
+            directory_name: "Fake.colors",
+            component_type: ComponentType::ColorScheme,
+            content_id: 777,
+            new_version: "2.0",
+            download_url: "https://example.test/dl?new=1",
+            installed_path: Path::new("/usr/share/color-schemes/Fake.colors"),
+            release_date: "2026-02-02",
+            name_fallback: true,
+        };
+        let out = update_entry(xml, &fields).unwrap().unwrap();
+
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(
+            parsed[0].id_text, "111",
+            "the other root's entry was rewritten"
+        );
+        assert_eq!(
+            parsed[1].id_text, "777",
+            "the own root's entry was not rewritten"
+        );
+    }
+
+    /// A user registry entry recorded under a spelling normalization cannot
+    /// fold — a moved or symlinked data directory — still names the same
+    /// directory: the fallback rewrites it instead of appending a duplicate.
+    #[test]
+    fn update_falls_back_to_the_one_entry_naming_the_directory() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Fake</name>
+    <version>1.0</version>
+    <installedfile>/home/u/.local/share/color-schemes/Fake.colors</installedfile>
+    <id>111</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let out = update_entry(
+            xml,
+            &update_fields(
+                "Fake.colors",
+                Path::new("/data/u/share/color-schemes/Fake.colors"),
+            ),
+        )
+        .unwrap()
+        .unwrap();
+
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed.len(), 1, "the update appended a duplicate:\n{out}");
+        assert_eq!(parsed[0].id_text, "777");
+        assert_eq!(parsed[0].version, "2.0");
+        assert_eq!(
+            parsed[0].installed_files,
+            vec!["/data/u/share/color-schemes/Fake.colors/metadata.json"]
+        );
+    }
+
+    /// A `--system` write never selects an entry by directory name: a name-only
+    /// match appends a record instead of rewriting an entry it cannot identify.
+    #[test]
+    fn a_system_write_never_matches_an_entry_by_name() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Fake</name>
+    <version>1.0</version>
+    <installedfile>/home/u/.local/share/color-schemes/Fake.colors</installedfile>
+    <id>111</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let mut fields = update_fields(
+            "Fake.colors",
+            Path::new("/data/u/share/color-schemes/Fake.colors"),
+        );
+        fields.name_fallback = false;
+
+        assert_eq!(
+            update_entry(xml, &fields).unwrap(),
+            None,
+            "a system write picked an entry by directory name"
+        );
+    }
+
+    /// Two entries of this registry name one directory: no unique fallback, so
+    /// the update appends instead of guessing which record is the stale one.
+    #[test]
+    fn update_appends_when_two_entries_name_the_directory() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Fake</name>
+    <version>1.0</version>
+    <installedfile>/home/u/first/color-schemes/Fake.colors</installedfile>
+    <id>111</id>
+  </stuff>
+  <stuff category="112">
+    <name>Fake</name>
+    <version>1.0</version>
+    <installedfile>/home/u/second/color-schemes/Fake.colors</installedfile>
+    <id>222</id>
+  </stuff>
+</hotnewstuffregistry>
+"#;
+
+        let fields = update_fields(
+            "Fake.colors",
+            Path::new("/data/u/share/color-schemes/Fake.colors"),
+        );
+
+        assert_eq!(
+            update_entry(xml, &fields).unwrap(),
+            None,
+            "an ambiguous directory-name match picked an entry"
+        );
+        let appended = add_entry(
+            xml,
+            &new_entry(Path::new("/data/u/share/color-schemes/Fake.colors")),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_raw_entries(&appended).unwrap().len(),
+            3,
+            "the new record was not appended"
+        );
+    }
+
+    /// A pretty-printed `installedfile` carries whitespace inside the element:
+    /// the write side trims it as the read side does, so it rewrites the entry
+    /// instead of appending a duplicate.
+    #[test]
+    fn update_matches_an_installedfile_holding_surrounding_whitespace() {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<hotnewstuffregistry>\n  <stuff category=\"112\">\n    <name>Target</name>\n    <version>1.0</version>\n    <installedfile>\n      /home/u/target/Target.colors\n    </installedfile>\n    <id>222</id>\n  </stuff>\n</hotnewstuffregistry>\n";
+
+        let out = update_entry(
+            xml,
+            &update_fields("Target.colors", Path::new("/home/u/target/Target.colors")),
+        )
+        .unwrap()
+        .unwrap();
+
+        let parsed = parse_raw_entries(&out).unwrap();
+        assert_eq!(parsed.len(), 1, "the update appended a duplicate:\n{out}");
+        assert_eq!(parsed[0].id_text, "777");
+        assert_eq!(parsed[0].version, "2.0");
     }
 
     #[test]

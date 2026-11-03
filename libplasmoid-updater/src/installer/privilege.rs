@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::{os::unix::fs::PermissionsExt as _, path::Path, process::Command};
+use std::{ffi::OsStr, os::unix::fs::PermissionsExt as _, path::Path, process::Command};
 
 use super::ComponentFailure;
 use crate::FailureKind;
@@ -23,6 +23,19 @@ pub(crate) fn needs_sudo(path: &Path) -> bool {
 // --- Privileged Command Execution ---
 
 fn run_sudo(args: &[&str]) -> Result<(), ComponentFailure> {
+    let os: Vec<&OsStr> = args.iter().copied().map(OsStr::new).collect();
+    run_sudo_os(&os)
+}
+
+/// Runs `sudo` with every argument kept as an `OsStr`, so a non-UTF-8 path
+/// crosses to the child unchanged.
+fn run_sudo_os(args: &[&OsStr]) -> Result<(), ComponentFailure> {
+    run_sudo_reading_os(args).map(|_| ())
+}
+
+/// Runs a command through sudo, reading its standard output, every argument
+/// kept as an `OsStr` so a non-UTF-8 path survives the crossing.
+pub(crate) fn run_sudo_reading_os(args: &[&OsStr]) -> Result<String, ComponentFailure> {
     let output = Command::new("sudo").args(args).output().map_err(|e| {
         ComponentFailure::new(FailureKind::Install, format!("failed to run sudo: {e}"))
     })?;
@@ -35,7 +48,7 @@ fn run_sudo(args: &[&str]) -> Result<(), ComponentFailure> {
         ));
     }
 
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Creates a `Command` that is prefixed with sudo if not root.
@@ -357,6 +370,109 @@ pub(crate) fn replace_file_as_root(src: &Path, dest: &Path) -> Result<(), Compon
     }
 }
 
+/// Creates directories recursively as root with `mode`, whatever the path
+/// looks like. Every level this call creates gets `mode` set on it: `mkdir -p
+/// -m` gives the mode only to the directory it names last, and a level left to
+/// the umask (027, 077) is unsearchable for the invoking user, whose trust
+/// check and restore read through it. A directory that already exists keeps
+/// its own mode.
+pub(crate) fn create_dir_all_as_root(path: &Path, mode: u32) -> Result<(), ComponentFailure> {
+    let levels: Vec<&Path> = path
+        .ancestors()
+        .filter(|level| level.parent().is_some())
+        .collect();
+    if is_root() {
+        for level in levels.into_iter().rev() {
+            match std::fs::create_dir(level) {
+                Ok(()) => std::fs::set_permissions(level, std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| ComponentFailure::io(FailureKind::Install, level, e))?,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(ComponentFailure::io(FailureKind::Install, level, e)),
+            }
+        }
+        Ok(())
+    } else {
+        let mode = format!("{mode:o}");
+        let mut args: Vec<&OsStr> = vec![
+            OsStr::new("mkdir"),
+            OsStr::new("-p"),
+            OsStr::new("-m"),
+            OsStr::new(&mode),
+        ];
+        for level in levels.into_iter().rev() {
+            args.push(level.as_os_str());
+        }
+        run_sudo_os(&args)
+    }
+}
+
+/// Copies a file as root, whatever the path looks like.
+pub(crate) fn copy_file_as_root(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
+    if is_root() {
+        std::fs::copy(src, dest)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, dest, e))?;
+        Ok(())
+    } else {
+        run_sudo_os(&[
+            OsStr::new("cp"),
+            OsStr::new("-f"),
+            src.as_os_str(),
+            dest.as_os_str(),
+        ])
+    }
+}
+
+/// Recursively copies a directory's contents as root, whatever the paths look
+/// like, into an existing destination without nesting it. `-H` dereferences
+/// only the command-line source, the way the user-mode copy reads a component's
+/// own path through a link while a link inside the package stays a link.
+pub(crate) fn copy_dir_as_root(src: &Path, dest: &Path) -> Result<(), ComponentFailure> {
+    if is_root() {
+        super::backup::copy_dir_recursive(src, dest)
+    } else {
+        run_sudo_os(&[
+            OsStr::new("cp"),
+            OsStr::new("-rfT"),
+            OsStr::new("-H"),
+            src.as_os_str(),
+            dest.as_os_str(),
+        ])
+    }
+}
+
+/// Removes a file as root, whatever the path looks like.
+pub(crate) fn remove_file_as_root(path: &Path) -> Result<(), ComponentFailure> {
+    if is_root() {
+        std::fs::remove_file(path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
+        Ok(())
+    } else {
+        run_sudo_os(&[OsStr::new("rm"), OsStr::new("-f"), path.as_os_str()])
+    }
+}
+
+/// Removes a directory tree as root, whatever the path looks like.
+pub(crate) fn remove_dir_all_as_root(path: &Path) -> Result<(), ComponentFailure> {
+    if is_root() {
+        std::fs::remove_dir_all(path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
+        Ok(())
+    } else {
+        run_sudo_os(&[OsStr::new("rm"), OsStr::new("-rf"), path.as_os_str()])
+    }
+}
+
+/// Removes an empty directory as root, whatever the path looks like.
+pub(crate) fn remove_dir_as_root(path: &Path) -> Result<(), ComponentFailure> {
+    if is_root() {
+        std::fs::remove_dir(path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
+        Ok(())
+    } else {
+        run_sudo_os(&[OsStr::new("rmdir"), path.as_os_str()])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -532,6 +648,112 @@ mod tests {
                 a.display(),
                 b.display()
             )
+        );
+    }
+
+    /// A `--system` directory copy dereferences only the top-level link, the
+    /// way the user-mode copy does: a component's own path may be a link,
+    /// while a link inside the package must stay a link.
+    #[test]
+    fn copy_dir_as_root_follows_only_the_top_level_link() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+
+        if is_root() {
+            return; // root takes the direct `copy_dir_recursive` branch
+        }
+
+        if std::env::var_os("PU_TEST_COPY_DIR_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_COPY_DIR_ROOT").unwrap());
+            let fake = std::env::var("PU_TEST_FAKE_SUDO").unwrap();
+            let resolved = Command::new("sh")
+                .args(["-c", "command -v sudo"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&resolved.stdout).trim(),
+                fake,
+                "a real sudo would run against a system path"
+            );
+
+            let dest = root.join("backup");
+            copy_dir_as_root(&root.join("linked"), &dest).unwrap();
+
+            assert!(
+                !std::fs::symlink_metadata(&dest)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the top-level link was recreated as a link"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dest.join("file.txt")).unwrap(),
+                "kept"
+            );
+            assert!(
+                std::fs::symlink_metadata(dest.join("inner"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "a link inside the package was followed"
+            );
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("file.txt"), b"kept").unwrap();
+        let outside = root.join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("inner")).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("linked")).unwrap();
+
+        let sudo_log = root.join("sudo.log");
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::privilege::tests::copy_dir_as_root_follows_only_the_top_level_link",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_SUDO_LOG", &sudo_log)
+            .env("PU_TEST_COPY_DIR_CHILD", "1")
+            .env("PU_TEST_COPY_DIR_ROOT", &root)
+            .env("PU_TEST_FAKE_SUDO", &fake_sudo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run failed: {}\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let log = std::fs::read_to_string(&sudo_log).unwrap();
+        assert!(
+            log.lines().any(|line| line.starts_with("cp -rfT")),
+            "the copy did not run through sudo: {log}"
         );
     }
 
@@ -955,6 +1177,184 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dest.join("file.txt")).unwrap(),
             "content"
+        );
+    }
+
+    /// The `--system` base and every level below it get the mode on the levels
+    /// the run creates, whatever the umask: `mkdir -p -m` alone gives the mode
+    /// only to the directory it names last, and a 027/077 umask leaves the
+    /// intermediate levels unsearchable for the invoking user.
+    #[test]
+    fn create_dir_all_as_root_sets_every_created_levels_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::PathBuf;
+
+        if is_root() {
+            return; // root takes the direct `create_dir` branch
+        }
+
+        if std::env::var_os("PU_TEST_MKDIR_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_MKDIR_ROOT").unwrap());
+            let fake = std::env::var("PU_TEST_FAKE_SUDO").unwrap();
+            let resolved = Command::new("sh")
+                .args(["-c", "command -v sudo"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&resolved.stdout).trim(),
+                fake,
+                "a real sudo would run against a system path"
+            );
+
+            let base = root.join("var/lib/plasmoid-updater/backups");
+            create_dir_all_as_root(&base, 0o755).unwrap();
+
+            for level in [
+                root.join("var"),
+                root.join("var/lib"),
+                root.join("var/lib/plasmoid-updater"),
+                root.join("var/lib/plasmoid-updater/backups"),
+            ] {
+                let mode = std::fs::metadata(&level).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(mode, 0o755, "{} took the umask", level.display());
+            }
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\numask 077\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let log = root.join("sudo.log");
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::privilege::tests::create_dir_all_as_root_sets_every_created_levels_mode",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_SUDO_LOG", &log)
+            .env("PU_TEST_MKDIR_CHILD", "1")
+            .env("PU_TEST_MKDIR_ROOT", &root)
+            .env("PU_TEST_FAKE_SUDO", &fake_sudo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A non-UTF-8 path survives the sudo crossing: `to_string_lossy` would
+    /// turn the name into U+FFFD, so the copy would read or write a different
+    /// name than the `PathBuf` the caller handed in.
+    #[test]
+    fn a_non_utf8_path_survives_the_sudo_crossing() {
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::PathBuf;
+
+        if is_root() {
+            return; // root takes the direct `fs::copy` branch
+        }
+
+        if std::env::var_os("PU_TEST_NONUTF8_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_NONUTF8_ROOT").unwrap());
+            let fake = std::env::var("PU_TEST_FAKE_SUDO").unwrap();
+            let resolved = Command::new("sh")
+                .args(["-c", "command -v sudo"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&resolved.stdout).trim(),
+                fake,
+                "a real sudo would run against a system path"
+            );
+
+            let mut src_name = b"bad-".to_vec();
+            src_name.push(0xFF);
+            src_name.extend_from_slice(b"-name");
+            let mut dest_name = b"dest-".to_vec();
+            dest_name.push(0xFE);
+            let src = root.join(std::ffi::OsString::from_vec(src_name.clone()));
+            let dest = root.join(std::ffi::OsString::from_vec(dest_name.clone()));
+            std::fs::write(&src, b"kept").unwrap();
+
+            copy_file_as_root(&src, &dest).unwrap();
+
+            assert_eq!(
+                std::fs::read(&dest).unwrap(),
+                b"kept",
+                "the copy did not land under the non-UTF-8 destination name"
+            );
+            let log = std::fs::read(root.join("sudo.log")).unwrap();
+            assert!(
+                log.contains(&0xFF),
+                "the sudo argv lost the non-UTF-8 byte: {:?}",
+                String::from_utf8_lossy(&log)
+            );
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let log = root.join("sudo.log");
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::privilege::tests::a_non_utf8_path_survives_the_sudo_crossing",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_SUDO_LOG", &log)
+            .env("PU_TEST_NONUTF8_CHILD", "1")
+            .env("PU_TEST_NONUTF8_ROOT", &root)
+            .env("PU_TEST_FAKE_SUDO", &fake_sudo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 }

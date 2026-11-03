@@ -301,6 +301,16 @@ pub(crate) struct RegistryInstall {
 /// Maps each install a registry names to the store id it recorded for it.
 pub(crate) type RegistryIdCache = HashMap<RegistryInstall, u64>;
 
+/// The install identity an installed path names for `component_type`: its type
+/// and the normalized resolved install root, the key the id cache indexes an
+/// install by.
+fn install_key(component_type: ComponentType, installed_path: &Path) -> RegistryInstall {
+    RegistryInstall {
+        component_type,
+        path: utils::normalize_path(&utils::resolve_component_path(installed_path.to_path_buf())),
+    }
+}
+
 /// Builds an install -> content_id lookup cache from the registry files that
 /// may name this mode's components.
 ///
@@ -366,9 +376,8 @@ fn build_id_cache_trusting(
                 let Some(installed_path) = raw.first_installed_path() else {
                     continue;
                 };
-                let installed_path =
-                    utils::normalize_path(&utils::resolve_component_path(installed_path));
-                let Some(dir_name) = utils::extract_directory_name(&installed_path) else {
+                let install = install_key(ct, &installed_path);
+                let Some(dir_name) = utils::extract_directory_name(&install.path) else {
                     continue;
                 };
                 // An installer sibling is not a component and must not answer
@@ -378,14 +387,8 @@ fn build_id_cache_trusting(
                 }
                 // A trusted system registry records the system installs; a user
                 // registry records only what the user's own run may update.
-                if system || ct.registry_only() || !privilege::is_system_path(&installed_path) {
-                    cache.insert(
-                        RegistryInstall {
-                            component_type: ct,
-                            path: installed_path,
-                        },
-                        id,
-                    );
+                if system || ct.registry_only() || !privilege::is_system_path(&install.path) {
+                    cache.insert(install, id);
                 }
             }
         }
@@ -436,36 +439,72 @@ fn registry_target(
     component: &InstalledComponent,
     system_roots: &[PathBuf],
 ) -> Option<(PathBuf, bool)> {
-    if !component.is_system {
-        return registry_path(component.component_type).map(|path| (path, false));
-    }
-    let registry_file = component.component_type.registry_file()?;
-    system_registry_target(
-        registry_file,
-        &component.directory_name,
+    registry_target_trusting(
+        component,
         system_roots,
+        &crate::paths::knewstuff_dir(),
         crate::paths::is_trusted_system_path,
     )
-    .map(|registry| (registry, true))
 }
 
-/// Returns the trusted system registry under `roots` that names
-/// `directory_name`: the registry the component was discovered from, so the
-/// next `--system` run still finds it.
+/// `user_knewstuff` and `trusted` decide the source, so a test can point a
+/// system read at a trusted fixture a tempdir root could never make pass the
+/// real trust check.
+pub(crate) fn registry_target_trusting(
+    component: &InstalledComponent,
+    system_roots: &[PathBuf],
+    user_knewstuff: &Path,
+    trusted: fn(&Path) -> bool,
+) -> Option<(PathBuf, bool)> {
+    if !component.is_system {
+        return component
+            .component_type
+            .registry_file()
+            .map(|file| (user_knewstuff.join(file), false));
+    }
+    system_registry_target(component, system_roots, trusted).map(|registry| (registry, true))
+}
+
+/// Reads the version the registry an update belongs to records for a
+/// component: the user registry for a user component, the trusted system
+/// registry that names a system component (the one the update wrote) for a
+/// `--system` one.
+pub(crate) fn read_component_version_trusting(
+    component: &InstalledComponent,
+    system_roots: &[PathBuf],
+    user_knewstuff: &Path,
+    trusted: fn(&Path) -> bool,
+) -> Option<String> {
+    let (registry, _system) =
+        registry_target_trusting(component, system_roots, user_knewstuff, trusted)?;
+    if !registry.try_exists().ok()? {
+        return None;
+    }
+    let entries = read_registry_file(&registry).ok()?;
+    let wanted = install_key(component.component_type, &component.path);
+    entries
+        .iter()
+        .find(|entry| install_key(component.component_type, &entry.installed_path) == wanted)
+        .map(|entry| entry.version.clone())
+}
+
+/// Returns the trusted system registry under `roots` that records
+/// `component`'s install: the registry whose entry names this type and install
+/// path, keyed the way the id cache keys an install.
 fn system_registry_target(
-    registry_file: &str,
-    directory_name: &str,
+    component: &InstalledComponent,
     roots: &[PathBuf],
     trusted: fn(&Path) -> bool,
 ) -> Option<PathBuf> {
+    let registry_file = component.component_type.registry_file()?;
+    let wanted = install_key(component.component_type, &component.path);
     let trusted_roots: Vec<PathBuf> = roots.iter().filter(|root| trusted(root)).cloned().collect();
     trusted_registries(&trusted_roots, registry_file, trusted)
         .into_iter()
         .find(|registry| {
             read_registry_file(registry).is_ok_and(|entries| {
                 entries.iter().any(|entry| {
-                    utils::extract_directory_name(&entry.installed_path).as_deref()
-                        == Some(directory_name)
+                    install_key(component.component_type, &entry.installed_path) == wanted
                 })
             })
         })
@@ -510,6 +549,7 @@ fn update_registry_file(registry: &Path, update: &AvailableUpdate, system: bool)
         download_url: &update.download_url,
         installed_path: &component.path,
         release_date: &release_date,
+        name_fallback: !system,
     };
 
     if let Some(updated) = xml::update_entry(&content, &fields)? {
@@ -1027,6 +1067,59 @@ mod tests {
         assert_eq!(user_map.get("org.example.theme").unwrap().version, "1.0");
     }
 
+    /// Two trusted system roots each holding a same-type, same-dir entry at a
+    /// different version: the component's own root's entry answers the version
+    /// read and its own root's registry is the write target.
+    #[test]
+    fn a_system_component_reads_and_targets_its_own_roots_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let roots = [root.join("local"), root.join("share")];
+        let installed = roots[1].join("color-schemes/Fake.colors");
+
+        for (root, version) in roots.iter().zip(["1.0", "2.0"]) {
+            let registry_dir = root.join("knewstuff3");
+            fs::create_dir_all(&registry_dir).unwrap();
+            fs::write(
+                registry_dir.join("colorschemes.knsregistry"),
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<hotnewstuffregistry>
+  <stuff category="112">
+    <name>Fake</name>
+    <version>{version}</version>
+    <installedfile>{installed}</installedfile>
+    <id>42</id>
+  </stuff>
+</hotnewstuffregistry>
+"#,
+                    installed = root.join("color-schemes/Fake.colors").display(),
+                ),
+            )
+            .unwrap();
+        }
+
+        let component = InstalledComponent {
+            name: "Fake".to_string(),
+            directory_name: "Fake.colors".to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::ColorScheme,
+            path: installed,
+            is_system: true,
+            release_date: String::new(),
+        };
+        let user_knewstuff = root.join("user-knewstuff3");
+
+        let read = read_component_version_trusting(&component, &roots, &user_knewstuff, |_| true);
+        assert_eq!(read.as_deref(), Some("2.0"));
+
+        let target = registry_target_trusting(&component, &roots, &user_knewstuff, |_| true);
+        assert_eq!(
+            target,
+            Some((roots[1].join("knewstuff3/colorschemes.knsregistry"), true))
+        );
+    }
+
     const SUDO_CHILD: &str = "PLASMOID_UPDATER_SUDO_TEST_CHILD";
     const SUDO_ROOT: &str = "PLASMOID_UPDATER_SUDO_TEST_ROOT";
 
@@ -1098,6 +1191,26 @@ mod tests {
             assert!(
                 written.contains("<name>Foreign</name>"),
                 "a foreign entry was lost: {written}"
+            );
+            // The registry's only `Fake` entry records another install
+            // (`/usr/share/...`) under the same directory name: a system write
+            // never picks an entry by name, so that entry keeps its version and
+            // this install's entry is appended.
+            let other_install = written
+                .split("<stuff")
+                .find(|entry| entry.contains("/usr/share/color-schemes/Fake.colors"))
+                .unwrap_or_else(|| panic!("the other install's entry was lost: {written}"));
+            assert!(
+                other_install.contains("<version>1.0</version>"),
+                "a system write rewrote an entry that only shares the directory name: {written}"
+            );
+            let own_path = format!(
+                "<installedfile>{}",
+                root.join("color-schemes/Fake.colors").display()
+            );
+            assert!(
+                written.contains(&own_path),
+                "this install's entry was not appended: {written}"
             );
             assert_eq!(
                 fs::metadata(&registry).unwrap().mode() & 0o777,
@@ -1188,10 +1301,16 @@ mod tests {
             .unwrap();
         }
 
-        let target =
-            system_registry_target("colorschemes.knsregistry", "Target.colors", &roots, |_| {
-                true
-            });
+        let component = InstalledComponent {
+            name: "Target".to_string(),
+            directory_name: "Target.colors".to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::ColorScheme,
+            path: PathBuf::from("/usr/share/color-schemes/Target.colors"),
+            is_system: true,
+            release_date: String::new(),
+        };
+        let target = system_registry_target(&component, &roots, |_| true);
 
         assert_eq!(
             target,
@@ -1215,9 +1334,17 @@ mod tests {
         )
         .unwrap();
 
+        let component = InstalledComponent {
+            name: "Fake".to_string(),
+            directory_name: "Fake.colors".to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::ColorScheme,
+            path: PathBuf::from("/usr/share/color-schemes/Fake.colors"),
+            is_system: true,
+            release_date: String::new(),
+        };
         let target = system_registry_target(
-            "colorschemes.knsregistry",
-            "Fake.colors",
+            &component,
             std::slice::from_ref(&root),
             crate::paths::is_trusted_system_path,
         );

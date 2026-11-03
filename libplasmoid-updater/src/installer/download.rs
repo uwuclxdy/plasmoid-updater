@@ -360,7 +360,7 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), Co
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         let detail = if stderr.trim().is_empty() {
-            format!("bsdtar exited with status {status}")
+            crate::error::command_failure("bsdtar", &status)
         } else {
             stderr.trim().to_string()
         };
@@ -384,7 +384,7 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), Co
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = if stderr.trim().is_empty() {
-            format!("bsdtar exited with status {}", output.status)
+            crate::error::command_failure("bsdtar", &output.status)
         } else {
             stderr.trim().to_string()
         };
@@ -709,5 +709,65 @@ mod tests {
         // the assertion above is about the owner and not an unsweepable fixture.
         sweep_stale_dirs(base.path(), effective);
         assert!(!stale.exists(), "the fixture itself is not sweepable");
+    }
+
+    /// A bsdtar that dies with empty stderr names its exit status the way every
+    /// other command does, not `bsdtar exited with status exit status: 1`.
+    #[test]
+    fn a_bsdtar_failure_with_empty_stderr_names_the_exit_status() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::PathBuf;
+
+        if std::env::var_os("PU_TEST_BSDTAR_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_BSDTAR_ROOT").unwrap());
+            let archive = root.join("package.tar.gz");
+            std::fs::write(&archive, b"not an archive").unwrap();
+            let dest = root.join("out");
+
+            let refusal = extract_archive(&archive, &dest).unwrap_err();
+
+            assert_eq!(refusal.kind, FailureKind::Extract);
+            assert_eq!(refusal.message, "bsdtar exited with status 1");
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_bsdtar = bin.join("bsdtar");
+        std::fs::write(
+            &fake_bsdtar,
+            "#!/bin/sh\ncase \"$1\" in -t) exit 0;; *) exit 1;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_bsdtar, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = std::ffi::OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::download::tests::a_bsdtar_failure_with_empty_stderr_names_the_exit_status",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_BSDTAR_CHILD", "1")
+            .env("PU_TEST_BSDTAR_ROOT", &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }

@@ -9,6 +9,14 @@ use super::{IdLookup, resolution};
 
 pub(crate) enum ComponentCheckResult {
     Update(Box<AvailableUpdate>),
+    /// No store entry matches the component: resolution found no id, so the
+    /// component cannot be checked. A `--system` check skips it; a user check
+    /// reports it unresolved.
+    Unmatched(Diagnostic),
+    /// The resolved store entry is another component type, so the component
+    /// has no store entry of its type: a `--system` check skips it; a user
+    /// check keeps today's routing.
+    TypeMismatch(Diagnostic),
     Unresolved(Diagnostic),
     /// The store entry offers no download link this component may take. The
     /// check reports the diagnostic; `update` turns the carried component into
@@ -44,7 +52,7 @@ pub(crate) fn check_component(
             "could not match to kde store entry".to_string(),
         )
         .with_versions(installed_version, None);
-        return ComponentCheckResult::Unresolved(diagnostic);
+        return ComponentCheckResult::Unmatched(diagnostic);
     };
 
     // Try to find the entry by resolved ID; if not found, retry with name match.
@@ -106,7 +114,7 @@ pub(crate) fn evaluate_store_entry(
             format!("store entry {} is a different component type", entry.id),
         )
         .with_content_id(content_id);
-        return ComponentCheckResult::Unresolved(diagnostic);
+        return ComponentCheckResult::TypeMismatch(diagnostic);
     }
 
     if !version::is_update_available_with_date(
@@ -326,6 +334,26 @@ mod tests {
                 ComponentCheckResult::Update(_)
             ),
             "an icon theme entry was refused for an icon theme"
+        );
+    }
+
+    /// A component no store entry matches is `Unmatched`, not `Unresolved`:
+    /// the two route differently for a `--system` check.
+    #[test]
+    fn a_component_with_no_store_entry_is_unmatched() {
+        let component = make_component("Distro Widget", "org.example.distro");
+        let wid = HashMap::new();
+        let reg = HashMap::new();
+        let lookup = IdLookup {
+            widgets_id_table: &wid,
+            registry_id_cache: &reg,
+        };
+
+        let result = check_component(&component, &[], &lookup);
+
+        assert!(
+            matches!(result, ComponentCheckResult::Unmatched(_)),
+            "expected Unmatched"
         );
     }
 }

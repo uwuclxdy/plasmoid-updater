@@ -934,12 +934,33 @@ fn validate_sudo() -> Result<(), lib::Error> {
         .map_err(|e| spawn_error("sudo", &e))?;
 
     if !status.success() {
-        return Err(lib::Error::Config(format!(
-            "sudo authentication failed: {status}"
-        )));
+        return Err(sudo_auth_failure(&status));
     }
 
     Ok(())
+}
+
+/// A failed `sudo -v` names the exit status the way every other command does.
+fn sudo_auth_failure(status: &std::process::ExitStatus) -> lib::Error {
+    lib::Error::Config(format!(
+        "sudo authentication failed: {}",
+        command_failure("sudo", status)
+    ))
+}
+
+/// Renders a failed command's exit status the way an error line names it. The
+/// bin's own copy of the library's `command_failure`, which is not public.
+pub(crate) fn command_failure(command: &str, status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("{command} exited with status {code}"),
+        (None, Some(signal)) => match nix::sys::signal::Signal::try_from(signal) {
+            Ok(name) => format!("{command} was killed by signal {signal} ({name:?})"),
+            Err(_) => format!("{command} was killed by signal {signal}"),
+        },
+        (None, None) => format!("{command} exited without a status code"),
+    }
 }
 
 /// Maps a failed spawn of `command` to the error that names the real cause: a
@@ -1044,20 +1065,60 @@ mod tests {
 
     #[test]
     fn a_failed_restart_is_an_error_line() {
+        use std::os::unix::process::ExitStatusExt as _;
+
         install_capture_logger();
 
-        super::log_restart_failure(&libplasmoid_updater::Error::Config(
-            "systemctl exited with status 1".to_string(),
-        ));
+        super::log_restart_failure(&libplasmoid_updater::Error::Command {
+            command: "systemctl",
+            status: std::process::ExitStatus::from_raw(1 << 8),
+        });
 
         let logged = RESTART_LOG.lock().expect("the restart log mutex");
         // The log is process-wide, so another test's line may follow this one.
         assert!(
-            logged.iter().any(|(level, message)| *level == log::Level::Error
-                && message
-                    == "failed to restart plasmashell: configuration error: systemctl exited with status 1"),
+            logged
+                .iter()
+                .any(|(level, message)| *level == log::Level::Error
+                    && message == "failed to restart plasmashell: systemctl exited with status 1"),
             "{logged:?}"
         );
+    }
+
+    /// A failed `sudo -v` names the exit status, never the doubled
+    /// `exit status: exit status: 1` shape an `ExitStatus` interpolates.
+    #[test]
+    fn a_failed_sudo_authentication_names_the_exit_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let error = super::sudo_auth_failure(&std::process::ExitStatus::from_raw(1 << 8));
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: sudo authentication failed: sudo exited with status 1"
+        );
+    }
+
+    /// The bin's own formatter copy pins its signal branch, the same string the
+    /// library's formatter renders for a signal death.
+    #[test]
+    fn the_bin_command_failure_names_a_signal_death() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let message = super::command_failure("sudo", &std::process::ExitStatus::from_raw(9));
+
+        assert_eq!(message, "sudo was killed by signal 9 (SIGKILL)");
+    }
+
+    /// The bin's own formatter copy pins its no-status branch, the same string
+    /// the library's formatter renders when no code and no signal are known.
+    #[test]
+    fn the_bin_command_failure_names_a_missing_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let message = super::command_failure("sudo", &std::process::ExitStatus::from_raw(0x7f));
+
+        assert_eq!(message, "sudo exited without a status code");
     }
 
     #[test]

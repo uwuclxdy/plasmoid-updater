@@ -17,6 +17,7 @@ pub(crate) fn check_components(
     store_entries: &[StoreEntry],
     store_answered: bool,
     lookup: &IdLookup,
+    system: bool,
     result: &mut UpdateCheckResult,
 ) -> crate::Result<()> {
     let resolutions: Vec<(&InstalledComponent, Option<u64>)> = registry_components
@@ -89,6 +90,20 @@ pub(crate) fn check_components(
                     result.add_no_matching_download(component, diagnostic);
                 }
                 evaluation::ComponentCheckResult::UpToDate => {}
+                evaluation::ComponentCheckResult::Unmatched(diagnostic) => {
+                    if system {
+                        result.skipped.push(diagnostic.name);
+                    } else {
+                        result.add_unresolved(diagnostic);
+                    }
+                }
+                evaluation::ComponentCheckResult::TypeMismatch(diagnostic) => {
+                    if system {
+                        result.skipped.push(diagnostic.name);
+                    } else {
+                        result.add_check_failure(diagnostic);
+                    }
+                }
                 evaluation::ComponentCheckResult::Unresolved(diagnostic) => {
                     result.add_check_failure(diagnostic);
                 }
@@ -106,6 +121,12 @@ pub(crate) fn check_components(
 
     for (component, resolved) in &resolutions {
         if resolved.is_some() {
+            continue;
+        }
+        // A system component no store entry matches is skipped, not failed: a
+        // distro package the store never shipped must not fail `--system check`.
+        if system {
+            result.skipped.push(component.name.clone());
             continue;
         }
         let diagnostic = Diagnostic::new(

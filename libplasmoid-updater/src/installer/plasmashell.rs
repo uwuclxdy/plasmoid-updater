@@ -14,8 +14,8 @@ fn get_user_id() -> String {
 /// # Errors
 ///
 /// Returns [`Error::MissingTool`] when `systemctl` is not on `PATH`,
-/// [`Error::Config`] naming the command when it cannot be spawned or exits
-/// nonzero.
+/// [`Error::Config`] naming the command when it cannot be spawned, and
+/// [`Error::Command`] naming `systemctl` and its status when it exits nonzero.
 pub fn restart_plasmashell() -> Result<()> {
     let mut cmd = Command::new("systemctl");
     cmd.args(["--user", "restart", "plasma-plasmashell.service"]);
@@ -39,9 +39,10 @@ pub fn restart_plasmashell() -> Result<()> {
     })?;
 
     if !status.success() {
-        return Err(Error::Config(format!(
-            "systemctl exited with status {status}"
-        )));
+        return Err(Error::Command {
+            command: "systemctl",
+            status,
+        });
     }
 
     Ok(())

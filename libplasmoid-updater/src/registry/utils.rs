@@ -85,3 +85,12 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     }
     out
 }
+
+/// The install root an `installedfile` element names, in the spelling the id
+/// cache keys an install by: a cursor theme's trailing `/*` dropped, a
+/// `metadata.json`/`metadata.desktop` leaf resolved to its directory, and `.`/
+/// `..` folded lexically.
+pub(super) fn normalize_installed_path(installed_file: &str) -> PathBuf {
+    let path = PathBuf::from(installed_file.trim_end_matches("/*"));
+    normalize_path(&resolve_component_path(path))
+}

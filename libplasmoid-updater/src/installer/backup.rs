@@ -1,31 +1,50 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
     fs,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
 };
 
 use super::ComponentFailure;
-use crate::{FailureKind, types::InstalledComponent};
+use crate::{FailureKind, installer::privilege, types::InstalledComponent};
 
 const MAX_BACKUPS_PER_TYPE: usize = 5;
+
+/// The mode every root-owned system backup directory is created with: root
+/// owns it and only root writes it, while the invoking user keeps search
+/// permission so a restore can tell a file backup from a directory one.
+const SYSTEM_BACKUP_DIR_MODE: u32 = 0o755;
+
+/// One backup this run made, so retention can leave it alone.
+struct BackupRecord {
+    timestamp_dir: PathBuf,
+    type_subdir: &'static str,
+    /// A `--system` backup: written and pruned through sudo, under the
+    /// root-owned base.
+    system: bool,
+}
 
 /// The timestamp directories one run's backups land in, so retention can leave
 /// every one of them alone.
 #[derive(Default)]
 pub(crate) struct BackupLedger {
-    created: std::sync::Mutex<Vec<(PathBuf, &'static str)>>,
+    created: std::sync::Mutex<Vec<BackupRecord>>,
 }
 
 impl BackupLedger {
-    fn record(&self, timestamp_dir: &Path, type_subdir: &'static str) {
+    fn record(&self, timestamp_dir: &Path, type_subdir: &'static str, system: bool) {
         let mut created = self
             .created
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        created.push((timestamp_dir.to_path_buf(), type_subdir));
+        created.push(BackupRecord {
+            timestamp_dir: timestamp_dir.to_path_buf(),
+            type_subdir,
+            system,
+        });
     }
 }
 
@@ -43,23 +62,53 @@ pub(crate) fn prune_backups(ledger: &BackupLedger) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *guard)
     };
-    prune_backups_in(&backup_base_dir(), &created, MAX_BACKUPS_PER_TYPE);
-}
-
-fn prune_backups_in(base: &Path, created: &[(PathBuf, &'static str)], max_keep: usize) {
-    let types: BTreeSet<&str> = created
-        .iter()
-        .map(|(_, type_subdir)| *type_subdir)
-        .collect();
-    let skip: Vec<PathBuf> = created.iter().map(|(path, _)| path.clone()).collect();
-    for type_subdir in types {
-        cleanup_old_backups_in(base, type_subdir, max_keep, &skip);
+    if created.is_empty() {
+        return;
+    }
+    // One run can write both bases; each one is listed and pruned the way its
+    // backups were written.
+    let mut by_base: BTreeMap<(PathBuf, bool), Vec<BackupRecord>> = BTreeMap::new();
+    for record in created {
+        if let Some(base) = record.timestamp_dir.parent() {
+            by_base
+                .entry((base.to_path_buf(), record.system))
+                .or_default()
+                .push(record);
+        }
+    }
+    for ((base, system), records) in by_base {
+        prune_backups_in(&base, &records, system, MAX_BACKUPS_PER_TYPE);
     }
 }
 
-/// Returns the base backup directory.
-fn backup_base_dir() -> PathBuf {
+fn prune_backups_in(base: &Path, created: &[BackupRecord], system: bool, max_keep: usize) {
+    let types: BTreeSet<&str> = created.iter().map(|record| record.type_subdir).collect();
+    let skip: Vec<PathBuf> = created
+        .iter()
+        .map(|record| record.timestamp_dir.clone())
+        .collect();
+    for type_subdir in types {
+        cleanup_old_backups_in(base, type_subdir, max_keep, &skip, system);
+    }
+}
+
+/// The base backup directory for user-mode backups.
+fn user_backup_base_dir() -> PathBuf {
     crate::paths::cache_home().join("plasmoid-updater/backups")
+}
+
+/// The base backup directory for `--system` backups: root-owned, reached only
+/// through sudo.
+pub(crate) fn system_backup_base_dir() -> PathBuf {
+    PathBuf::from("/var/lib/plasmoid-updater/backups")
+}
+
+fn backup_base_dir_for(component: &InstalledComponent, system_base: &Path) -> PathBuf {
+    if component.is_system {
+        system_base.to_path_buf()
+    } else {
+        user_backup_base_dir()
+    }
 }
 
 /// Generates a timestamp string for backup directories.
@@ -75,13 +124,133 @@ pub(crate) fn backup_component(
     component: &InstalledComponent,
     backups: &BackupLedger,
 ) -> Result<Option<PathBuf>, ComponentFailure> {
-    let backup = backup_component_in(&backup_base_dir(), component)?;
+    backup_component_at(
+        component,
+        &system_backup_base_dir(),
+        backups,
+        crate::paths::is_trusted_system_path,
+    )
+}
+
+/// Seam: `system_base` names the root system backups land under and `trusted`
+/// the run's system-path check, so a test can inject a tempdir root and a
+/// trust verdict the real check would never give it.
+fn backup_component_at(
+    component: &InstalledComponent,
+    system_base: &Path,
+    backups: &BackupLedger,
+    trusted: impl Fn(&Path) -> bool,
+) -> Result<Option<PathBuf>, ComponentFailure> {
+    let base = backup_base_dir_for(component, system_base);
+    if component.is_system {
+        ensure_system_backup_base(&base, trusted)?;
+    }
+    let backup = backup_component_in(&base, component)?;
     if let Some(backup) = &backup
         && let Some(timestamp_dir) = backup.parent().and_then(Path::parent)
     {
-        backups.record(timestamp_dir, component.component_type.backup_subdir());
+        backups.record(
+            timestamp_dir,
+            component.component_type.backup_subdir(),
+            component.is_system,
+        );
     }
     Ok(backup)
+}
+
+/// Creates the root-owned system backups base with its own mode, then checks
+/// the base this run is about to write into: a path that is not, or does not
+/// sit under, a root-owned directory only root can write is refused by name,
+/// so a swapped base can never receive a backup.
+fn ensure_system_backup_base(
+    base: &Path,
+    trusted: impl Fn(&Path) -> bool,
+) -> Result<(), ComponentFailure> {
+    // Every level that already exists is checked before root creates anything
+    // under it: search permission first, then trust. A base or ancestor the
+    // invoking user cannot search (a root-owned 0700/0750 an older run or an
+    // admin left) is refused by name with its fix, never created over and never
+    // left to fail the restore later; a swapped or symlinked ancestor is
+    // refused rather than followed.
+    if let Some(level) = unsearchable_level(base) {
+        return Err(unsearchable_failure(base, level));
+    }
+    if base.try_exists().unwrap_or(false) {
+        if trusted(base) {
+            return Ok(());
+        }
+        return Err(untrusted_base_failure(base));
+    }
+    // A missing base under an existing ancestor: the ancestor is checked before
+    // root's mkdir, so a symlinked or foreign ancestor is refused rather than
+    // followed.
+    if let Some(level) = base.ancestors().find(|level| level.exists())
+        && !trusted(level)
+    {
+        return Err(untrusted_base_failure(base));
+    }
+    privilege::create_dir_all_as_root(base, SYSTEM_BACKUP_DIR_MODE)?;
+    if trusted(base) {
+        return Ok(());
+    }
+    Err(untrusted_base_failure(base))
+}
+
+/// The shallowest existing directory on the chain up to `base` the invoking
+/// user cannot search, if any. A root-owned 0700/0750 level passes the trust check
+/// (which refuses group and other WRITE only) yet the invoking user still
+/// cannot search it, and the user-side restore probe would read a file backup
+/// as a directory. Walked shallowest first, so the first level found is the one
+/// `sudo chmod 755` must fix. A level the user owns and can search (a 0700 one
+/// they made themselves) is not refused: the search check answers for the
+/// invoking user, not only the mode bits.
+fn unsearchable_level(base: &Path) -> Option<&Path> {
+    use nix::unistd::AccessFlags;
+
+    let mut levels: Vec<&Path> = base
+        .ancestors()
+        .filter(|level| level.parent().is_some())
+        .collect();
+    levels.reverse();
+    levels.into_iter().find(|&level| {
+        nix::unistd::access(level, AccessFlags::X_OK) == Err(nix::errno::Errno::EACCES)
+    })
+}
+
+/// The refusal for a system backup path level the invoking user cannot search,
+/// naming the level and the fix to paste when the path is valid UTF-8.
+fn unsearchable_failure(base: &Path, level: &Path) -> ComponentFailure {
+    match level.to_str() {
+        Some(level) => ComponentFailure::new(
+            FailureKind::Install,
+            format!(
+                "refusing to write a system backup into {}: {level} is not searchable by this user: sudo chmod 755 {}",
+                base.display(),
+                shell_quote(level),
+            ),
+        ),
+        // A non-UTF-8 path cannot be shell-quoted losslessly, so the hint names
+        // the path instead of a pasteable command that would run against a
+        // different directory.
+        None => ComponentFailure::new(
+            FailureKind::Install,
+            format!(
+                "refusing to write a system backup into {}: {level:?} is not searchable by this user",
+                base.display(),
+            ),
+        ),
+    }
+}
+
+/// The refusal for a system backups base the trust check did not accept.
+fn untrusted_base_failure(base: &Path) -> ComponentFailure {
+    ComponentFailure::new(
+        FailureKind::Install,
+        format!(
+            "refusing to write a system backup into {}: it, or a directory above it, is a symlink, not owned by root, or writable by group or others",
+            base.display()
+        ),
+    )
 }
 
 fn backup_component_in(
@@ -110,6 +279,7 @@ fn backup_component_in(
         }
     }
 
+    let system = component.is_system;
     let timestamp = timestamp();
     let type_dir = component.component_type.backup_subdir();
     let timestamp_dir = base.join(&timestamp);
@@ -117,14 +287,13 @@ fn backup_component_in(
     // handle single files (e.g., color schemes, static wallpapers)
     if component.path.is_file() {
         let backup_dir = timestamp_dir.join(type_dir);
-        fs::create_dir_all(&backup_dir)
-            .map_err(|e| ComponentFailure::io(FailureKind::Install, &backup_dir, e))?;
+        create_backup_dir(&backup_dir, system)?;
 
         let backup_path = backup_dir.join(&component.directory_name);
-        if let Err(e) = fs::copy(&component.path, &backup_path) {
+        if let Err(e) = copy_backup_file(&component.path, &backup_path, system) {
             // A failed copy may leave a partial file; a removal that fails
             // leaves a file a restore could pick up, so it cannot be dropped.
-            match fs::remove_file(&backup_path) {
+            match remove_backup_file(&backup_path, system) {
                 Ok(()) => {}
                 Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(remove_error) => log::warn!(
@@ -133,12 +302,8 @@ fn backup_component_in(
                     backup_path.display()
                 ),
             }
-            remove_empty_backup_dirs(&backup_path);
-            return Err(ComponentFailure::io(
-                FailureKind::Install,
-                &component.path,
-                e,
-            ));
+            remove_empty_backup_dirs(&backup_path, system);
+            return Err(e);
         }
 
         return Ok(Some(backup_path));
@@ -146,35 +311,162 @@ fn backup_component_in(
 
     let backup_path = timestamp_dir.join(type_dir).join(&component.directory_name);
 
-    fs::create_dir_all(&backup_path)
-        .map_err(|e| ComponentFailure::io(FailureKind::Install, &backup_path, e))?;
+    create_backup_dir(&backup_path, system)?;
 
-    if let Err(e) = copy_dir_recursive(&component.path, &backup_path) {
-        remove_partial_backup(&backup_path);
+    if let Err(e) = copy_backup_dir(&component.path, &backup_path, system) {
+        remove_partial_backup(&backup_path, system);
         return Err(e);
     }
 
     Ok(Some(backup_path))
 }
 
+/// Creates a backup directory. A refusal on a user-mode directory names the
+/// chown fix; a `--system` directory is created through sudo.
+fn create_backup_dir(path: &Path, system: bool) -> Result<(), ComponentFailure> {
+    if system {
+        privilege::create_dir_all_as_root(path, SYSTEM_BACKUP_DIR_MODE)
+    } else {
+        std::fs::create_dir_all(path).map_err(|e| backup_io_failure(path, e))
+    }
+}
+
+/// The failure a user-mode backup step reports. Only a permission refusal of
+/// the backups directory names the chown fix; every other failure (a full
+/// disk, a bad path) keeps the operating system's own message.
+fn backup_io_failure(path: &Path, source: std::io::Error) -> ComponentFailure {
+    if source.kind() == std::io::ErrorKind::PermissionDenied {
+        not_writable_failure(path, Some(&source))
+    } else {
+        ComponentFailure::io(FailureKind::Install, path, source)
+    }
+}
+
+fn copy_backup_file(src: &Path, dst: &Path, system: bool) -> Result<(), ComponentFailure> {
+    if system {
+        privilege::copy_file_as_root(src, dst)
+    } else {
+        std::fs::copy(src, dst).map_err(|e| match dst.parent() {
+            // A same-second retry writes into a directory an earlier run left
+            // root-owned: the directory names the fix, the bare OS error would
+            // not distinguish it from an unreadable component.
+            Some(dir)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    && !super::lock::writable_by_current_ids(dir) =>
+            {
+                not_writable_failure(dir, Some(&e))
+            }
+            _ => ComponentFailure::io(FailureKind::Install, src, e),
+        })?;
+        Ok(())
+    }
+}
+
+fn copy_backup_dir(src: &Path, dst: &Path, system: bool) -> Result<(), ComponentFailure> {
+    if system {
+        privilege::copy_dir_as_root(src, dst)
+    } else {
+        copy_dir_recursive(src, dst).map_err(|failure| {
+            // The hint fires only on a permission refusal of the destination
+            // directory, and keeps the operating system's error, the way the
+            // single-file copy does. A disk-full or unreadable source refusal
+            // keeps its own message.
+            match &failure.source {
+                Some(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        && !super::lock::writable_by_current_ids(dst) =>
+                {
+                    not_writable_failure(dst, failure.source.as_ref())
+                }
+                _ => failure,
+            }
+        })
+    }
+}
+
+/// The chown fix a user-mode backup step reports when the backups directory
+/// itself refused the write, with the operating system's own error when one
+/// names a different cause.
+fn not_writable_failure(dir: &Path, source: Option<&std::io::Error>) -> ComponentFailure {
+    let cache_dir = crate::paths::cache_home().join("plasmoid-updater");
+    ComponentFailure::new(FailureKind::Install, chown_hint(dir, source, &cache_dir))
+}
+
+/// The full chown-hint message: the directory that refused the write, the
+/// operating system's own error when one names a different cause, and the
+/// command to paste, whose path is shell-quoted.
+fn chown_hint(dir: &Path, source: Option<&std::io::Error>, cache_dir: &Path) -> String {
+    let reason = source.map_or_else(String::new, |e| format!(": {e}"));
+    match cache_dir.to_str() {
+        Some(cache) => format!(
+            "{}{reason}; {} is not writable by this user: sudo chown -R \"$USER\": {}",
+            dir.display(),
+            cache_dir.display(),
+            shell_quote(cache),
+        ),
+        // A non-UTF-8 path cannot be shell-quoted losslessly, so the hint names
+        // the path instead of a pasteable command that would run against a
+        // different directory.
+        None => format!(
+            "{}{reason}; {:?} is not writable by this user",
+            dir.display(),
+            cache_dir,
+        ),
+    }
+}
+
+/// Single-quotes `path` for the shell command the hint asks the user to paste:
+/// a `'` becomes `'\''`, so a path holding a space or a quote survives.
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+fn remove_backup_file(path: &Path, system: bool) -> std::io::Result<()> {
+    if system {
+        privilege::remove_file_as_root(path)
+            .map_err(|failure| std::io::Error::other(failure.message))
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
 /// Removes a backup left half-written by a failed copy, so a later restore
 /// cannot pick it up as a whole tree.
-fn remove_partial_backup(backup_path: &Path) {
-    if let Err(e) = fs::remove_dir_all(backup_path) {
-        log::warn!(target: "backup", "failed to remove partial backup {}: {e}", backup_path.display());
+fn remove_partial_backup(backup_path: &Path, system: bool) {
+    let removal = if system {
+        privilege::remove_dir_all_as_root(backup_path)
+    } else {
+        std::fs::remove_dir_all(backup_path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, backup_path, e))
+    };
+    if let Err(e) = removal {
+        log::warn!(
+            target: "backup",
+            "failed to remove partial backup {}: {}",
+            backup_path.display(),
+            e.message
+        );
         return;
     }
-    remove_empty_backup_dirs(backup_path);
+    remove_empty_backup_dirs(backup_path, system);
 }
 
 /// Removes the timestamp and type directories a failed backup left empty, so no
 /// empty directory counts as a backup of the component's type.
-fn remove_empty_backup_dirs(backup_path: &Path) {
+fn remove_empty_backup_dirs(backup_path: &Path, system: bool) {
     if let Some(type_dir) = backup_path.parent() {
-        let _ = fs::remove_dir(type_dir);
+        let _ = remove_dir_or_sudo(type_dir, system);
         if let Some(timestamp_dir) = type_dir.parent() {
-            let _ = fs::remove_dir(timestamp_dir);
+            let _ = remove_dir_or_sudo(timestamp_dir, system);
         }
+    }
+}
+
+fn remove_dir_or_sudo(path: &Path, system: bool) -> Result<(), ComponentFailure> {
+    if system {
+        privilege::remove_dir_as_root(path)
+    } else {
+        std::fs::remove_dir(path).map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))
     }
 }
 
@@ -292,6 +584,56 @@ fn oldest_first(backups: &mut [(chrono::NaiveDateTime, PathBuf)]) {
     backups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 }
 
+/// The timestamp directories under a user backups base that hold a backup of
+/// `type_subdir`.
+fn user_backup_dirs(base: &Path, type_subdir: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(base) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join(type_subdir).is_dir())
+        .collect()
+}
+
+/// The timestamp directories under a system backups base that hold a backup
+/// of `type_subdir`, listed as root: the base is root-owned, and a `0700` one
+/// is not listable by the user the run acts as.
+fn system_backup_dirs(base: &Path, type_subdir: &str) -> Vec<PathBuf> {
+    if privilege::is_root() {
+        return user_backup_dirs(base, type_subdir);
+    }
+    let listed = privilege::run_sudo_reading_os(&[
+        OsStr::new("find"),
+        base.as_os_str(),
+        OsStr::new("-mindepth"),
+        OsStr::new("2"),
+        OsStr::new("-maxdepth"),
+        OsStr::new("2"),
+        OsStr::new("-type"),
+        OsStr::new("d"),
+        OsStr::new("-name"),
+        OsStr::new(type_subdir),
+        OsStr::new("-print"),
+    ]);
+    match listed {
+        Ok(output) => output
+            .lines()
+            .filter_map(|line| Path::new(line).parent().map(Path::to_path_buf))
+            .collect(),
+        Err(e) => {
+            log::warn!(
+                target: "backup",
+                "could not list the system backups under {}: {}",
+                base.display(),
+                e.message
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Removes old backup directories, keeping the most recent `max_keep` and
 /// never one of `skip`, the directories the current run created.
 ///
@@ -300,15 +642,21 @@ fn oldest_first(backups: &mut [(chrono::NaiveDateTime, PathBuf)]) {
 /// nor removed in a real backup's place. The encoded timestamp orders the
 /// backups, since a cache restored from a tarball or written on another clock
 /// carries mtimes that say nothing about when the backups were taken.
-fn cleanup_old_backups_in(base: &Path, type_subdir: &str, max_keep: usize, skip: &[PathBuf]) {
-    let Ok(entries) = fs::read_dir(base) else {
-        return;
+fn cleanup_old_backups_in(
+    base: &Path,
+    type_subdir: &str,
+    max_keep: usize,
+    skip: &[PathBuf],
+    system: bool,
+) {
+    let candidates = if system {
+        system_backup_dirs(base, type_subdir)
+    } else {
+        user_backup_dirs(base, type_subdir)
     };
 
-    let mut backups: Vec<(chrono::NaiveDateTime, PathBuf)> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path.join(type_subdir).is_dir())
+    let mut backups: Vec<(chrono::NaiveDateTime, PathBuf)> = candidates
+        .into_iter()
         .filter_map(|path| {
             let name = path.file_name()?.to_str()?;
             let created =
@@ -334,19 +682,33 @@ fn cleanup_old_backups_in(base: &Path, type_subdir: &str, max_keep: usize, skip:
         if skip.contains(&path) {
             continue;
         }
-        remove_backup(&path, type_subdir);
+        remove_backup(&path, type_subdir, system);
         to_remove -= 1;
     }
 }
 
-fn remove_backup(path: &Path, type_subdir: &str) {
+fn remove_backup(path: &Path, type_subdir: &str, system: bool) {
     let type_path = path.join(type_subdir);
-    if let Err(e) = fs::remove_dir_all(&type_path) {
-        log::warn!(target: "backup", "failed to remove old backup {}: {e}", type_path.display());
+    let removal = if system {
+        privilege::remove_dir_all_as_root(&type_path)
+    } else {
+        std::fs::remove_dir_all(&type_path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, &type_path, e))
+    };
+    if let Err(e) = removal {
+        log::warn!(
+            target: "backup",
+            "failed to remove old backup {}: {}",
+            type_path.display(),
+            e.message
+        );
     }
-    // Remove the timestamp dir too if it's now empty
-    if path.read_dir().map_or(true, |mut d| d.next().is_none()) {
-        let _ = fs::remove_dir(path);
+    // Remove the timestamp dir too if it's now empty. Through sudo, `rmdir`
+    // itself refuses a directory another type's backup still fills.
+    if system {
+        let _ = remove_dir_or_sudo(path, true);
+    } else if path.read_dir().map_or(true, |mut d| d.next().is_none()) {
+        let _ = remove_dir_or_sudo(path, false);
     }
 }
 
@@ -378,7 +740,7 @@ mod tests {
         assert_eq!(count_before, 7);
 
         // Run cleanup keeping 5
-        cleanup_old_backups_in(base.path(), subdir, 5, &[]);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
 
         // Verify only 5 remain
         let count_after = std::fs::read_dir(base.path())
@@ -480,7 +842,7 @@ mod tests {
             std::fs::create_dir_all(&type_dir).unwrap();
         }
 
-        cleanup_old_backups_in(base.path(), subdir, 5, &[]);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
 
         // All 3 should still exist
         let count = std::fs::read_dir(base.path())
@@ -575,16 +937,20 @@ mod tests {
             make_backup(base.path(), &format!("2024-01-0{day}T00-00-00"), subdir);
         }
         // Three of the six belong to this run, all named oldest.
-        let created: Vec<(PathBuf, &'static str)> = [
+        let created: Vec<BackupRecord> = [
             "2024-01-01T00-00-00",
             "2024-01-02T00-00-00",
             "2024-01-03T00-00-00",
         ]
         .iter()
-        .map(|name| (base.path().join(*name), subdir))
+        .map(|name| BackupRecord {
+            timestamp_dir: base.path().join(*name),
+            type_subdir: subdir,
+            system: false,
+        })
         .collect();
 
-        prune_backups_in(base.path(), &created, 5);
+        prune_backups_in(base.path(), &created, false, 5);
 
         for day in 1..=3 {
             assert!(
@@ -624,7 +990,13 @@ mod tests {
         let current_type = current.join(subdir);
         fs::create_dir_all(&current_type).unwrap();
 
-        cleanup_old_backups_in(base.path(), subdir, 5, std::slice::from_ref(&current));
+        cleanup_old_backups_in(
+            base.path(),
+            subdir,
+            5,
+            std::slice::from_ref(&current),
+            false,
+        );
 
         assert!(current_type.is_dir(), "the run's own backup was pruned");
         assert!(
@@ -652,7 +1024,7 @@ mod tests {
         }
         make_backup(base.path(), "not-a-date", subdir);
 
-        cleanup_old_backups_in(base.path(), subdir, 5, &[]);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
 
         for day in 1..=5 {
             assert!(
@@ -681,7 +1053,7 @@ mod tests {
             .unwrap();
         assert!(touched.success());
 
-        cleanup_old_backups_in(base.path(), subdir, 1, &[]);
+        cleanup_old_backups_in(base.path(), subdir, 1, &[], false);
 
         assert!(
             base.path()
@@ -915,7 +1287,7 @@ mod tests {
             .unwrap();
         assert!(touched.success());
 
-        cleanup_old_backups_in(base.path(), subdir, 5, &[]);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
 
         let named = std::fs::read_dir(base.path())
             .unwrap()
@@ -1014,6 +1386,906 @@ mod tests {
             logged.is_some(),
             "a failed removal of the partial backup file was dropped: {:?}",
             captured_logs()
+        );
+    }
+
+    /// A same-second retry lands its copy in a type directory an older run left
+    /// root-owned. That refusal names the chown fix, not only the OS error.
+    #[test]
+    fn a_backup_into_an_unwritable_type_dir_fails_naming_the_chown_fix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::installer::privilege::is_root() {
+            return; // root writes into a 0o555 directory
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("backups");
+        let file = dir.path().join("org.test.widget.colors");
+        fs::write(&file, b"[Colors:Window]\n").unwrap();
+        let component = component_at(file);
+        let subdir = component.component_type.backup_subdir();
+
+        // The backup path is timestamped inside the call, so the fixture takes
+        // the type directory of the second the call lands in. A clock tick
+        // between the two makes the call create a writable one and succeed:
+        // retry, then fail loudly if no attempt reached the refusal.
+        let mut refusal = None;
+        for _ in 0..5 {
+            let type_dir = base.join(timestamp()).join(subdir);
+            fs::create_dir_all(&type_dir).unwrap();
+            fs::set_permissions(&type_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+            let failed = backup_component_in(&base, &component);
+
+            // The failed backup removes the type directory it left empty.
+            let _ = fs::set_permissions(&type_dir, fs::Permissions::from_mode(0o755));
+            if let Err(failed) = failed {
+                refusal = Some(failed);
+                break;
+            }
+        }
+
+        let refusal = refusal.expect("a backup into a directory this user cannot write succeeded");
+        assert!(
+            refusal.message.contains("sudo chown -R"),
+            "the refusal names no fix: {}",
+            refusal.message
+        );
+        let cache_dir = crate::paths::cache_home().join("plasmoid-updater");
+        assert!(
+            refusal.message.contains(&cache_dir.display().to_string()),
+            "the hint names no path under the cache dir: {}",
+            refusal.message
+        );
+    }
+
+    const SYSTEM_BACKUP_CHILD: &str = "PLASMOID_UPDATER_SYSTEM_BACKUP_CHILD";
+    const SYSTEM_BACKUP_ROOT: &str = "PLASMOID_UPDATER_SYSTEM_BACKUP_ROOT";
+
+    /// A `--system` backup lands under the injected system backups root, never
+    /// under the user's cache, and every write runs through sudo.
+    #[test]
+    fn a_system_backup_lands_under_the_system_base() {
+        if crate::installer::privilege::is_root() {
+            return; // root takes the plain filesystem branches
+        }
+
+        if std::env::var_os(SYSTEM_BACKUP_CHILD).is_some() {
+            let root = std::path::PathBuf::from(std::env::var(SYSTEM_BACKUP_ROOT).unwrap());
+            let system_base = root.join("system-backups");
+            let component_path = root.join("color-schemes/Fake.colors");
+            std::fs::create_dir_all(component_path.parent().unwrap()).unwrap();
+            std::fs::write(&component_path, "[Colors:Window]\n").unwrap();
+            let component = InstalledComponent {
+                name: "Fake".to_string(),
+                directory_name: "Fake.colors".to_string(),
+                version: "1.0".to_string(),
+                component_type: ComponentType::ColorScheme,
+                path: component_path,
+                is_system: true,
+                release_date: String::new(),
+            };
+            let ledger = BackupLedger::default();
+
+            let backup = backup_component_at(&component, &system_base, &ledger, |_| true)
+                .unwrap()
+                .unwrap();
+
+            assert!(
+                backup.starts_with(&system_base),
+                "the system backup landed outside the system base: {}",
+                backup.display()
+            );
+            let cache_backups = crate::paths::cache_home().join("plasmoid-updater/backups");
+            assert!(
+                !cache_backups.exists(),
+                "a system backup reached the user cache: {}",
+                cache_backups.display()
+            );
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sudo = bin.join("sudo");
+        std::fs::write(
+            &sudo,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sudo_log = root.join("sudo.log");
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "installer::backup::tests::a_system_backup_lands_under_the_system_base",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("HOME", root.join("home"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("TMPDIR", root.join("tmp"))
+            .env(SYSTEM_BACKUP_CHILD, "1")
+            .env(SYSTEM_BACKUP_ROOT, &root)
+            .env("PU_TEST_SUDO_LOG", &sudo_log)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success() && root.join("done").exists(),
+            "child failed ({}; body completed: {})\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            root.join("done").exists(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let log = std::fs::read_to_string(&sudo_log).unwrap();
+        assert!(
+            log.lines().any(|line| line.starts_with("mkdir")),
+            "the system backup was not created through sudo: {log}"
+        );
+        assert!(
+            log.lines().any(|line| line.starts_with("cp")),
+            "the system backup was not written through sudo: {log}"
+        );
+    }
+
+    fn system_scheme(dir: &Path, name: &str) -> InstalledComponent {
+        InstalledComponent {
+            name: name.to_string(),
+            directory_name: format!("{name}.colors"),
+            version: "1.0".to_string(),
+            component_type: ComponentType::ColorScheme,
+            path: dir.join(format!("{name}.colors")),
+            is_system: true,
+            release_date: String::new(),
+        }
+    }
+
+    struct SudoChild {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        output: std::process::Output,
+        log: String,
+    }
+
+    /// The fixture root when this process is `test`'s child run.
+    fn backup_child_root(test: &str) -> Option<PathBuf> {
+        let child = std::env::var("PU_BACKUP_CHILD_TEST").ok()?;
+        (child == test).then(|| PathBuf::from(std::env::var("PU_BACKUP_ROOT").unwrap()))
+    }
+
+    /// Fails unless `sudo` on `PATH` is the fixture's, never the real one.
+    fn assert_fake_sudo(root: &Path) {
+        let resolved = std::process::Command::new("sh")
+            .args(["-c", "command -v sudo"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&resolved.stdout).trim(),
+            root.join("bin/sudo").to_string_lossy(),
+            "a real sudo would run against a system path"
+        );
+    }
+
+    /// Re-runs `test` in a child process with a logging fake `sudo` first on
+    /// `PATH` that runs the command it is handed, and a fresh fixture root in
+    /// `PU_BACKUP_ROOT`.
+    fn run_backup_child(test: &str) -> SudoChild {
+        run_backup_child_with(test, "exec \"$@\"\n")
+    }
+
+    /// Re-runs `test` with a fake `sudo` that logs and exits 1, never running
+    /// the command: the production test names `/var/lib/...`, and a fake sudo
+    /// that executes would really write there as the test user.
+    fn run_backup_child_refusing(test: &str) -> SudoChild {
+        run_backup_child_with(test, "exit 1\n")
+    }
+
+    fn run_backup_child_with(test: &str, tail: &str) -> SudoChild {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sudo = bin.join("sudo");
+        std::fs::write(
+            &sudo,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\n{tail}"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log_path = root.join("sudo.log");
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(format!("installer::backup::tests::{test}"))
+            .args(["--exact", "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("HOME", root.join("home"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("TMPDIR", root.join("tmp"))
+            .env("PU_TEST_SUDO_LOG", &log_path)
+            .env("PU_BACKUP_CHILD_TEST", test)
+            .env("PU_BACKUP_ROOT", &root)
+            .output()
+            .unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        SudoChild {
+            _dir: dir,
+            root,
+            output,
+            log,
+        }
+    }
+
+    #[test]
+    fn a_system_component_backs_up_under_the_root_owned_system_base() {
+        let mut system = widget_at(
+            PathBuf::from("/usr/share/plasma/plasmoids/org.test.system"),
+            "org.test.system",
+        );
+        system.is_system = true;
+        let user = widget_at(
+            PathBuf::from("/home/user/.local/share/plasma/plasmoids/org.test.user"),
+            "org.test.user",
+        );
+
+        assert_eq!(
+            backup_base_dir_for(&system, &system_backup_base_dir()),
+            PathBuf::from("/var/lib/plasmoid-updater/backups"),
+            "a system backup no longer lands under the root-owned base"
+        );
+        assert_eq!(
+            backup_base_dir_for(&user, &system_backup_base_dir()),
+            crate::paths::cache_home().join("plasmoid-updater/backups"),
+            "a user backup left the user cache"
+        );
+    }
+
+    /// The production system base is the root-owned
+    /// `/var/lib/plasmoid-updater/backups` root: a system backup through the
+    /// seam with that base and an injected trust verdict makes the fake sudo
+    /// log a `mkdir` for it.
+    #[test]
+    fn a_system_backup_goes_through_the_root_owned_system_base() {
+        const TEST: &str = "a_system_backup_goes_through_the_root_owned_system_base";
+        if crate::installer::privilege::is_root() {
+            return;
+        }
+
+        if let Some(root) = backup_child_root(TEST) {
+            assert_fake_sudo(&root);
+            let scheme_dir = root.join("color-schemes");
+            std::fs::create_dir_all(&scheme_dir).unwrap();
+            let component = system_scheme(&scheme_dir, "Fake");
+            std::fs::write(&component.path, "[Colors:Window]\n").unwrap();
+            let ledger = BackupLedger::default();
+
+            // The trust verdict is injected instead of read from the host. The
+            // fake sudo refuses to run, so the production base is only ever
+            // logged, never created.
+            let _ = backup_component_at(&component, &system_backup_base_dir(), &ledger, |_| true);
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let child = run_backup_child_refusing(TEST);
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert!(
+            child
+                .log
+                .lines()
+                .any(|line| line.contains("/var/lib/plasmoid-updater/backups")),
+            "the production base was not used: {}",
+            child.log
+        );
+    }
+
+    /// Every system widget is a directory: its whole tree lands under the
+    /// injected system base, copied through sudo, never under the user cache.
+    #[test]
+    fn a_system_backup_of_a_directory_component_copies_the_tree_through_sudo() {
+        const TEST: &str = "a_system_backup_of_a_directory_component_copies_the_tree_through_sudo";
+        if crate::installer::privilege::is_root() {
+            return;
+        }
+
+        if let Some(root) = backup_child_root(TEST) {
+            assert_fake_sudo(&root);
+            let component_path = root.join("widgets/FakeWidget");
+            std::fs::create_dir_all(&component_path).unwrap();
+            std::fs::write(component_path.join("metadata.json"), b"{}").unwrap();
+            let component = InstalledComponent {
+                name: "Fake Widget".to_string(),
+                directory_name: "FakeWidget".to_string(),
+                version: "1.0".to_string(),
+                component_type: ComponentType::PlasmaWidget,
+                path: component_path,
+                is_system: true,
+                release_date: String::new(),
+            };
+            let system_base = root.join("system-backups");
+            let ledger = BackupLedger::default();
+
+            let backup = backup_component_at(&component, &system_base, &ledger, |_| true)
+                .unwrap()
+                .unwrap();
+
+            assert!(backup.starts_with(&system_base), "{}", backup.display());
+            assert!(
+                backup.join("metadata.json").is_file(),
+                "the backup is not the component's own tree: {}",
+                backup.display()
+            );
+            let cache_backups = crate::paths::cache_home().join("plasmoid-updater/backups");
+            assert!(
+                !cache_backups.exists(),
+                "a system backup reached the user cache: {}",
+                cache_backups.display()
+            );
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let child = run_backup_child(TEST);
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert!(
+            child.log.lines().any(|line| line.starts_with("mkdir")),
+            "the directory backup was not created through sudo: {}",
+            child.log
+        );
+        assert!(
+            child.log.lines().any(|line| line.starts_with("cp -rfT")),
+            "the directory backup was not copied through sudo: {}",
+            child.log
+        );
+    }
+
+    /// A system copy that fails removes its half-written tree through sudo and
+    /// leaves no empty backup directory behind.
+    #[test]
+    fn a_failed_system_copy_removes_its_directories_through_sudo() {
+        const TEST: &str = "a_failed_system_copy_removes_its_directories_through_sudo";
+        if crate::installer::privilege::is_root() {
+            return;
+        }
+
+        if let Some(root) = backup_child_root(TEST) {
+            assert_fake_sudo(&root);
+            let scheme_dir = root.join("color-schemes");
+            std::fs::create_dir_all(&scheme_dir).unwrap();
+            let component = system_scheme(&scheme_dir, "Fake");
+            std::fs::write(&component.path, "[Colors:Window]\n").unwrap();
+            std::fs::set_permissions(&component.path, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let system_base = root.join("system-backups");
+            let ledger = BackupLedger::default();
+
+            let failed = backup_component_at(&component, &system_base, &ledger, |_| true);
+            let _ =
+                std::fs::set_permissions(&component.path, std::fs::Permissions::from_mode(0o644));
+            assert!(
+                failed.is_err(),
+                "a copy that could not read its source succeeded"
+            );
+
+            let leftovers: Vec<PathBuf> = std::fs::read_dir(&system_base)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "an empty backup directory survived: {leftovers:?}"
+            );
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let child = run_backup_child(TEST);
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert!(
+            child.log.lines().any(|line| line.starts_with("rm -f")),
+            "the partial backup was not removed through sudo: {}",
+            child.log
+        );
+        assert!(
+            child.log.lines().any(|line| line.starts_with("rmdir")),
+            "the empty backup directories were not removed through sudo: {}",
+            child.log
+        );
+    }
+
+    /// Retention on a system base lists and removes through sudo, so it runs
+    /// even when the root-owned base is not listable by this user.
+    #[test]
+    fn a_system_prune_lists_and_removes_through_sudo() {
+        const TEST: &str = "a_system_prune_lists_and_removes_through_sudo";
+        if crate::installer::privilege::is_root() {
+            return;
+        }
+
+        if let Some(root) = backup_child_root(TEST) {
+            assert_fake_sudo(&root);
+            let base = root.join("system-backups");
+            let subdir = ComponentType::PlasmaWidget.backup_subdir();
+            for day in 1..=6 {
+                std::fs::create_dir_all(base.join(format!("2024-01-0{day}T00-00-00")).join(subdir))
+                    .unwrap();
+            }
+            let ledger = BackupLedger::default();
+            // The newest is this run's own and must survive.
+            ledger.record(&base.join("2024-01-06T00-00-00"), subdir, true);
+
+            prune_backups(&ledger);
+
+            assert!(
+                !base.join("2024-01-01T00-00-00").join(subdir).exists(),
+                "the oldest system backup must go"
+            );
+            for day in 2..=6 {
+                assert!(
+                    base.join(format!("2024-01-0{day}T00-00-00"))
+                        .join(subdir)
+                        .is_dir(),
+                    "backup {day} was pruned"
+                );
+            }
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let child = run_backup_child(TEST);
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert!(
+            child.log.lines().any(|line| line.starts_with("find ")),
+            "the system backups were not listed through sudo: {}",
+            child.log
+        );
+        assert!(
+            child.log.lines().any(|line| line.starts_with("rm -rf")),
+            "the pruned system backup was not removed through sudo: {}",
+            child.log
+        );
+    }
+
+    /// The system base is created with its own mode, and a base the trust
+    /// check refuses is never written into.
+    #[test]
+    fn a_system_backup_base_is_created_root_private_and_refused_when_untrusted() {
+        const TEST: &str =
+            "a_system_backup_base_is_created_root_private_and_refused_when_untrusted";
+        if crate::installer::privilege::is_root() {
+            return;
+        }
+
+        if let Some(root) = backup_child_root(TEST) {
+            assert_fake_sudo(&root);
+            let scheme_dir = root.join("color-schemes");
+            std::fs::create_dir_all(&scheme_dir).unwrap();
+            let component = system_scheme(&scheme_dir, "Fake");
+            std::fs::write(&component.path, "[Colors:Window]\n").unwrap();
+            let system_base = root.join("system-backups");
+            let ledger = BackupLedger::default();
+
+            let refusal = backup_component_at(&component, &system_base, &ledger, |path| {
+                path != system_base
+            })
+            .expect_err("a base the trust check refuses received a backup");
+            assert_eq!(
+                refusal.message,
+                format!(
+                    "refusing to write a system backup into {}: it, or a directory above it, is a symlink, not owned by root, or writable by group or others",
+                    system_base.display()
+                ),
+            );
+            let written: Vec<PathBuf> = std::fs::read_dir(&system_base)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect();
+            assert!(
+                written.is_empty(),
+                "a refused base was written into: {written:?}"
+            );
+            let mode = std::fs::metadata(&system_base)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o755, "the base took the process umask for its mode");
+
+            let backup = backup_component_at(&component, &system_base, &ledger, |_| true)
+                .unwrap()
+                .unwrap();
+            assert!(backup.starts_with(&system_base), "{}", backup.display());
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let child = run_backup_child(TEST);
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert!(
+            child
+                .log
+                .lines()
+                .any(|line| line.starts_with("mkdir") && line.contains("-m 755")),
+            "the base was not created with its own mode: {}",
+            child.log
+        );
+    }
+
+    /// The pasted command shell-quotes its path, and every clause of the hint
+    /// (the refusing directory, the OS error, the cache dir, the fix) is pinned
+    /// by equality.
+    #[test]
+    fn the_chown_hint_shell_quotes_a_path_with_a_space_and_a_quote() {
+        let dir = Path::new("/cache/plasmoid-updater/backups/2024-01-01T00-00-00/color-schemes");
+        let cache_dir = Path::new("/home/a b'c/.cache/plasmoid-updater");
+
+        let message = chown_hint(dir, Some(&std::io::Error::from_raw_os_error(13)), cache_dir);
+
+        assert_eq!(
+            message,
+            format!(
+                "{}: Permission denied (os error 13); {} is not writable by this user: sudo chown -R \"$USER\": '/home/a b'\\''c/.cache/plasmoid-updater'",
+                dir.display(),
+                cache_dir.display(),
+            )
+        );
+    }
+
+    /// A permission refusal copying a directory names the chown fix and keeps
+    /// the operating system's error, the way the single-file copy does.
+    #[test]
+    fn a_permission_failure_copying_a_directory_names_the_chown_fix_and_keeps_the_os_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::installer::privilege::is_root() {
+            return; // root writes into a 0o555 directory
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("file.txt"), b"x").unwrap();
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let failure = copy_backup_dir(&src, &dst, false).unwrap_err();
+
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            failure.message.contains("sudo chown -R"),
+            "the chown fix is missing: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("Permission denied"),
+            "the OS error was dropped: {}",
+            failure.message
+        );
+    }
+
+    /// A non-permission failure copying a directory keeps its own message:
+    /// the hint keys on the error's kind, never on the destination's mode
+    /// bits, so a disk-full or wrong-shape source is never read as "not
+    /// writable by this user".
+    #[test]
+    fn a_non_permission_failure_copying_a_directory_keeps_its_own_message() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::installer::privilege::is_root() {
+            return; // root writes into a 0o555 directory
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"not a directory").unwrap();
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let failure = copy_backup_dir(&src, &dst, false).unwrap_err();
+
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !failure.message.contains("sudo chown -R"),
+            "the hint fired on a non-permission failure: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("source is not a directory"),
+            "the failure's own message was replaced: {}",
+            failure.message
+        );
+    }
+
+    /// A file backup under a base the invoking user cannot search (a root-owned
+    /// 0700 one, stood in for by a mode with no execute bit) is refused at
+    /// backup time, naming the level and its fix, before the restore can
+    /// misroute the file to the directory branch and fail with `RestoreFailed`.
+    #[test]
+    fn a_file_backup_under_an_unsearchable_base_is_refused_before_the_restore_misroutes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::installer::privilege::is_root() {
+            return; // root searches a directory whatever its mode
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let system_base = dir.path().join("backups");
+        std::fs::create_dir_all(&system_base).unwrap();
+        std::fs::set_permissions(&system_base, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let scheme_dir = dir.path().join("color-schemes");
+        std::fs::create_dir_all(&scheme_dir).unwrap();
+        let component = system_scheme(&scheme_dir, "Fake");
+        std::fs::write(&component.path, "[Colors:Window]\n").unwrap();
+        let ledger = BackupLedger::default();
+
+        let refusal = backup_component_at(&component, &system_base, &ledger, |_| true).unwrap_err();
+
+        std::fs::set_permissions(&system_base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            refusal.kind,
+            FailureKind::Install,
+            "the refusal must not read as a failed restore"
+        );
+        assert_eq!(
+            refusal.message,
+            format!(
+                "refusing to write a system backup into {}: {} is not searchable by this user: sudo chmod 755 '{}'",
+                system_base.display(),
+                system_base.display(),
+                system_base.display(),
+            ),
+        );
+        assert!(
+            std::fs::read_dir(&system_base).unwrap().next().is_none(),
+            "a refused base was written into"
+        );
+    }
+
+    /// The refusal for an unsearchable level names the level itself (an
+    /// existing base or an existing parent) and its fix, both shell-quoted.
+    #[test]
+    fn an_unsearchable_system_backup_base_or_parent_is_refused_naming_the_level() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::installer::privilege::is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        // An existing base without the other-execute bit.
+        let base = dir.path().join("backups");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refusal = ensure_system_backup_base(&base, |_| true).unwrap_err();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert_eq!(
+            refusal.message,
+            format!(
+                "refusing to write a system backup into {}: {} is not searchable by this user: sudo chmod 755 '{}'",
+                base.display(),
+                base.display(),
+                base.display(),
+            ),
+        );
+
+        // An existing parent without the other-execute bit.
+        let parent = dir.path().join("parent");
+        let base = parent.join("backups");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refusal = ensure_system_backup_base(&base, |_| true).unwrap_err();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert_eq!(
+            refusal.message,
+            format!(
+                "refusing to write a system backup into {}: {} is not searchable by this user: sudo chmod 755 '{}'",
+                base.display(),
+                parent.display(),
+                parent.display(),
+            ),
+        );
+    }
+
+    /// A missing base under a symlinked ancestor is refused before root's
+    /// `mkdir` can follow the link, so the backup never lands where it points.
+    #[test]
+    fn a_missing_base_under_a_symlinked_ancestor_is_refused_before_root_follows_it() {
+        if crate::installer::privilege::is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        let base = dir.path().join("link").join("backups");
+
+        let refusal = ensure_system_backup_base(&base, |path| !path.is_symlink()).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert_eq!(
+            refusal.message,
+            format!(
+                "refusing to write a system backup into {}: it, or a directory above it, is a symlink, not owned by root, or writable by group or others",
+                base.display()
+            ),
+        );
+        assert!(
+            !target.join("backups").exists(),
+            "root's mkdir followed the symlinked ancestor"
+        );
+    }
+
+    /// A non-UTF-8 cache path cannot be shell-quoted losslessly, so the chown
+    /// hint names it with `{:?}` and drops the pasteable command.
+    #[test]
+    fn a_non_utf8_cache_path_hint_names_the_path_without_a_pasteable_command() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = Path::new("/cache/plasmoid-updater/backups/2024-01-01T00-00-00/color-schemes");
+        let mut name = b"/home/".to_vec();
+        name.push(0xFF);
+        name.extend_from_slice(b"/.cache/plasmoid-updater");
+        let cache_dir = PathBuf::from(std::ffi::OsString::from_vec(name));
+
+        let source = std::io::Error::from_raw_os_error(13);
+        let message = chown_hint(dir, Some(&source), &cache_dir);
+
+        assert!(
+            !message.contains("sudo chown"),
+            "a non-UTF-8 path must not get a lossy pasteable command: {message}"
+        );
+        assert!(
+            message.contains(&format!("{cache_dir:?}")),
+            "the non-UTF-8 path must be named losslessly: {message}"
+        );
+        assert_eq!(
+            message,
+            format!(
+                "{}: {source}; {cache_dir:?} is not writable by this user",
+                dir.display(),
+            ),
+            "the non-UTF-8 hint must name every clause"
+        );
+    }
+
+    /// The `find` listing passes the base as an `OsStr`, so a non-UTF-8 base
+    /// reaches sudo byte-for-byte instead of as U+FFFD.
+    #[test]
+    fn a_system_backup_listing_passes_a_non_utf8_base_to_sudo() {
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::installer::privilege::is_root() {
+            return; // root lists directly, without sudo
+        }
+
+        if std::env::var_os("PU_TEST_FIND_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_FIND_ROOT").unwrap());
+            let fake = std::env::var("PU_TEST_FAKE_SUDO").unwrap();
+            let resolved = std::process::Command::new("sh")
+                .args(["-c", "command -v sudo"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&resolved.stdout).trim(),
+                fake,
+                "a real sudo would run against a system path"
+            );
+
+            let mut name = b"base-".to_vec();
+            name.push(0xFF);
+            let base = root.join(std::ffi::OsString::from_vec(name));
+            std::fs::create_dir_all(&base).unwrap();
+
+            let dirs = system_backup_dirs(&base, "plasma-plasmoids");
+
+            assert!(dirs.is_empty(), "{dirs:?}");
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let log = root.join("sudo.log");
+        let path = std::ffi::OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::backup::tests::a_system_backup_listing_passes_a_non_utf8_base_to_sudo",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_SUDO_LOG", &log)
+            .env("PU_TEST_FIND_CHILD", "1")
+            .env("PU_TEST_FIND_ROOT", &root)
+            .env("PU_TEST_FAKE_SUDO", &fake_sudo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let log = std::fs::read(&log).unwrap();
+        assert!(
+            log.contains(&0xFF),
+            "the find base lost the non-UTF-8 byte: {:?}",
+            String::from_utf8_lossy(&log)
         );
     }
 }
