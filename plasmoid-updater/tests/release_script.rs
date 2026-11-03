@@ -2431,7 +2431,7 @@ fn job_key(job: &[&str], key: &str) -> Option<String> {
 fn semver_pins(job: &[&str]) -> (Option<String>, Option<String>) {
     let toolchain = job
         .iter()
-        .position(|line| line.trim() == "- uses: dtolnay/rust-toolchain@stable")
+        .position(|line| line.trim().starts_with("- uses: dtolnay/rust-toolchain@"))
         .and_then(|start| {
             job[start + 1..]
                 .iter()

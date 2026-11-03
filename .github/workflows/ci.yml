@@ -58,9 +58,11 @@ jobs:
 
   # clippy → instrumented test → release build as sequential steps in ONE job:
   # clippy builds deps + lints, the instrumented run compiles into
-  # target/llvm-cov-target (cargo-llvm-cov's own target dir — the job pays a
-  # second full dep compile for it), and the release binary then reuses clippy's
-  # target/ and uploads as a 1-day artifact. Compile is release opt-level minus
+  # target/llvm-cov-target (cargo-llvm-cov's own target dir, inside the target/
+  # rust-cache saves, so its instrumented deps restore with the rest; measured
+  # 2026-11-03: an exact-hit run compiled only the workspace crates), and the
+  # release binary then reuses clippy's target/ and uploads as a 1-day
+  # artifact. Compile is release opt-level minus
   # LTO (env block drops the LTO tax for CI). mold self-gates on linux. Trade: a
   # clippy failure aborts before test/build, so fix clippy first. Workspace
   # crate: clippy/coverage/doctest/build all get --workspace so both members
@@ -90,7 +92,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets --all-features --release -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --release --locked -- -D warnings
       # Instrumented suite run: cargo-llvm-cov drives nextest and writes the lcov
       # report the coverage job below stores. `--no-fail-fast` so a red run
       # reports every failure instead of a prefix: nextest cancels at the first
@@ -101,7 +103,7 @@ jobs:
       # libtest arguments nextest uses to list tests). The step name is load-
       # bearing: the octocov config's testExecutionTime.steps matches it by name.
       - name: test (coverage)
-        run: cargo llvm-cov nextest --workspace --release --all-features --no-fail-fast --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --workspace --release --all-features --no-fail-fast --locked --lcov --output-path lcov.info
       # nextest can't run doctests, so cover them with cargo test. Self-gates on
       # a doctest target so a bin-only crate (no lib) skips instead of erroring
       # with "no library targets found".
@@ -109,12 +111,12 @@ jobs:
         shell: bash
         run: |
           if cargo metadata --no-deps --format-version 1 | grep -q '"doctest":true'; then
-            cargo test --workspace --release --doc --all-features
+            cargo test --workspace --release --doc --all-features --locked
           else
             echo "no doctest targets; skipping"
           fi
       - name: build release binary
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
       - name: upload binary
         uses: actions/upload-artifact@v7
         with:
