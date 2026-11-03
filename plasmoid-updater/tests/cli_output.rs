@@ -1445,13 +1445,7 @@ fn a_block_taller_than_the_screen_leaves_no_stale_frames_in_scrollback() {
         1000,
     );
     parser.process(&run.stderr);
-    let scrollback = parser.screen().scrollback_len();
-    parser.screen_mut().set_scrollback(scrollback);
-    let rows: Vec<String> = parser
-        .screen()
-        .rows(0, 100)
-        .map(|row| row.trim_end().to_string())
-        .collect();
+    let rows = whole_history(&mut parser, 100);
     let failed: Vec<&String> = rows
         .iter()
         .filter(|row| row.starts_with('\u{2717}'))
@@ -1467,4 +1461,56 @@ fn a_block_taller_than_the_screen_leaves_no_stale_frames_in_scrollback() {
             .any(|row| row.contains('\u{2588}') || row.contains('\u{2591}')),
         "a stale bar frame is left in the scrollback or the final screen: {rows:#?}"
     );
+}
+
+/// Every line `parser` holds, scrollback first, each trimmed at the end.
+fn whole_history(parser: &mut vt100::Parser, cols: u16) -> Vec<String> {
+    let total = parser.screen().scrollback_len();
+    let mut lines = Vec::new();
+    for offset in (1..=total).rev() {
+        parser.screen_mut().set_scrollback(offset);
+        if let Some(top) = parser.screen().rows(0, cols).next() {
+            lines.push(top.trim_end().to_string());
+        }
+    }
+    parser.screen_mut().set_scrollback(0);
+    lines.extend(
+        parser
+            .screen()
+            .rows(0, cols)
+            .map(|row| row.trim_end().to_string()),
+    );
+    lines
+}
+
+/// A user run reads no system data directory, so an `XDG_DATA_DIRS` entry that
+/// fails the trust check (a per-user export directory, the GitHub runner's
+/// `/usr/share`) draws no trust warning on `check` or `update`.
+#[test]
+fn a_user_run_draws_no_warning_from_an_untrusted_xdg_data_dir() {
+    // As root the sandbox directory is root-owned and passes the trust check,
+    // so no warning is due whatever the code does.
+    if nix::unistd::Uid::effective().is_root() {
+        return;
+    }
+    for (args, code) in [(CHECK, 100), (UPDATE, 0)] {
+        let sandbox = Sandbox::new();
+        sandbox.install_old_scheme();
+        // A colour scheme is registry-only; a widget directory makes the scan
+        // load that type's registry map too, a third path to the trust check.
+        std::fs::create_dir_all(sandbox.data_home().join("plasma/plasmoids")).unwrap();
+        let store = FakeStore::start(Listing::default());
+        let user_owned = sandbox.data_home().to_str().unwrap().to_owned();
+        let env = [("XDG_DATA_DIRS", user_owned.as_str())];
+        let run = on_sized_terminals(&sandbox, &store, args, &env, 200, 40);
+        assert_eq!(run.code, code, "{}", describe(&env, &run));
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !stderr
+                .lines()
+                .any(|line| line.contains("warn: ignoring \"")),
+            "a user run judged a system data dir: {}",
+            describe(&env, &run)
+        );
+    }
 }

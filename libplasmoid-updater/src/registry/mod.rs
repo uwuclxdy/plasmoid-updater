@@ -226,11 +226,16 @@ pub(crate) fn load_registry_map(
     component_type: ComponentType,
     system: bool,
 ) -> Result<HashMap<String, RegistryEntry>> {
+    let system_roots = if system {
+        crate::paths::system_data_dirs()
+    } else {
+        Vec::new()
+    };
     load_registry_map_trusting(
         component_type,
         system,
         &crate::paths::knewstuff_dir(),
-        &crate::paths::system_data_dirs(),
+        &system_roots,
         crate::paths::is_trusted_system_path,
     )
 }
@@ -321,10 +326,15 @@ fn install_key(component_type: ComponentType, installed_path: &Path) -> Registry
 /// running as the user, so an entry in it must never choose the store content a
 /// privileged update installs.
 pub(crate) fn build_id_cache(system: bool) -> RegistryIdCache {
+    let system_roots = if system {
+        crate::paths::system_data_dirs()
+    } else {
+        Vec::new()
+    };
     build_id_cache_trusting(
         system,
         &crate::paths::knewstuff_dir(),
-        &crate::paths::system_data_dirs(),
+        &system_roots,
         crate::paths::is_trusted_system_path,
     )
 }
