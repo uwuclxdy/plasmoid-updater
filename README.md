@@ -147,7 +147,7 @@ assume_yes = false        # confirm all updates without prompting
 prompt_restart = true     # ask before restarting plasmashell
 ```
 
-`--edit-config` creates the file with commented examples if it does not exist and opens it in `$EDITOR` (`nano` when unset). `$EDITOR` may name a command with arguments (`EDITOR="code --wait"`), which runs through the shell; a path containing spaces needs quoting inside the variable (`EDITOR="'/opt/my editor/ed'"`). A non-zero editor exit fails the run. Excluded components are skipped during updates and hidden from `check`. Invalid regex patterns are dropped instead of aborting the run.
+`--edit-config` creates the file with commented examples if it does not exist and opens it in `$EDITOR` (`nano` when unset). `$EDITOR` may name a command with arguments (`EDITOR="code --wait"`), which runs through the shell; a path containing spaces needs quoting inside the variable (`EDITOR="'/opt/my editor/ed'"`). A non-zero editor exit fails the run. Excluded components are skipped during updates and hidden from `check`. Invalid regex patterns are dropped instead of aborting the run. A key the file does not recognise fails `check`, `update` and `list-installed` (exit 3) with an error naming the key and the keys it accepts; `--edit-config` still opens the file. `verbosity`, which earlier releases read, is ignored with a warning: `-q` and `-v` set the log level.
 
 ## Topgrade integration (preview)
 
