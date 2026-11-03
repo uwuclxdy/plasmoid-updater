@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stands in for rustup: `rustup run <toolchain> <command>...` succeeds when the
+# toolchain is installed, which is every toolchain unless
+# $FAKE_RUSTUP_INSTALLED is set, and then only the space-separated ones it
+# lists. Nothing is ever installed; every call lands in $FAKE_RUSTUP_LOG.
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_RUSTUP_LOG:-/dev/null}"
+case "${1:-}" in
+  run)
+    if [ -z "${FAKE_RUSTUP_INSTALLED+x}" ]; then exit 0; fi
+    case " ${FAKE_RUSTUP_INSTALLED} " in
+      *" ${2:-} "*) exit 0 ;;
+    esac
+    echo "error: toolchain '${2:-}' is not installed" >&2
+    exit 1
+    ;;
+esac
+echo "fake rustup: unhandled invocation: $*" >&2
+exit 1

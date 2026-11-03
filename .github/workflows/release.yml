@@ -32,6 +32,9 @@ permissions:
 jobs:
   validate:
     name: Validate tag
+    # Tag guard on every job: a second trigger or a hand-dispatched run must
+    # never reach the builds or the publish step without a v* tag.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Validate tag is semver
@@ -43,10 +46,46 @@ jobs:
           if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::tag '${GITHUB_REF_NAME}' is not vX.Y.Z"; exit 1
           fi
+      - uses: actions/checkout@v7
+        with:
+          # the baseline is the newest origin tag HEAD contains, which needs the
+          # history and the tags, not the triggering tag alone
+          fetch-depth: 0
+      # The toolchain builds the rustdoc JSON the tool reads, and the tool
+      # reads only the formats of the toolchains it was released against, so
+      # the two pins move together (ci.yml's semver job carries the same pair,
+      # and scripts/semver-guard.sh's SEMVER_TOOLCHAIN, which release.sh's
+      # local check runs on, must equal this toolchain).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.1"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: Check the library's API against its previous release tag
+        # Release time, not per push: main carries the next version's
+        # (possibly breaking) API before the bump that announces it. The
+        # baseline, the release type and the check all come from
+        # scripts/semver-guard.sh, the one implementation release.sh shares:
+        # the baseline is the newest origin v* tag below this one that the tag's
+        # commit contains (never crates.io, which nothing publishes to yet), and
+        # the release type follows from that baseline version to the tag's.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest_ver="$(bash scripts/semver-guard.sh manifest-version)"
+          if [ "$manifest_ver" != "$tag" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the workspace version '${manifest_ver}'; release.sh bumps and tags together, so a hand-pushed tag must not skip the bump"
+            exit 1
+          fi
+          prev_tag="$(bash scripts/semver-guard.sh baseline "$tag")"
+          kind="$(bash scripts/semver-guard.sh release-type "${prev_tag#v}" "$tag")"
+          bash scripts/semver-guard.sh check "$prev_tag" "$kind"
 
   build:
     name: Build ${{ matrix.asset_name }}
     needs: validate
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -82,10 +121,13 @@ jobs:
 
   publish:
     name: Publish assets
-    needs: [build]
+    needs: [validate, build]
     # Run even when a build leg fails so the binaries that DID ship still get
     # attached with a matching sums file covering exactly what was published.
-    if: always()
+    # A failed validate skips every build leg, so there is nothing to attach:
+    # publish then stays out and leaves the validate failure as the one red.
+    # The tag guard still holds under always().
+    if: always() && needs.validate.result == 'success' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The argv as invoked, for the dirty-tree recovery hint to print the exact
-# re-run command.
+# The argv as invoked, so a refusal can print the exact re-run command.
 ORIG_ARGS=("$@")
 
-# Release driver for plasmoid-updater: bump the workspace versions, roll the
-# changelog's Unreleased section to the new version, refresh Cargo.lock, commit,
-# push, tag, and create the GitHub release right after the tag push with the
-# full changelog in the body (--notes FILE, required), so the notes ride
-# GitHub's release email. .github/workflows/release.yml only builds the binary
-# and uploads it to that release; it never creates the release or writes notes.
+# Release driver for plasmoid-updater: check the library's public API against
+# its previous release tag on origin, then bump the workspace versions, refresh
+# Cargo.lock, roll the changelog's Unreleased section to the new version,
+# commit, push, tag, and create the GitHub release right after the tag push
+# with the full changelog in the body (--notes FILE, required), so the notes
+# ride GitHub's release email. .github/workflows/release.yml only builds the
+# binary and uploads it to that release; it never creates the release or
+# writes notes.
 #
 # crates.io publishing is out of scope for this script.
+
+# The crate whose public API is a contract (topgrade depends on it); the binary
+# has no library API to keep compatible. The shared semver-guard script holds
+# SEMVER_PACKAGE, the baseline rule (read from origin, the one release.yml and
+# CI use), the release-type helpers and the check invocation.
+# shellcheck source=scripts/semver-guard.sh
+source "$(dirname "${BASH_SOURCE[0]}")/scripts/semver-guard.sh"
 
 RETRY=0
 WORKSPACE=0
@@ -128,6 +136,14 @@ case "$notes_url" in
   *) echo "Error: --notes requires a github origin remote (got '${notes_url:-none}')"; exit 1 ;;
 esac
 
+# The API check below needs its binary: refusing here, with the other
+# prerequisites, keeps a missing tool from surfacing after the bump.
+command -v cargo-semver-checks >/dev/null 2>&1 || {
+  echo "Error: checking the library's API needs cargo-semver-checks (install: cargo install cargo-semver-checks --version 0.51.0 --locked)"
+  exit 1
+}
+require_semver_toolchain || exit 1
+
 # Refuse to (re)release over an existing github release on a clean run: a clean
 # re-run would collide on gh release create. --retry resumes a partial run; a
 # do-over deletes the old release and tag first.
@@ -179,20 +195,20 @@ bump_workspace_versions() {
     done
   done
 }
-version_lt() {
-  # true (0) when $1 is strictly less than $2 by semver ordering
-  [ "$1" = "$2" ] && return 1
-  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
-}
 commit_exists() {
-  git log -n 200 --format=%s -- 2>/dev/null | grep -qFx "chore: release v${VERSION}"
+  # The log is captured first: grep -q exits on its match, and a writer still
+  # feeding a pipe to it takes SIGPIPE, which pipefail reads as "not found".
+  local subjects
+  subjects="$(git log -n 200 --format=%s -- 2>/dev/null)" || return 1
+  grep -qFx -- "chore: release v${VERSION}" <<<"$subjects"
 }
 local_tag_exists() {
   git rev-parse --verify -q "refs/tags/v${VERSION}" >/dev/null
 }
 remote_tag_exists() {
-  git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null \
-    | grep -qE "refs/tags/v${VERSION}\$"
+  local listing
+  listing="$(git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null)" || return 1
+  grep -qE "refs/tags/v${VERSION}\$" <<<"$listing"
 }
 remote_has_head() {
   local branch local_sha remote_sha
@@ -201,6 +217,40 @@ remote_has_head() {
   local_sha=$(git rev-parse HEAD)
   remote_sha=$(git rev-parse "origin/${branch}" 2>/dev/null) || return 1
   [ "$local_sha" = "$remote_sha" ]
+}
+print_rerun_command() {
+  # The re-run line for a refusal: the invocation exactly as typed. $1 replaces
+  # the positional version when given.
+  local override_version="${1:-}" drop_retry=0 rerun_args="" a self i=0
+  local -a rerun_words=()
+  [ -z "$override_version" ] || drop_retry=1
+  while [ "$i" -lt "${#ORIG_ARGS[@]}" ]; do
+    a="${ORIG_ARGS[$i]}"
+    case "$a" in
+      --notes)
+        rerun_words+=("$a")
+        i=$((i + 1))
+        rerun_words+=("${ORIG_ARGS[$i]}")
+        ;;
+      --retry)
+        # a different version is a different release: its first run must pass
+        # the "release already exists" guard, which --retry skips
+        [ "$drop_retry" -eq 1 ] || rerun_words+=("$a")
+        ;;
+      -*) rerun_words+=("$a") ;;
+      *)
+        if [ -n "$override_version" ]; then rerun_words+=("$override_version"); override_version=""
+        else rerun_words+=("$a"); fi
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  for a in "${rerun_words[@]}"; do rerun_args+=" $(printf '%q' "$a")"; done
+  case "$0" in
+    */*) self="$0" ;;
+    *) self="./$0" ;;
+  esac
+  echo "  $(printf '%q' "$self")${rerun_args}" >&2
 }
 ensure_github_auth() {
   local url helper
@@ -361,84 +411,85 @@ fi
 
 CHANGELOG_FILES=(docs/RELEASE_NOTES.md docs/CHANGELOG.md RELEASE_NOTES.md CHANGELOG.md)
 
-retry_owned_path() {
-  # true when $1 is a file this release itself rewrites: the manifests it
-  # bumps (root and members, however nested the member dirs are), the
-  # lockfile, or a changelog it rolls.
-  local f
-  case "$1" in
-    Cargo.toml|Cargo.lock) return 0 ;;
-  esac
-  for f in "${CHANGELOG_FILES[@]}"; do [ "$1" = "$f" ] && return 0; done
-  for f in "${MEMBERS[@]}"; do [ "$1" = "$f/Cargo.toml" ] && return 0; done
-  return 1
-}
 # A release commit stages the whole index, and the push and tag publish it:
-# refuse a dirty tree in every mode, --retry included. When every dirty path
-# is a tracked modification of a file this release rewrites AND the bump is
-# already applied (the state a failure between the version bump and the
-# commit leaves), the refusal prints the exact recovery; the reset stays the
-# operator's hand, since the same command would discard a stray edit inside
-# those files.
-if ! dirty="$(git status --porcelain)"; then
+# refuse a dirty tree in every mode, --retry included, untracked files too
+# (spelled out so a status.showUntrackedFiles=no config cannot hide one). The
+# refusal lists the dirty paths and `git diff HEAD`, asks the operator to
+# commit what to keep and discard the rest by hand, and prints the re-run line
+# as typed; it reads no other state, and the script never resets, stashes or
+# discards anything itself. A path is operator-controlled text, so each is
+# printed shell-quoted (%q) behind `# `, one line per path with no status
+# letters or arrow: the line holds only `#` and quoted words, and nothing in it
+# redirects or expands in bash or in zsh, where an interactive `#` is a command
+# name. Pasting the whole block runs `git diff HEAD` and the re-run line, which
+# refuses again while the tree is dirty. The listing is NUL-separated so a
+# newline in a path stays one record, hence a file rather than a substitution
+# (which drops NULs).
+dirty_file="$(mktemp)"
+trap 'rm -f "$dirty_file"' EXIT
+if ! git status --porcelain -z --untracked-files=normal >"$dirty_file"; then
   echo "Error: git status failed; refusing to release" >&2
   exit 1
 fi
-if [ -n "$dirty" ]; then
-  echo "Error: working tree or index not clean; the release commit stages the whole index:" >&2
-  printf '%s\n' "$dirty" | sed 's/^/  /' >&2
-  while IFS= read -r line; do
-    case "$line" in
-      '??'*) echo "untracked ${line:3} blocks the release: commit it, ignore it, or move it out of the tree (a --notes file can also live outside the worktree)" >&2 ;;
+if [ -s "$dirty_file" ]; then
+  echo "# Error: working tree or index not clean; the release commit stages the whole index:" >&2
+  untracked_paths=()
+  while IFS= read -r -d '' record; do
+    dirty_path="${record:3}"
+    case "${record:0:2}" in
+      *[RC]*)
+        # a rename or copy record is followed by the path it came from
+        IFS= read -r -d '' from_path || from_path=""
+        printf '  # %q %q\n' "$from_path" "$dirty_path" >&2
+        ;;
+      '??')
+        untracked_paths+=("$dirty_path")
+        printf '  # %q\n' "$dirty_path" >&2
+        ;;
+      *) printf '  # %q\n' "$dirty_path" >&2 ;;
     esac
-  done <<<"$dirty"
-  all_owned=1
-  owned_paths=""
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    path="${line:3}"
-    case "${line:0:2}" in
-      " M"|"M "|"MM") retry_owned_path "$path" || all_owned=0 ;;
-      *) all_owned=0 ;;
-    esac
-    [ "$all_owned" -eq 1 ] || break
-    owned_paths+=" $path"
-  done <<<"$dirty"
-  if [ "$all_owned" -eq 1 ] && [ "$CUR_VERSION" = "$VERSION" ]; then
-    echo "Every dirty path is a file this release rewrites, as a failure between the version bump and the commit leaves it (or an edit made after the release commit). Inspect first: the reset below also discards any other uncommitted edit in these files (notes written in place included). Then reset the bump and re-run:" >&2
-    echo "  git diff HEAD" >&2
-    echo "  git checkout HEAD --${owned_paths}" >&2
-    rerun_args=""
-    for a in "${ORIG_ARGS[@]}"; do rerun_args+=" $(printf '%q' "$a")"; done
-    rerun_retry=" --retry"
-    for a in "${ORIG_ARGS[@]}"; do
-      if [ "$a" = "--retry" ]; then rerun_retry=""; fi
-    done
-    case "$0" in
-      */*) self="$0" ;;
-      *) self="./$0" ;;
-    esac
-    echo "  $(printf '%q' "$self")${rerun_retry}${rerun_args}" >&2
-  elif [ "$all_owned" -eq 1 ]; then
-    echo "These are files this release rewrites, but the version is not ${VERSION} yet, so the edits are not a failed bump: commit them first (or stash them; notes written in place included), then re-run." >&2
-  else
-    echo "Commit or set these changes aside, then re-run." >&2
-  fi
+  done <"$dirty_file"
+  for dirty_path in ${untracked_paths[@]+"${untracked_paths[@]}"}; do
+    printf '# untracked %q blocks the release: commit it, ignore it, or move it out of the tree (a --notes file can also live outside the worktree)\n' "$dirty_path" >&2
+  done
+  echo "# Inspect them:" >&2
+  echo "  git diff HEAD" >&2
+  echo "# Commit what you want to keep (notes written in place included), discard the rest yourself, then re-run:" >&2
+  print_rerun_command
   exit 1
 fi
 
 # Refuse to release unless the new version is strictly greater than the current
 # one. On --retry the current version may already equal the target (Cargo.toml
 # was bumped by an earlier run), which is allowed. This runs after the dirty-tree
-# guard so a bump left uncommitted gets the recovery hint, not this error.
+# guard, so an uncommitted bump meets the dirty-tree refusal first.
 if [ "$CUR_VERSION" = "$VERSION" ]; then
   if [ "$RETRY" -ne 1 ]; then
-    echo "Error: version is already ${VERSION}; bump to a higher version, or pass --retry to resume a release of ${VERSION} that stopped after its commit"
+    echo "Error: version is already ${VERSION}; bump to a higher version, or re-run with --retry if an earlier run of ${VERSION} stopped part-way"
     exit 1
   fi
 elif [ -n "$CUR_VERSION" ] && ! version_lt "$CUR_VERSION" "$VERSION"; then
   echo "Error: new version ${VERSION} must be greater than current ${CUR_VERSION}"
   exit 1
+fi
+
+# --retry resumes a release at the commit its tag names: with HEAD anywhere
+# else, the resume would push that HEAD and report the old tag released. Both
+# the local tag and origin's are judged, before the plan and any change.
+if [ "$RETRY" -eq 1 ]; then
+  head_commit="$(git rev-parse HEAD)"
+  if ! origin_tags="$(origin_release_tags)"; then
+    echo "Error: git ls-remote --tags origin failed; cannot tell whether v${VERSION} names HEAD, so --retry did not start; nothing was pushed" >&2
+    exit 1
+  fi
+  tagged_commits=$'local\t'"$(git rev-parse --verify --quiet "refs/tags/v${VERSION}^{commit}" || true)"
+  tagged_commits+=$'\norigin\t'"$(awk -v ver="$VERSION" '$1 == ver { print $2 }' <<<"$origin_tags")"
+  while IFS=$'\t' read -r tag_where tag_commit; do
+    if [ -n "$tag_commit" ] && [ "$tag_commit" != "$head_commit" ]; then
+      echo "Error: tag v${VERSION} on ${tag_where} names commit ${tag_commit}, but HEAD is ${head_commit}; --retry did not start and nothing was pushed" >&2
+      exit 1
+    fi
+  done <<<"$tagged_commits"
 fi
 
 # The release body comes only from the curated section: refuse before any
@@ -496,18 +547,23 @@ for f in "${CHANGELOG_FILES[@]}"; do
 done
 if [ "$WORKSPACE" -eq 1 ]; then
   echo "Release plan: workspace v${CUR_VERSION:-?} -> v${VERSION}"
-  echo "  - bump ${#MEMBERS[@]} member crate(s) + [workspace.package] + dep pins: ${MEMBER_NAMES[*]}"
 else
   CRATE_LABEL="$(crate_name || true)"
   echo "Release plan: ${CRATE_LABEL:-$(basename "$PWD")} v${CUR_VERSION:-?} -> v${VERSION}"
+fi
+echo "  - check ${SEMVER_PACKAGE}'s API against its previous release tag (an API change needs the bump that announces it)"
+if [ "$WORKSPACE" -eq 1 ]; then
+  echo "  - bump ${#MEMBERS[@]} member crate(s) + [workspace.package] + dep pins: ${MEMBER_NAMES[*]}"
+else
   echo "  - bump Cargo.toml"
 fi
+echo "  - refresh Cargo.lock"
 [ "${#plan_rolls[@]}" -gt 0 ] && echo "  - roll Unreleased -> ${VERSION} in: ${plan_rolls[*]}"
-echo "  - refresh Cargo.lock + commit \"chore: release v${VERSION}\""
-echo "  - push $(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD) + tag v${VERSION} to origin"
+echo "  - commit \"chore: release v${VERSION}\""
 case "$notes_url" in
   https://github.com/*) echo "  - set gh as the git credential helper if none is configured (gh auth setup-git)" ;;
 esac
+echo "  - push $(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD) + tag v${VERSION} to origin"
 echo "  - create github release v${VERSION} with notes from: ${NOTES_FILES[*]}"
 [ "$RETRY" -eq 1 ] && echo "  - (--retry: already-completed steps will be skipped)"
 printf 'Proceed? [y/N] '
@@ -517,6 +573,59 @@ case "$REPLY" in
   *) echo "Aborted."; exit 1 ;;
 esac
 
+# The library's public API is a contract (topgrade depends on it), so a
+# breaking change must carry the version bump that announces it. The check runs
+# BEFORE any mutation: it compares the previous release tag against the version
+# being released, with the release type passed explicitly so no bumped manifest
+# is needed. A refusal leaves the tree, refs and remote untouched and prints no
+# undo advice.
+# The baseline comes from the shared rule (the newest origin v* tag below
+# VERSION that HEAD contains), which prints its own refusal. On --retry the
+# tag v<VERSION> may already exist; "below VERSION" keeps the first run's
+# baseline. Status 3 means a fetch is needed first, so the same command is the
+# re-run once the fetch line it printed has run.
+baseline_status=0
+baseline_tag="$(resolve_baseline "$VERSION" below)" || baseline_status=$?
+if [ "$baseline_status" -ne 0 ]; then
+  if [ "$baseline_status" -eq 3 ]; then print_rerun_command; fi
+  exit 1
+fi
+previous_version="${baseline_tag#v}"
+release_kind="$(release_type "$previous_version" "$VERSION")"
+echo "Checking ${SEMVER_PACKAGE}'s API against v${previous_version} as $(release_label "$release_kind" "$previous_version")"
+semver_status=0
+semver_check "v${previous_version}" "$release_kind" || semver_status=$?
+if [ "$semver_status" -eq 100 ]; then
+  needed_kind="major"
+  if [ "$release_kind" = "patch" ]; then
+    minor_status=0
+    semver_check "v${previous_version}" minor >/dev/null 2>&1 || minor_status=$?
+    if [ "$minor_status" -eq 0 ]; then
+      needed_kind="minor"
+    elif [ "$minor_status" -ne 100 ]; then
+      echo "Error: the ${SEMVER_PACKAGE} API check could not complete (cargo-semver-checks exited ${minor_status}); the release did not start" >&2
+      print_rerun_command
+      exit 1
+    fi
+  fi
+  if [ "$needed_kind" = "minor" ]; then
+    echo "Error: ${SEMVER_PACKAGE}'s public API change needs a minor version bump" >&2
+  elif [ "${previous_version%%.*}" = "0" ]; then
+    echo "Error: ${SEMVER_PACKAGE}'s public API change needs a major version bump (a minor one while below 1.0)" >&2
+  else
+    echo "Error: ${SEMVER_PACKAGE}'s public API change needs a major version bump" >&2
+  fi
+  # a baseline version too long to compute the next one from: refuse without a
+  # re-run line, which would only repeat the refused version
+  needed_next="$(needed_version "$previous_version" "$needed_kind")" || exit 1
+  print_rerun_command "$needed_next"
+  exit 1
+elif [ "$semver_status" -ne 0 ]; then
+  echo "Error: the ${SEMVER_PACKAGE} API check could not complete (cargo-semver-checks exited ${semver_status}); the release did not start" >&2
+  print_rerun_command
+  exit 1
+fi
+
 if [ "$RETRY" -eq 1 ] && [ "$CUR_VERSION" = "$VERSION" ]; then
   echo "Skipping Cargo.toml bump (already at ${VERSION})"
 elif [ "$WORKSPACE" -eq 1 ]; then
@@ -524,7 +633,14 @@ elif [ "$WORKSPACE" -eq 1 ]; then
   bump_workspace_versions
 else
   echo "Setting version ${VERSION}"
-  sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+  sed -i -E '/^\[package\]/,/^\[/ s/^version = ".*"/version = "'"${VERSION}"'"/' Cargo.toml
+fi
+
+echo "Updating Cargo.lock"
+if [ "$WORKSPACE" -eq 1 ]; then
+  cargo check --workspace --quiet
+else
+  cargo check --quiet
 fi
 
 CHANGED_CHANGELOGS=()
@@ -536,13 +652,6 @@ for f in "${CHANGELOG_FILES[@]}"; do
     CHANGED_CHANGELOGS+=("$f")
   fi
 done
-
-echo "Updating Cargo.lock"
-if [ "$WORKSPACE" -eq 1 ]; then
-  cargo check --workspace --quiet
-else
-  cargo check --quiet
-fi
 
 if [ "$RETRY" -eq 1 ] && commit_exists; then
   echo "Skipping commit (chore: release v${VERSION} already in history)"

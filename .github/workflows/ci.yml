@@ -173,6 +173,35 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
+  # Report-only: prints the release type the change needs against the newest
+  # origin v* tag that HEAD contains at or below the manifest version, and fails
+  # only when the manifest is already bumped by a smaller type than that. The
+  # manifest still sits at the baseline tag until a release bumps it, so a
+  # breaking change on main reports and passes; the tag-time check in
+  # release.yml and release.sh is the gate. The baseline needs the history and
+  # the tags, hence the full fetch.
+  semver:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # The toolchain builds the rustdoc JSON the tool reads, and the tool
+      # reads only the formats of the toolchains it was released against, so
+      # the two pins move together (release.yml's validate job carries the
+      # same pair, and scripts/semver-guard.sh's SEMVER_TOOLCHAIN, which
+      # release.sh's local check runs on, must equal this toolchain).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: release type the change needs
+        run: bash scripts/semver-guard.sh report
+
   # Separate job so the write token never meets build code: job-level
   # `permissions` would apply to every leg of the check job, where checkout
   # persists the token in .git/config and any build/test step can write

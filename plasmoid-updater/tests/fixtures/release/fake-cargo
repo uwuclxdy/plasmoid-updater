@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Stands in for cargo: `check` is a no-op in the sandbox (there is nothing to
+# build), and `semver-checks` resolves the tool the way cargo resolves any
+# subcommand, through PATH. A leading `+toolchain` is recorded, one line per
+# semver-checks call (empty when none was given), in $FAKE_CARGO_LOG.
+set -euo pipefail
+toolchain=""
+case "${1:-}" in
+  +*)
+    toolchain="${1#+}"
+    shift
+    ;;
+esac
+case "${1:-}" in
+  check) exit 0 ;;
+  semver-checks)
+    shift
+    printf '%s\n' "$toolchain" >>"${FAKE_CARGO_LOG:-/dev/null}"
+    exec cargo-semver-checks "$@"
+    ;;
+esac
+echo "fake cargo: unhandled invocation: $*" >&2
+exit 1
