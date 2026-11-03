@@ -25,24 +25,18 @@ const SELECTION_MARKER: &str = "selection=0";
 const SIGNAL_MARKER: &str = "sigint=SIGINT";
 
 fn pending_update() -> AvailableUpdate {
-    AvailableUpdate {
-        installed: InstalledComponent {
-            name: "Fake Scheme".to_string(),
-            directory_name: "FakeScheme.colors".to_string(),
-            version: "1.0".to_string(),
-            component_type: ComponentType::ColorScheme,
-            path: std::path::PathBuf::from("/tmp/test"),
-            is_system: false,
-            release_date: String::new(),
-        },
-        content_id: 1,
-        latest_version: "2.0".to_string(),
-        download_url: String::new(),
-        store_url: String::new(),
-        release_date: String::new(),
-        checksum: None,
-        download_size: None,
-    }
+    AvailableUpdate::builder(
+        InstalledComponent::new(
+            "Fake Scheme".to_string(),
+            "FakeScheme.colors".to_string(),
+            ComponentType::ColorScheme,
+            std::path::PathBuf::from("/tmp/test"),
+        )
+        .with_version("1.0"),
+        1,
+        "2.0",
+    )
+    .build()
 }
 
 /// The blocking set every thread of this process and its children carry here.

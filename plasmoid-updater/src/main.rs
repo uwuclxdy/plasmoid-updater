@@ -6,6 +6,7 @@ mod exit_code;
 mod logger;
 
 use std::io::{IsTerminal, Write as _};
+use std::path::PathBuf;
 
 use clap::{CommandFactory as _, Parser, Subcommand};
 
@@ -174,6 +175,15 @@ enum Stop {
     Usage(String),
     /// The run could not start or finish.
     Fatal(lib::Error),
+    /// A required external tool is not installed or not on `PATH`; the bin's
+    /// own spawn failure, reported rather than dressed as a library error.
+    MissingTool(&'static str),
+    /// A filesystem operation on the config file failed; the bin's own error,
+    /// rendered the way the library's `Error::Io` reads.
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// Writing the payload to stdout failed; the bin's own stream, so the bin
     /// reports it rather than dressing it as a library error.
     Output(std::io::Error),
@@ -200,6 +210,14 @@ fn main() {
         }
         Err(Stop::Fatal(error)) => {
             log::error!("{error}");
+            ExitCode::Fatal
+        }
+        Err(Stop::MissingTool(tool)) => {
+            log::error!("missing required tool: {tool}");
+            ExitCode::Fatal
+        }
+        Err(Stop::Io { path, source }) => {
+            log::error!("{}: {source}", path.display());
             ExitCode::Fatal
         }
         Err(Stop::Output(error)) => {
@@ -547,12 +565,12 @@ fn named_check_result(
     diagnostics: Vec<lib::Diagnostic>,
     unavailable: Vec<lib::Failure>,
 ) -> lib::CheckResult {
-    lib::CheckResult {
-        available_updates,
-        skipped,
-        diagnostics,
-        unavailable,
-    }
+    let mut result = lib::CheckResult::default();
+    result.available_updates = available_updates;
+    result.skipped = skipped;
+    result.diagnostics = diagnostics;
+    result.unavailable = unavailable;
+    result
 }
 
 /// Lists what `update` would install, leaving the disk and the registry alone.
@@ -693,10 +711,9 @@ fn do_update_single(
         }
         Named::Excluded(display_name) => {
             if json {
-                payload_json(&lib::UpdateResult {
-                    skipped: vec![display_name],
-                    ..Default::default()
-                })?;
+                let mut result = lib::UpdateResult::default();
+                result.skipped.push(display_name);
+                payload_json(&result)?;
             } else {
                 payload(format_args!("{name:?} is excluded"))?;
             }
@@ -711,20 +728,16 @@ fn do_update_single(
             Ok(ExitCode::Success)
         }
         Named::Unavailable(failure) => {
-            let result = lib::UpdateResult {
-                succeeded: Vec::new(),
-                failed: vec![failure],
-                skipped: Vec::new(),
-            };
+            let mut result = lib::UpdateResult::default();
+            result.failed.push(failure);
             finish_update(result, restart, false, json)
         }
         Named::CheckFailed(diagnostic) => {
             report_diagnostic(&diagnostic);
             if json {
-                payload_json(&lib::UpdateResult {
-                    skipped: vec![diagnostic.name],
-                    ..Default::default()
-                })?;
+                let mut result = lib::UpdateResult::default();
+                result.skipped.push(diagnostic.name);
+                payload_json(&result)?;
             }
             Ok(ExitCode::Failure)
         }
@@ -812,11 +825,8 @@ fn report_failure_rows(failed: Vec<lib::Failure>) {
     if failed.is_empty() {
         return;
     }
-    let result = lib::UpdateResult {
-        succeeded: Vec::new(),
-        failed,
-        skipped: Vec::new(),
-    };
+    let mut result = lib::UpdateResult::default();
+    result.failed = failed;
     lib::cli::print_failures(&result);
 }
 
@@ -919,7 +929,7 @@ fn is_root_user() -> bool {
 /// Authenticates a system-wide run up front, so the installs do not stop on a
 /// password prompt. Only a run that writes under `--system` gets here; `check`,
 /// `list-installed` and `update --dry-run` read and never authenticate.
-fn authenticate_system(system_wide: bool) -> Result<(), lib::Error> {
+fn authenticate_system(system_wide: bool) -> Result<(), Stop> {
     if system_wide && !is_root_user() {
         validate_sudo()
     } else {
@@ -927,14 +937,14 @@ fn authenticate_system(system_wide: bool) -> Result<(), lib::Error> {
     }
 }
 
-fn validate_sudo() -> Result<(), lib::Error> {
+fn validate_sudo() -> Result<(), Stop> {
     let status = std::process::Command::new("sudo")
         .args(["-v"])
         .status()
         .map_err(|e| spawn_error("sudo", &e))?;
 
     if !status.success() {
-        return Err(sudo_auth_failure(&status));
+        return Err(sudo_auth_failure(&status).into());
     }
 
     Ok(())
@@ -964,14 +974,14 @@ pub(crate) fn command_failure(command: &str, status: &std::process::ExitStatus) 
 }
 
 /// Maps a failed spawn of `command` to the error that names the real cause: a
-/// missing binary is [`lib::Error::MissingTool`], anything else a
+/// missing binary is [`Stop::MissingTool`], anything else a
 /// [`lib::Error::Config`] message naming the command. `Error::Io` carries a
 /// touched path, which a command name is not.
-fn spawn_error(command: &'static str, e: &std::io::Error) -> lib::Error {
+fn spawn_error(command: &'static str, e: &std::io::Error) -> Stop {
     if e.kind() == std::io::ErrorKind::NotFound {
-        lib::Error::MissingTool { tool: command }
+        Stop::MissingTool(command)
     } else {
-        lib::Error::Config(format!("failed to run {command}: {e}"))
+        Stop::Fatal(lib::Error::Config(format!("failed to run {command}: {e}")))
     }
 }
 
@@ -1065,22 +1075,18 @@ mod tests {
 
     #[test]
     fn a_failed_restart_is_an_error_line() {
-        use std::os::unix::process::ExitStatusExt as _;
-
         install_capture_logger();
 
-        super::log_restart_failure(&libplasmoid_updater::Error::Command {
-            command: "systemctl",
-            status: std::process::ExitStatus::from_raw(1 << 8),
-        });
+        super::log_restart_failure(&libplasmoid_updater::Error::Config(
+            "could not reach plasmashell".into(),
+        ));
 
         let logged = RESTART_LOG.lock().expect("the restart log mutex");
         // The log is process-wide, so another test's line may follow this one.
         assert!(
-            logged
-                .iter()
-                .any(|(level, message)| *level == log::Level::Error
-                    && message == "failed to restart plasmashell: systemctl exited with status 1"),
+            logged.iter().any(|(level, message)| *level == log::Level::Error
+                && message
+                    == "failed to restart plasmashell: configuration error: could not reach plasmashell"),
             "{logged:?}"
         );
     }

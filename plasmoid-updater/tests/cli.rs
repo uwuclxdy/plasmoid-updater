@@ -726,6 +726,34 @@ fn system_update_of_a_named_component_authenticates() {
     common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
 }
 
+/// A `sudo` that cannot be spawned is named as the missing tool, not as a
+/// configuration problem, and ends the run like any other missing tool.
+#[test]
+fn a_missing_sudo_exits_3_naming_the_missing_tool() {
+    let sandbox = Sandbox::new();
+    let empty_bin = sandbox.tmp_dir().join("empty-bin");
+    std::fs::create_dir_all(&empty_bin).unwrap();
+    let output = sandbox
+        .command(bin())
+        .env("PATH", &empty_bin)
+        .env(API_URL_VAR, common::dead_store_url())
+        .args(["--system", "--skip-plasma-detection", "update", "-y"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let run = Run {
+        code: output.status.code().expect("killed by a signal"),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    assert_eq!(run.code, 3, "{run}");
+    assert_eq!(
+        run.stderr.trim_end(),
+        "error: missing required tool: sudo",
+        "{run}"
+    );
+}
+
 /// Runs `check` with the config directory pointed at `config_dir`.
 fn check_with_config_dir(sandbox: &Sandbox, api_url: &str, config_dir: &std::path::Path) -> Run {
     let output = sandbox
@@ -802,6 +830,29 @@ fn a_config_dir_that_is_a_regular_file_is_a_usage_error_naming_it() {
     assert!(
         stderr.contains(&not_a_dir.display().to_string()),
         "stderr:\n{stderr}"
+    );
+}
+
+/// A config file that cannot be read names the path and the OS error, the
+/// same line the library's `Error::Io` renders, and ends the run fatally.
+#[test]
+fn an_unreadable_config_file_exits_3_naming_the_path_and_cause() {
+    let sandbox = Sandbox::new();
+    let config_file = sandbox.config_dir().join("plasmoid-updater.toml");
+    std::fs::create_dir_all(&config_file).unwrap();
+    let run = run(
+        &sandbox,
+        &common::dead_store_url(),
+        &["--skip-plasma-detection", "check"],
+    );
+    assert_eq!(run.code, 3, "{run}");
+    assert_eq!(
+        run.stderr.trim_end(),
+        format!(
+            "error: {}: Is a directory (os error 21)",
+            config_file.display()
+        ),
+        "{run}"
     );
 }
 

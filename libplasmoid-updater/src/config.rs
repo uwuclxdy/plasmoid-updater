@@ -19,8 +19,10 @@ pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kde-look.org/ocs/v1";
 /// Configuration for libplasmoid-updater operations.
 ///
 /// This struct contains all configuration options used by the library.
-/// Library consumers (like topgrade or other automation tools) can construct
-/// this directly without needing config file parsing.
+/// Library consumers (like topgrade or other automation tools) build it with
+/// [`Config::new`] and the `with_*` methods, without needing config file
+/// parsing. The struct is `#[non_exhaustive]`: build it through those methods,
+/// never a struct literal from outside this crate.
 ///
 /// # Examples
 ///
@@ -47,6 +49,7 @@ pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kde-look.org/ocs/v1";
 ///     .with_api_url("https://mirror.example.org/ocs/v1");
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// If `true`, operate on system-wide components (in `/usr/share`).
     /// If `false` (default), operate on user components (in `~/.local/share`).
@@ -56,9 +59,9 @@ pub struct Config {
     /// Packages to exclude from updates.
     ///
     /// Can match either directory names (e.g., "org.kde.plasma.systemmonitor")
-    /// or display names (e.g., "System Monitor"). Exclusions are applied once,
-    /// by [`check`](crate::check) — and so by [`update`](crate::update), which
-    /// checks first: an excluded component leaves
+    /// or display names (e.g., "System Monitor"). [`check`](crate::check) and
+    /// [`update`](crate::update) apply these rules to their own run: an
+    /// excluded component leaves
     /// [`CheckResult::available_updates`](crate::CheckResult::available_updates)
     /// and is listed in [`CheckResult::skipped`](crate::CheckResult::skipped).
     /// [`install`](crate::install) applies no exclusions: it installs the
@@ -71,8 +74,8 @@ pub struct Config {
     /// and the display name of every candidate. Complements
     /// [`excluded_packages`](Self::excluded_packages), which matches exactly.
     /// Invalid patterns are dropped with a warning rather than aborting the
-    /// run. Applied in the same one place as `excluded_packages`:
-    /// [`check`](crate::check), never [`install`](crate::install).
+    /// run. Applied like `excluded_packages`: by [`check`](crate::check) and
+    /// [`update`](crate::update), never by [`install`](crate::install).
     pub excluded_patterns: Vec<String>,
 
     /// Widget ID fallback table mapping directory names to KDE Store content IDs.
@@ -90,8 +93,10 @@ pub struct Config {
     /// - Key: Component directory name (e.g., "org.kde.plasma.systemmonitor")
     /// - Value: KDE Store content ID (numeric)
     ///
-    /// The CLI application loads this from a `widgets-id` file, but library
-    /// consumers can provide it programmatically or leave it empty.
+    /// [`Config::new`] starts from the table embedded in the library at compile
+    /// time (the `widgets-id` file); no file is read at runtime. Library
+    /// consumers can replace it with [`Config::with_widgets_id_table`], an
+    /// empty map included.
     pub widgets_id_table: HashMap<String, u64>,
 
     /// The OCS base URL every store request (listing and per-id lookup)
@@ -123,7 +128,7 @@ impl Default for Config {
             system: false,
             excluded_packages: Vec::new(),
             excluded_patterns: Vec::new(),
-            widgets_id_table: HashMap::new(),
+            widgets_id_table: DEFAULT_WIDGETS_TABLE.clone(),
             api_url: DEFAULT_BASE_URL.to_string(),
             threads: None,
             skip_plasma_detection: false,
@@ -133,7 +138,8 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Creates a new configuration with default values.
+    /// Creates a configuration with the default values, the same as
+    /// [`Config::default`].
     ///
     /// Default values:
     /// - `system`: false (user components)
@@ -145,10 +151,7 @@ impl Config {
     /// for components that cannot be resolved via KNewStuff registry or
     /// exact name matching.
     pub fn new() -> Self {
-        Self {
-            widgets_id_table: DEFAULT_WIDGETS_TABLE.clone(),
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Sets whether to operate on system-wide components.
@@ -195,12 +198,11 @@ impl Config {
 
     /// Sets the list of Plasmoids to exclude from updates.
     ///
-    /// Exclusions are applied once, by [`check`](crate::check) (and by
-    /// [`update`](crate::update), which checks first): an excluded component
-    /// leaves `available_updates` and is listed in `skipped`.
-    /// [`install`](crate::install) ignores these rules and installs the
-    /// selection it is given. The list can contain either directory names or
-    /// display names.
+    /// [`check`](crate::check) and [`update`](crate::update) apply these rules
+    /// to their own run: an excluded component leaves `available_updates` and
+    /// is listed in `skipped`. [`install`](crate::install) ignores these rules
+    /// and installs the selection it is given. The list can contain either
+    /// directory names or display names.
     ///
     /// # Arguments
     ///
@@ -227,9 +229,9 @@ impl Config {
     /// Each pattern is matched (unanchored) against both the directory name
     /// and the display name of every candidate. Invalid patterns are dropped
     /// with a warning when the update run starts. Like
-    /// [`with_excluded_packages`](Self::with_excluded_packages), these apply
-    /// in [`check`](crate::check) (and so in [`update`](crate::update)), never
-    /// in [`install`](crate::install).
+    /// [`with_excluded_packages`](Self::with_excluded_packages), these apply in
+    /// [`check`](crate::check) and [`update`](crate::update), never in
+    /// [`install`](crate::install).
     ///
     /// # Example
     ///
@@ -395,6 +397,12 @@ mod tests {
         assert_eq!(table.get("com.bxabi.bumblebee-indicator"), Some(&998890));
         assert_eq!(table.get("org.kde.plasma.awesomewidget"), Some(&998913));
         assert_eq!(table.get("com.dschopf.plasma.qalculate"), Some(&1155946));
+    }
+
+    #[test]
+    fn default_loads_the_embedded_widgets_id_table() {
+        let default = Config::default();
+        assert_eq!(default.widgets_id_table.get("adhe.menu.11"), Some(&2171750));
     }
 
     #[test]

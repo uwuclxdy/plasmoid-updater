@@ -8,6 +8,14 @@ use std::path::PathBuf;
 /// failed install) is not an [`Error`]: it is a [`Failure`](crate::Failure)
 /// row inside the returned [`UpdateResult`](crate::UpdateResult), and the rest
 /// of the run continues.
+///
+/// The enum is `#[non_exhaustive]`: a new variant is not a breaking change, so
+/// match with a wildcard arm. The struct-like variants that carry fields are
+/// `#[non_exhaustive]` as well, so a field added to one later ships in a minor
+/// release: an outside match names the fields it uses and ends with `..`. The
+/// tuple variants ([`Error::Network`], [`Error::Config`]) stay exhaustive:
+/// their payload never grows, and a new payload shape arrives as a new
+/// variant, which the enum's own `#[non_exhaustive]` already allows.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -27,6 +35,7 @@ pub enum Error {
 
     /// A required external tool is not installed or not on `PATH`.
     #[error("missing required tool: {tool}")]
+    #[non_exhaustive]
     MissingTool {
         /// Name of the missing executable (e.g. `bsdtar`).
         tool: &'static str,
@@ -34,6 +43,7 @@ pub enum Error {
 
     /// A command the library ran exited nonzero.
     #[error("{}", command_failure(.command, .status))]
+    #[non_exhaustive]
     Command {
         /// The command that failed (e.g. `systemctl`).
         command: &'static str,
@@ -52,6 +62,7 @@ pub enum Error {
 
     /// The KDE Store returned a non-success status.
     #[error("kde store returned error status {status}")]
+    #[non_exhaustive]
     Api {
         /// The HTTP or OCS status code.
         status: u16,
@@ -59,6 +70,7 @@ pub enum Error {
 
     /// A payload could not be parsed.
     #[error("failed to parse {what}: {detail}")]
+    #[non_exhaustive]
     Parse {
         /// What failed to parse (e.g. `"ocs response"`).
         what: &'static str,
@@ -69,6 +81,7 @@ pub enum Error {
     /// A filesystem operation failed. Both the path and the underlying
     /// `std::io::Error` (with its errno) are preserved.
     #[error("{path}: {source}")]
+    #[non_exhaustive]
     Io {
         /// The path the operation touched.
         path: PathBuf,

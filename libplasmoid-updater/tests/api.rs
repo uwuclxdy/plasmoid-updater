@@ -9,12 +9,12 @@ mod common;
 use std::sync::Mutex;
 
 use common::{
-    ExtraEntry, FakeStore, Listing, NEW_CONTENT, NEW_VERSION, OLD_CONTENT, OLD_VERSION,
+    ExtraEntry, FakeStore, Listing, NEW_CONTENT, NEW_VERSION, OLD_CONTENT, OLD_VERSION, SCHEME_ID,
     SCHEME_NAME, Sandbox, assert_content,
 };
 use libplasmoid_updater::{
-    ComponentType, Config, Error, Event, FailureKind, Reporter, check, get_installed, install,
-    update,
+    AvailableUpdate, ComponentType, Config, Error, Event, FailureKind, InstalledComponent,
+    Reporter, check, get_installed, install, update,
 };
 
 struct Quiet;
@@ -435,6 +435,145 @@ fn install_of_an_empty_selection_changes_nothing() {
     let store = FakeStore::start(Listing::default());
     sandbox.run_child("install_of_an_empty_selection_changes_nothing", store.url());
     assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
+/// The component the sandbox's fake color scheme is, as the child sees it.
+fn sandbox_scheme_update() -> AvailableUpdate {
+    let scheme = std::path::Path::new(&std::env::var("XDG_DATA_HOME").unwrap())
+        .join("color-schemes")
+        .join(common::SCHEME_FILE);
+    let component = InstalledComponent::new(
+        SCHEME_NAME,
+        common::SCHEME_FILE,
+        ComponentType::ColorScheme,
+        scheme,
+    )
+    .with_version(OLD_VERSION);
+    AvailableUpdate::builder(component, SCHEME_ID, NEW_VERSION).build()
+}
+
+#[test]
+fn an_update_with_no_download_url_is_a_failure_and_installs_nothing() {
+    if let Some(child) = common::child() {
+        let result = install(
+            &[sandbox_scheme_update()],
+            &config(&child.store_url),
+            &Quiet,
+        )
+        .unwrap();
+        assert!(result.succeeded.is_empty(), "{result:?}");
+        assert_eq!(result.failed.len(), 1, "{result:?}");
+        assert_eq!(result.failed[0].kind, FailureKind::NoMatchingDownload);
+        assert_eq!(
+            result.failed[0].message, "the selected update has no download url",
+            "{:?}",
+            result.failed[0]
+        );
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing::default());
+    sandbox.run_child(
+        "an_update_with_no_download_url_is_a_failure_and_installs_nothing",
+        store.url(),
+    );
+    assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+    assert!(
+        sandbox
+            .registry_content()
+            .contains(&version_line(OLD_VERSION)),
+        "the registry was rewritten: {}",
+        sandbox.registry_content()
+    );
+}
+
+/// A store entry with an empty `<version>` is a legitimate match: the checker
+/// offers it when its change date is newer, and `update()` installs it.
+#[test]
+fn a_versionless_store_entry_updates_through_update() {
+    if let Some(child) = common::child() {
+        let result = update(&config(&child.store_url), &Quiet).unwrap();
+        assert_eq!(result.succeeded.len(), 1, "{result:?}");
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert_eq!(result.succeeded[0].version, "", "{result:?}");
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let registry = sandbox.registry_content().replace(
+        "<status>installed</status>",
+        "<releasedate>2026-01-01</releasedate>\n    <status>installed</status>",
+    );
+    std::fs::write(sandbox.registry_path(), registry).unwrap();
+    let store = FakeStore::start(Listing {
+        version: "",
+        link_version: Some(""),
+        ..Listing::default()
+    });
+    sandbox.run_child(
+        "a_versionless_store_entry_updates_through_update",
+        store.url(),
+    );
+    assert_content(&sandbox.scheme_path(), NEW_CONTENT);
+    let registry = sandbox.registry_content();
+    assert!(
+        registry.contains(&version_line("")),
+        "the registry was not rewritten with the empty version: {registry}"
+    );
+    assert!(
+        !registry.contains(&version_line(OLD_VERSION)),
+        "the registry still lists {OLD_VERSION}: {registry}"
+    );
+}
+
+#[test]
+fn a_refused_update_does_not_stop_the_rest_of_the_selection() {
+    if let Some(child) = common::child() {
+        let host = child
+            .store_url
+            .strip_suffix("/ocs/v1")
+            .unwrap_or(&child.store_url);
+        let mut good = sandbox_scheme_update();
+        good.download_url = format!("{host}/dl/fake-scheme.tar.gz");
+        let ghost = AvailableUpdate::builder(
+            InstalledComponent::new(
+                "Ghost Scheme",
+                "GhostScheme.colors",
+                ComponentType::ColorScheme,
+                std::path::Path::new("/nonexistent/GhostScheme.colors"),
+            ),
+            SCHEME_ID + 1,
+            NEW_VERSION,
+        )
+        .build();
+        let result = install(&[ghost, good], &config(&child.store_url), &Quiet).unwrap();
+        assert_eq!(result.succeeded.len(), 1, "{result:?}");
+        assert_eq!(result.succeeded[0].name, SCHEME_NAME);
+        assert_eq!(result.succeeded[0].version, NEW_VERSION);
+        assert_eq!(result.failed.len(), 1, "{result:?}");
+        assert_eq!(result.failed[0].component.name, "Ghost Scheme");
+        assert_eq!(result.failed[0].kind, FailureKind::NoMatchingDownload);
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing::default());
+    sandbox.run_child(
+        "a_refused_update_does_not_stop_the_rest_of_the_selection",
+        store.url(),
+    );
+    assert_content(&sandbox.scheme_path(), NEW_CONTENT);
+    assert!(
+        sandbox
+            .registry_content()
+            .contains(&version_line(NEW_VERSION)),
+        "the registry was not bumped to {NEW_VERSION}: {}",
+        sandbox.registry_content()
+    );
 }
 
 #[test]

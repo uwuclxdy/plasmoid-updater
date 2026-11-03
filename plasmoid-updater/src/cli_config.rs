@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::Stop;
+
 const CONFIG_FILE_NAME: &str = "plasmoid-updater.toml";
 const CONFIG_DIR_ENV: &str = "PLASMOID_UPDATER_CONFIG_DIR";
 /// Points every store request at another OCS base URL. Undocumented on
@@ -48,8 +50,8 @@ fn with_api_url(config: libplasmoid_updater::Config) -> libplasmoid_updater::Con
     }
 }
 
-fn config_error(path: &Path, e: std::io::Error) -> libplasmoid_updater::Error {
-    libplasmoid_updater::Error::Io {
+fn config_error(path: &Path, e: std::io::Error) -> Stop {
+    Stop::Io {
         path: path.to_path_buf(),
         source: e,
     }
@@ -75,7 +77,7 @@ pub struct CliConfig {
 
 impl CliConfig {
     /// Loads CLI configuration from the TOML config file.
-    pub fn load() -> libplasmoid_updater::Result<Self> {
+    pub fn load() -> Result<Self, Stop> {
         let toml_config = Self::load_toml_config()?;
 
         let inner = with_api_url(
@@ -92,7 +94,7 @@ impl CliConfig {
         })
     }
 
-    fn load_toml_config() -> libplasmoid_updater::Result<TomlConfig> {
+    fn load_toml_config() -> Result<TomlConfig, Stop> {
         let Some(path) = config_path() else {
             return Ok(TomlConfig::default());
         };
@@ -104,16 +106,18 @@ impl CliConfig {
         let content = fs::read_to_string(&path).map_err(|e| config_error(&path, e))?;
 
         toml::from_str(&content).map_err(|e| {
-            libplasmoid_updater::Error::Config(format!(
+            Stop::Fatal(libplasmoid_updater::Error::Config(format!(
                 "failed to parse config file {}: {e}",
                 path.display()
-            ))
+            )))
         })
     }
 
-    pub fn edit_config() -> libplasmoid_updater::Result<()> {
+    pub fn edit_config() -> Result<(), Stop> {
         let path = config_path().ok_or_else(|| {
-            libplasmoid_updater::Error::Config("could not determine config directory".into())
+            Stop::Fatal(libplasmoid_updater::Error::Config(
+                "could not determine config directory".into(),
+            ))
         })?;
 
         ensure_config_exists(&path)?;
@@ -121,7 +125,7 @@ impl CliConfig {
     }
 }
 
-fn ensure_config_exists(path: &Path) -> libplasmoid_updater::Result<()> {
+fn ensure_config_exists(path: &Path) -> Result<(), Stop> {
     if path.exists() {
         return Ok(());
     }
@@ -130,14 +134,14 @@ fn ensure_config_exists(path: &Path) -> libplasmoid_updater::Result<()> {
     create_default_config(path)
 }
 
-fn create_config_directory(path: &Path) -> libplasmoid_updater::Result<()> {
+fn create_config_directory(path: &Path) -> Result<(), Stop> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| config_error(dir, e))?;
     }
     Ok(())
 }
 
-fn create_default_config(path: &Path) -> libplasmoid_updater::Result<()> {
+fn create_default_config(path: &Path) -> Result<(), Stop> {
     let default_content = r#"# plasmoid-updater configuration
 # excluded_packages = ["widget-name", "another.widget"]  # exact name or directory match
 # excluded_patterns = ["^org\\.kde\\.", "weather"]  # regex, matched against name and directory
@@ -151,7 +155,7 @@ fn create_default_config(path: &Path) -> libplasmoid_updater::Result<()> {
 /// Opens the config in `$EDITOR`, the way git does: the variable may hold a
 /// command with its own arguments (`code --wait`), so the shell splits it and
 /// the config path arrives as the command's positional argument.
-fn open_in_editor(path: &Path) -> libplasmoid_updater::Result<()> {
+fn open_in_editor(path: &Path) -> Result<(), Stop> {
     let editor = std::env::var("EDITOR")
         .ok()
         .filter(|editor| !editor.trim().is_empty())
@@ -162,7 +166,7 @@ fn open_in_editor(path: &Path) -> libplasmoid_updater::Result<()> {
         .arg("sh")
         .arg(path)
         .status()
-        .map_err(|e| editor_spawn_error(&editor, &e))?;
+        .map_err(|e| Stop::from(editor_spawn_error(&editor, &e)))?;
 
     if status.success() {
         Ok(())
@@ -170,7 +174,7 @@ fn open_in_editor(path: &Path) -> libplasmoid_updater::Result<()> {
         // `sh` reports 127 when the command it would run does not exist or is
         // not executable. Only a bare name was looked up on PATH; an absolute
         // path names one file, so claiming PATH would misname the search.
-        Err(libplasmoid_updater::Error::Config(
+        Err(Stop::from(libplasmoid_updater::Error::Config(
             if editor.contains('/') {
                 format!(
                     "editor '{editor}' could not be run (exit 127: not found or not executable)"
@@ -178,9 +182,9 @@ fn open_in_editor(path: &Path) -> libplasmoid_updater::Result<()> {
             } else {
                 format!("editor '{editor}' not found on PATH (exit 127)")
             },
-        ))
+        )))
     } else {
-        Err(editor_failure(&editor, &status))
+        Err(editor_failure(&editor, &status).into())
     }
 }
 

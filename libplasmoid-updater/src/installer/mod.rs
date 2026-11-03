@@ -108,6 +108,7 @@ pub(crate) fn update_component(
     reporter: &dyn Reporter,
     backups: &BackupLedger,
 ) -> Result<InstallOutcome, ComponentFailure> {
+    validate_selected_update(update)?;
     let component = &update.installed;
     let temp = download::create_temp_dir()?;
 
@@ -126,6 +127,19 @@ pub(crate) fn update_component(
         }
     }
     // temp is dropped here, auto-cleanup
+}
+
+/// Refuses a selected update with no download URL before a backup or a
+/// download starts, so the rest of the selection continues. An empty version
+/// is a store value (`<version>` may be empty) and installs like any other.
+fn validate_selected_update(update: &AvailableUpdate) -> Result<(), ComponentFailure> {
+    if update.download_url.is_empty() {
+        return Err(ComponentFailure::new(
+            FailureKind::NoMatchingDownload,
+            "the selected update has no download url",
+        ));
+    }
+    Ok(())
 }
 
 fn create_backup(
@@ -618,20 +632,19 @@ mod tests {
 
     fn system_scheme_update(path: PathBuf, latest: &str, content_id: u64) -> AvailableUpdate {
         AvailableUpdate::builder(
-            InstalledComponent {
-                name: "Fake Scheme".to_string(),
-                directory_name: "FakeScheme.colors".to_string(),
-                version: "1.0".to_string(),
-                component_type: ComponentType::ColorScheme,
+            InstalledComponent::new(
+                "Fake Scheme".to_string(),
+                "FakeScheme.colors".to_string(),
+                ComponentType::ColorScheme,
                 path,
-                is_system: true,
-                release_date: String::new(),
-            },
+            )
+            .with_version("1.0")
+            .with_system(true),
             content_id,
-            latest.to_string(),
-            "https://example.test/dl".to_string(),
-            "2026-02-02".to_string(),
+            latest,
         )
+        .download_url("https://example.test/dl")
+        .release_date("2026-02-02")
         .build()
     }
 
@@ -684,20 +697,18 @@ mod tests {
 
     fn user_scheme_update(path: PathBuf, latest: &str, content_id: u64) -> AvailableUpdate {
         AvailableUpdate::builder(
-            InstalledComponent {
-                name: "Fake Scheme".to_string(),
-                directory_name: "FakeScheme.colors".to_string(),
-                version: "1.0".to_string(),
-                component_type: ComponentType::ColorScheme,
+            InstalledComponent::new(
+                "Fake Scheme".to_string(),
+                "FakeScheme.colors".to_string(),
+                ComponentType::ColorScheme,
                 path,
-                is_system: false,
-                release_date: String::new(),
-            },
+            )
+            .with_version("1.0"),
             content_id,
-            latest.to_string(),
-            "https://example.test/dl".to_string(),
-            "2026-02-02".to_string(),
+            latest,
         )
+        .download_url("https://example.test/dl")
+        .release_date("2026-02-02")
         .build()
     }
 

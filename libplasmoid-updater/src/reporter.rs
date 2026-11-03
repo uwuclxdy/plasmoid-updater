@@ -8,7 +8,37 @@
 /// run, which reporters key progress rows on.
 ///
 /// The enum is `#[non_exhaustive]`: a new stage is not a breaking change, so
-/// match with a wildcard arm.
+/// match with a wildcard arm. The variants that carry fields are
+/// `#[non_exhaustive]` as well, so a field added to one later ships in a minor
+/// release: an outside match names the fields it uses and ends with `..`.
+///
+/// ```
+/// # use libplasmoid_updater::Event;
+/// fn component_of(event: &Event) -> Option<&str> {
+///     match event {
+///         Event::Downloading { name, .. }
+///         | Event::Installed { name, .. }
+///         | Event::Failed { name, .. } => Some(name),
+///         _ => None,
+///     }
+/// }
+/// ```
+///
+/// A match naming every field of a variant without `..` does not compile:
+///
+/// ```compile_fail
+/// # use libplasmoid_updater::Event;
+/// fn component_of(event: &Event) -> Option<&str> {
+///     match event {
+///         Event::Failed {
+///             name,
+///             id,
+///             message,
+///         } => Some(name),
+///         _ => None,
+///     }
+/// }
+/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -18,6 +48,7 @@ pub enum Event {
     /// Emitted once by [`check`](crate::check) and [`update`](crate::update)
     /// after the scan, carrying how many installed components this run will
     /// check.
+    #[non_exhaustive]
     Checking {
         /// Number of installed components the run will check.
         components: usize,
@@ -29,6 +60,7 @@ pub enum Event {
     /// print its own output below without a half-drawn line above it.
     Checked,
     /// A chunk of one component's download arrived.
+    #[non_exhaustive]
     Downloading {
         /// Display name of the component being downloaded.
         name: String,
@@ -43,6 +75,7 @@ pub enum Event {
         total: Option<u64>,
     },
     /// One component finished installing.
+    #[non_exhaustive]
     Installed {
         /// Display name of the component that installed.
         name: String,
@@ -56,6 +89,7 @@ pub enum Event {
     /// One component failed; the row lands in
     /// [`UpdateResult::failed`](crate::UpdateResult::failed) and the run
     /// continues with the remaining components.
+    #[non_exhaustive]
     Failed {
         /// Display name of the component that failed.
         name: String,

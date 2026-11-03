@@ -40,6 +40,10 @@ const CATEGORY_COMIC_PLUGIN: u16 = 155;
 ///
 /// Maps to KDE Store category IDs and determines installation paths,
 /// registry files, and update strategies.
+///
+/// The enum is `#[non_exhaustive]`: match with a wildcard arm, so a component
+/// type added later is not a breaking change.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentType {
@@ -416,7 +420,11 @@ impl std::fmt::Display for ComponentType {
 // -- Internal types --
 
 /// A KDE component installed on the local system.
+///
+/// The struct is `#[non_exhaustive]`: build it with
+/// [`InstalledComponent::new`], never a struct literal from outside this crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InstalledComponent {
     /// Display name from the component's metadata, or the directory name when
     /// the metadata has none.
@@ -441,6 +449,117 @@ pub struct InstalledComponent {
 }
 
 impl InstalledComponent {
+    /// Builds a user component from what it is and where it lives.
+    ///
+    /// The version starts at `"0.0.0"` (unknown) and the release date empty;
+    /// set them, and whether the component is system-wide, with
+    /// [`with_version`](Self::with_version),
+    /// [`with_release_date`](Self::with_release_date) and
+    /// [`with_system`](Self::with_system).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use libplasmoid_updater::{ComponentType, InstalledComponent};
+    ///
+    /// let component = InstalledComponent::new(
+    ///     "Fake Scheme",
+    ///     "FakeScheme.colors",
+    ///     ComponentType::ColorScheme,
+    ///     "/tmp/FakeScheme.colors",
+    /// )
+    /// .with_version("1.0")
+    /// .with_system(true)
+    /// .with_release_date("2026-01-01");
+    /// assert_eq!(component.version, "1.0");
+    /// assert!(component.is_system);
+    /// assert_eq!(component.release_date, "2026-01-01");
+    /// ```
+    pub fn new(
+        name: impl Into<String>,
+        directory_name: impl Into<String>,
+        component_type: ComponentType,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            directory_name: directory_name.into(),
+            version: "0.0.0".to_string(),
+            component_type,
+            path: path.into(),
+            is_system: false,
+            release_date: String::new(),
+        }
+    }
+
+    /// Sets the installed version recorded in the metadata or the KNewStuff
+    /// registry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use libplasmoid_updater::{ComponentType, InstalledComponent};
+    ///
+    /// let component = InstalledComponent::new(
+    ///     "Fake Scheme",
+    ///     "FakeScheme.colors",
+    ///     ComponentType::ColorScheme,
+    ///     "/tmp/FakeScheme.colors",
+    /// )
+    /// .with_version("1.0");
+    /// assert_eq!(component.version, "1.0");
+    /// ```
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = version.into();
+        self
+    }
+
+    /// Sets whether the component lives in a system-wide directory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use libplasmoid_updater::{ComponentType, InstalledComponent};
+    ///
+    /// let component = InstalledComponent::new(
+    ///     "Fake Scheme",
+    ///     "FakeScheme.colors",
+    ///     ComponentType::ColorScheme,
+    ///     "/usr/share/color-schemes/FakeScheme.colors",
+    /// )
+    /// .with_system(true);
+    /// assert!(component.is_system);
+    /// ```
+    #[must_use]
+    pub fn with_system(mut self, is_system: bool) -> Self {
+        self.is_system = is_system;
+        self
+    }
+
+    /// Sets the release date the store or the KNewStuff registry records
+    /// (`YYYY-MM-DD` when known).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use libplasmoid_updater::{ComponentType, InstalledComponent};
+    ///
+    /// let component = InstalledComponent::new(
+    ///     "Fake Scheme",
+    ///     "FakeScheme.colors",
+    ///     ComponentType::ColorScheme,
+    ///     "/tmp/FakeScheme.colors",
+    /// )
+    /// .with_release_date("2026-01-01");
+    /// assert_eq!(component.release_date, "2026-01-01");
+    /// ```
+    #[must_use]
+    pub fn with_release_date(mut self, release_date: impl Into<String>) -> Self {
+        self.release_date = release_date.into();
+        self
+    }
+
     /// The installed path as a string: unique per component within a run,
     /// unlike the directory name, so progress events key their rows on it.
     pub(crate) fn event_id(&self) -> String {
@@ -449,7 +568,12 @@ impl InstalledComponent {
 }
 
 /// An available update for an installed component, with download metadata.
+///
+/// The struct is `#[non_exhaustive]`: build it with
+/// [`AvailableUpdate::builder`], never a struct literal from outside this
+/// crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AvailableUpdate {
     /// The component this update would replace.
     pub installed: InstalledComponent,
@@ -472,7 +596,13 @@ pub struct AvailableUpdate {
 }
 
 /// One component that failed inside an otherwise successful run.
+///
+/// The struct is `#[non_exhaustive]`: callers read its fields, and the
+/// [`check`](crate::check) (in [`CheckResult::unavailable`](crate::CheckResult::unavailable)),
+/// [`update`](crate::update) and [`install`](crate::install) runs produce the
+/// rows. A caller never builds one.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Failure {
     /// The component the failure is about.
     pub component: InstalledComponent,
@@ -487,7 +617,9 @@ pub struct Failure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
-    /// The store entry had no download link matching its own version.
+    /// The update carries no usable store metadata: the store entry had no
+    /// download link matching its own version, or the selected update's
+    /// download URL is empty.
     NoMatchingDownload,
     /// Downloading the archive or file failed.
     Download,
@@ -527,8 +659,49 @@ impl std::fmt::Display for FailureKind {
     }
 }
 
-/// Builder for constructing [`AvailableUpdate`] instances with optional fields.
-pub(crate) struct AvailableUpdateBuilder {
+/// The KDE Store page URL for a store content id.
+pub(crate) fn store_page_url(content_id: u64) -> String {
+    format!("https://store.kde.org/p/{content_id}")
+}
+
+/// Builds an [`AvailableUpdate`], the remaining store fields unset until their
+/// setter fills them.
+///
+/// Start from [`AvailableUpdate::builder`], which takes the installed
+/// component, the store content id and the version the store advertises.
+///
+/// # Examples
+///
+/// ```
+/// use libplasmoid_updater::{AvailableUpdate, ComponentType, InstalledComponent};
+///
+/// let builder = AvailableUpdate::builder(
+///     InstalledComponent::new(
+///         "Fake Scheme",
+///         "FakeScheme.colors",
+///         ComponentType::ColorScheme,
+///         "/tmp/FakeScheme.colors",
+///     )
+///     .with_version("1.0"),
+///     42,
+///     "2.0",
+/// );
+/// let copied = builder.clone();
+/// assert!(format!("{copied:?}").contains("FakeScheme.colors"));
+///
+/// let update = builder
+///     .download_url("https://example.org/FakeScheme.tar.gz")
+///     .release_date("2026-01-01")
+///     .download_size(Some(1024))
+///     .build();
+///
+/// assert_eq!(update.latest_version, "2.0");
+/// assert_eq!(update.store_url, "https://store.kde.org/p/42");
+/// assert_eq!(update.download_size, Some(1024));
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct AvailableUpdateBuilder {
     installed: InstalledComponent,
     content_id: u64,
     latest_version: String,
@@ -539,24 +712,39 @@ pub(crate) struct AvailableUpdateBuilder {
 }
 
 impl AvailableUpdateBuilder {
-    pub(crate) fn checksum(mut self, checksum: Option<String>) -> Self {
+    /// Sets the URL the archive or file downloads from, empty when unset.
+    pub fn download_url(mut self, download_url: impl Into<String>) -> Self {
+        self.download_url = download_url.into();
+        self
+    }
+
+    /// Sets the store change date of the newer entry, empty when unset.
+    pub fn release_date(mut self, release_date: impl Into<String>) -> Self {
+        self.release_date = release_date.into();
+        self
+    }
+
+    /// Sets the checksum the store advertises for this version.
+    pub fn checksum(mut self, checksum: Option<String>) -> Self {
         self.checksum = checksum;
         self
     }
 
-    pub(crate) fn download_size(mut self, size: Option<u64>) -> Self {
+    /// Sets the advertised download size in bytes.
+    pub fn download_size(mut self, size: Option<u64>) -> Self {
         self.download_size = size;
         self
     }
 
-    pub(crate) fn build(self) -> AvailableUpdate {
-        let store_url = format!("https://store.kde.org/p/{}", self.content_id);
+    /// Builds the update, filling in the store page URL from the content id.
+    #[must_use]
+    pub fn build(self) -> AvailableUpdate {
         AvailableUpdate {
             installed: self.installed,
             content_id: self.content_id,
             latest_version: self.latest_version,
             download_url: self.download_url,
-            store_url,
+            store_url: store_page_url(self.content_id),
             release_date: self.release_date,
             checksum: self.checksum,
             download_size: self.download_size,
@@ -565,19 +753,64 @@ impl AvailableUpdateBuilder {
 }
 
 impl AvailableUpdate {
-    pub(crate) fn builder(
+    /// Starts building an update for an installed component.
+    ///
+    /// The third argument is the version the store advertises, empty when the
+    /// store entry names none. It is required here, not a setter, so a caller
+    /// cannot leave it out by accident. The remaining store fields have named
+    /// setters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use libplasmoid_updater::{AvailableUpdate, ComponentType, InstalledComponent};
+    ///
+    /// let update = AvailableUpdate::builder(
+    ///     InstalledComponent::new(
+    ///         "Fake Scheme",
+    ///         "FakeScheme.colors",
+    ///         ComponentType::ColorScheme,
+    ///         "/tmp/FakeScheme.colors",
+    ///     )
+    ///     .with_version("1.0"),
+    ///     42,
+    ///     "2.0",
+    /// )
+    /// .download_url("https://example.org/FakeScheme.tar.gz")
+    /// .build();
+    /// assert_eq!(update.store_url, "https://store.kde.org/p/42");
+    /// assert_eq!(update.latest_version, "2.0");
+    /// ```
+    ///
+    /// Omitting the version does not compile:
+    ///
+    /// ```compile_fail
+    /// use std::path::PathBuf;
+    ///
+    /// use libplasmoid_updater::{AvailableUpdate, ComponentType, InstalledComponent};
+    ///
+    /// let update = AvailableUpdate::builder(
+    ///     InstalledComponent::new(
+    ///         "Fake Scheme".to_string(),
+    ///         "FakeScheme.colors".to_string(),
+    ///         ComponentType::ColorScheme,
+    ///         PathBuf::from("/tmp/FakeScheme.colors"),
+    ///     ),
+    ///     42,
+    /// )
+    /// .build();
+    /// ```
+    pub fn builder(
         installed: InstalledComponent,
         content_id: u64,
-        latest_version: String,
-        download_url: String,
-        release_date: String,
+        latest_version: impl Into<String>,
     ) -> AvailableUpdateBuilder {
         AvailableUpdateBuilder {
             installed,
             content_id,
-            latest_version,
-            download_url,
-            release_date,
+            latest_version: latest_version.into(),
+            download_url: String::new(),
+            release_date: String::new(),
             checksum: None,
             download_size: None,
         }
@@ -663,7 +896,14 @@ impl PackageMetadata {
 /// Diagnostic information about a component that could not be checked or updated.
 ///
 /// Returned as part of [`CheckResult::diagnostics`](crate::CheckResult::diagnostics).
+///
+/// The struct is `#[non_exhaustive]`: callers read its fields, and only
+/// [`check`](crate::check) produces them. [`update`](crate::update) returns no
+/// diagnostics: it folds every component it could not check into
+/// [`UpdateResult::skipped`](crate::UpdateResult::skipped) names.
+/// [`install`](crate::install) checks nothing, so its `skipped` is empty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Diagnostic {
     /// Display name of the component.
     pub name: String,
@@ -748,7 +988,10 @@ pub(crate) struct UpdateCheckResult {
     /// Components whose store entry offers no download link for its version, so
     /// `update` reports a failure rather than skipping them.
     pub no_matching_download: Vec<NoMatchingDownload>,
-    /// Names of components dropped by the configuration's exclusion rules.
+    /// Names of components the run does not attempt: excluded by the
+    /// configuration's exclusion rules, and — in a system run — components
+    /// with no matching store entry or a store entry of a different component
+    /// type.
     pub skipped: Vec<String>,
 }
 
@@ -829,6 +1072,11 @@ mod tests {
         assert_eq!(ComponentType::PlasmaStyle.category_id(), 104);
         assert_eq!(ComponentType::SplashScreen.category_id(), 716);
         assert_eq!(ComponentType::GlobalTheme.category_id(), 722);
+    }
+
+    #[test]
+    fn the_store_page_url_is_the_public_page_for_the_content_id() {
+        assert_eq!(store_page_url(2380745), "https://store.kde.org/p/2380745");
     }
 
     #[test]

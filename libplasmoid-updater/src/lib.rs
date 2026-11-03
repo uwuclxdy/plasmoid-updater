@@ -63,7 +63,8 @@ pub use config::Config;
 pub use error::Error;
 pub use reporter::{Event, Reporter};
 pub use types::{
-    AvailableUpdate, ComponentType, Diagnostic, Failure, FailureKind, InstalledComponent,
+    AvailableUpdate, AvailableUpdateBuilder, ComponentType, Diagnostic, Failure, FailureKind,
+    InstalledComponent,
 };
 
 /// A specialized `Result` type for libplasmoid-updater operations.
@@ -76,7 +77,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Components matching [`Config::excluded_packages`] or
 /// [`Config::excluded_patterns`] leave `available_updates` and are listed in
-/// [`CheckResult::skipped`] — this is the one place exclusions apply.
+/// [`CheckResult::skipped`]; [`update`] applies the same rules to its own run.
 ///
 /// `available_updates` is empty when every checked component is current —
 /// that is not an error. `diagnostics` can still list components that could
@@ -116,13 +117,41 @@ pub fn check(config: &Config, reporter: &dyn Reporter) -> Result<CheckResult> {
 ///
 /// Returned by [`check`]. Contains the full [`AvailableUpdate`] data
 /// for each pending update, plus diagnostics for components that could not be checked.
-#[derive(Debug, Clone, Serialize)]
+///
+/// The struct is `#[non_exhaustive]`, so a later field ships in a minor
+/// release. [`check`] produces it; a host builds a run of its own from
+/// [`CheckResult::default`] and field assignment, never a struct literal from
+/// outside this crate:
+///
+/// ```
+/// use libplasmoid_updater::CheckResult;
+///
+/// let mut result = CheckResult::default();
+/// result.skipped.push("excluded.widget".to_string());
+/// assert_eq!(result.skipped, vec!["excluded.widget".to_string()]);
+/// ```
+///
+/// ```compile_fail
+/// use libplasmoid_updater::CheckResult;
+///
+/// let _ = CheckResult {
+///     available_updates: Vec::new(),
+///     skipped: Vec::new(),
+///     diagnostics: Vec::new(),
+///     unavailable: Vec::new(),
+/// };
+/// ```
+#[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
 pub struct CheckResult {
     /// Available updates found during the check.
     pub available_updates: Vec<AvailableUpdate>,
-    /// Names of components excluded by the [`Config`]'s exclusion rules.
-    /// Exclusions are applied once, here: excluded components never appear in
-    /// `available_updates`.
+    /// Names of components the run did not attempt: excluded by the
+    /// [`Config`]'s exclusion rules, and — in a `--system` run — components
+    /// with no matching store entry or whose store entry is of a different
+    /// component type.
+    ///
+    /// An excluded component never appears in `available_updates`.
     pub skipped: Vec<String>,
     /// Components that could not be checked, with the reason for each failure.
     pub diagnostics: Vec<Diagnostic>,
@@ -266,14 +295,18 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
 /// [`check`] filtered by a prompt or a flag.
 ///
 /// Installs exactly the selection it is given: [`Config`]'s exclusions do not
-/// apply here. They are applied once, in [`check`] — a selection built from
-/// [`CheckResult::available_updates`] already has the excluded components
-/// removed. An empty selection installs nothing, but still takes the run lock
-/// and repairs what a killed run left stranded, so an interrupted install is
-/// recovered even when this run has nothing to install. When another run
-/// already holds the lock, an empty selection returns an empty result and
-/// leaves the repair to that run; a non-empty selection still fails. Like
-/// [`update`], this never prompts and never restarts plasmashell.
+/// apply here. [`check`] and [`update`] apply them to their own results — a
+/// selection built from [`CheckResult::available_updates`] already has the
+/// excluded components removed. An empty selection installs nothing, but still
+/// takes the run lock and repairs what a killed run left stranded, so an
+/// interrupted install is recovered even when this run has nothing to install.
+/// When another run already holds the lock, an empty selection returns an
+/// empty result and leaves the repair to that run; a non-empty selection still
+/// fails. Like [`update`], this never prompts and never restarts plasmashell.
+///
+/// A selected update whose [`download_url`](AvailableUpdate::download_url) is
+/// empty is a [`FailureKind::NoMatchingDownload`] row: it is refused before any
+/// backup or download starts, and the rest of the selection continues.
 ///
 /// # Errors
 ///
@@ -332,7 +365,21 @@ fn repair_after_interrupted_run(config: &Config) {
 ///
 /// [`Failure`] rows keep the full [`InstalledComponent`]; `skipped` lists the
 /// names of excluded and unresolvable components.
+///
+/// The struct is `#[non_exhaustive]`, so a later field ships in a minor
+/// release: [`update`] and [`install`] produce it, and a host builds a run of
+/// its own from [`UpdateResult::default`] and field assignment, never a struct
+/// literal from outside this crate.
+///
+/// ```
+/// use libplasmoid_updater::UpdateResult;
+///
+/// let mut result = UpdateResult::default();
+/// result.skipped.push("excluded.widget".to_string());
+/// assert_eq!(result.skipped, vec!["excluded.widget".to_string()]);
+/// ```
 #[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
 pub struct UpdateResult {
     /// Components that installed successfully and whose post-install version
     /// was verified, each carrying that installed version and the store's

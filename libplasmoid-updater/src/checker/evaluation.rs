@@ -147,16 +147,12 @@ pub(crate) fn evaluate_store_entry(
         };
     };
 
-    let update = AvailableUpdate::builder(
-        component.clone(),
-        content_id,
-        entry.version.clone(),
-        download_info.url,
-        entry.changed_date.clone(),
-    )
-    .checksum(download_info.checksum)
-    .download_size(download_info.size_kb.and_then(|kb| kb.checked_mul(1024)))
-    .build();
+    let update = AvailableUpdate::builder(component.clone(), content_id, entry.version.clone())
+        .download_url(download_info.url)
+        .release_date(entry.changed_date.clone())
+        .checksum(download_info.checksum)
+        .download_size(download_info.size_kb.and_then(|kb| kb.checked_mul(1024)))
+        .build();
 
     ComponentCheckResult::Update(Box::new(update))
 }

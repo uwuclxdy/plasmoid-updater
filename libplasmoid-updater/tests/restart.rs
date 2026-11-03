@@ -22,7 +22,7 @@ fn a_missing_systemctl_is_a_missing_tool() {
         let done = std::path::PathBuf::from(std::env::var_os(DONE_VAR).unwrap());
         std::fs::write(&done, b"ok").unwrap();
         match err {
-            libplasmoid_updater::Error::MissingTool { tool } => assert_eq!(tool, "systemctl"),
+            libplasmoid_updater::Error::MissingTool { tool, .. } => assert_eq!(tool, "systemctl"),
             other => panic!("expected MissingTool for a spawn failure, got {other:?}"),
         }
         return;

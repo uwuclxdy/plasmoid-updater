@@ -126,8 +126,11 @@ fn compile_exclude_patterns(patterns: &[String]) -> Option<regex::RegexSet> {
 }
 
 /// Applies `config`'s exclusion rules to a check result: excluded components
-/// leave `updates` and their names land in `skipped`. This is the one place
-/// exclusions are applied; every later stage works on the filtered list.
+/// leave `updates` and their names land in `skipped`.
+///
+/// [`check`](crate::check) and [`update`](crate::update) each call it on their
+/// own result, and every later stage works on the filtered list;
+/// [`install`](crate::install) applies no exclusions.
 ///
 /// A component with no matching download is filtered here too: an excluded
 /// component the store could not serve stays a skip, never a failure row.

@@ -257,7 +257,7 @@ fn escape_xml_text(s: &str) -> Cow<'_, str> {
 /// entries a truncated registry still holds.
 pub(super) fn add_entry(xml: &str, entry: &NewEntry) -> Result<String> {
     let category_id = entry.component_type.category_id();
-    let store_url = format!("https://store.kde.org/p/{}", entry.content_id);
+    let store_url = crate::types::store_page_url(entry.content_id);
     let installed_file =
         utils::registry_installed_file_path(entry.installed_path, entry.component_type);
 
@@ -734,6 +734,17 @@ mod tests {
             parsed[0].installed_files,
             vec!["/tmp/a&b<scheme>/metadata.json"]
         );
+    }
+
+    #[test]
+    fn add_entry_writes_the_store_page_homepage() {
+        let entry = new_entry(Path::new("/tmp/scheme"));
+
+        let out = add_entry(&create_empty_registry(), &entry).unwrap();
+
+        let (_, rest) = out.split_once("<homepage>").unwrap();
+        let (homepage, _) = rest.split_once("</homepage>").unwrap();
+        assert_eq!(homepage, "https://store.kde.org/p/7");
     }
 
     #[test]
