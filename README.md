@@ -182,8 +182,10 @@ Run `topgrade --edit-config` and add the following under `[commands]`:
 | SDDM Themes                | 101 (system only)  |
 | Icon Themes                | 132                |
 | Wallpapers                 | 299                |
+| Cursor Themes              | 107                |
+| Plasma Comic Plugins       | 155                |
 
-SDDM themes live under `/usr/share/sddm/themes` and are only handled with `--system` (needs root). Installs and scans respect `$XDG_DATA_HOME` (default `~/.local/share`).
+SDDM themes live under `/usr/share/sddm/themes` and are only handled with `--system` (needs root). Installs and scans respect `$XDG_DATA_HOME` (default `~/.local/share`), except cursor themes, which install under `~/.icons` as KNewStuff's `xcursor.knsrc` does.
 
 ---
 

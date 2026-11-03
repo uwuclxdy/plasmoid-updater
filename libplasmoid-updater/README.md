@@ -25,7 +25,7 @@ Runtime dependencies:
 
 ## Supported Components
 
-Plasma Widgets, Wallpaper Plugins, KWin Effects/Scripts/Switchers, Global Themes, Plasma Styles, Color Schemes, Splash Screens, SDDM Themes, Icon Themes, Wallpapers, and Aurorae Decorations.
+Plasma Widgets, Wallpaper Plugins, KWin Effects/Scripts/Switchers, Global Themes, Plasma Styles, Color Schemes, Splash Screens, SDDM Themes, Icon Themes, Cursor Themes, Wallpapers, Plasma Comic Plugins, and Aurorae Decorations.
 
 ## API
 
@@ -77,7 +77,7 @@ Built with a builder table via `Config::new()`:
 - fields: `name`, `reason`, `installed_version: Option<String>`, `available_version: Option<String>`, `content_id: Option<u64>`
 
 `ComponentType` : enum of all supported KDE component kinds:
-- variants: `PlasmaWidget`, `WallpaperPlugin`, `KWinEffect`, `KWinScript`, `KWinSwitcher`, `GlobalTheme`, `PlasmaStyle`, `AuroraeDecoration`, `ColorScheme`, `SplashScreen`, `SddmTheme`, `IconTheme`, `Wallpaper`
+- variants: `PlasmaWidget`, `WallpaperPlugin`, `KWinEffect`, `KWinScript`, `KWinSwitcher`, `GlobalTheme`, `PlasmaStyle`, `AuroraeDecoration`, `ColorScheme`, `SplashScreen`, `SddmTheme`, `IconTheme`, `Wallpaper`, `CursorTheme`, `ComicPlugin`
 - `user_path() -> PathBuf`, `system_path() -> PathBuf`, `all() -> &[ComponentType]`, `all_user() -> &[ComponentType]`
 
 `InstalledComponent` : a KDE component on the local system:
