@@ -11,8 +11,6 @@ mod install;
 mod lock;
 mod plasmashell;
 pub(crate) mod privilege;
-#[cfg(test)]
-pub(crate) mod testutil;
 
 use std::{
     fs,
@@ -453,36 +451,8 @@ fn handle_installation_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::logs::captured_logs_while;
     use crate::types::ComponentType;
-    use std::sync::{Mutex, OnceLock};
-
-    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    static RECORDER: Recorder = Recorder;
-
-    struct Recorder;
-
-    impl log::Log for Recorder {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            LINES.lock().unwrap().push(record.args().to_string());
-        }
-
-        fn flush(&self) {}
-    }
-
-    fn logged_by(run: impl FnOnce()) -> Vec<String> {
-        static INSTALLED: OnceLock<()> = OnceLock::new();
-        INSTALLED.get_or_init(|| {
-            log::set_logger(&RECORDER).unwrap();
-            log::set_max_level(log::LevelFilter::Trace);
-        });
-        LINES.lock().unwrap().clear();
-        run();
-        LINES.lock().unwrap().clone()
-    }
 
     fn color_scheme(path: &Path) -> InstalledComponent {
         InstalledComponent {
@@ -509,7 +479,7 @@ mod tests {
         let component = color_scheme(&target);
         let install_failure = ComponentFailure::new(FailureKind::Install, "install broke");
 
-        let lines = logged_by(|| {
+        let lines = captured_logs_while(|| {
             let outcome = handle_installation_failure(&backup, &component, &install_failure);
             assert!(outcome.is_err(), "the restore was expected to fail");
         });
@@ -523,6 +493,14 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(&format!("{:?}", component.name))),
             "the restore failure log does not repr the component name: {lines:?}",
+        );
+        // The buffer is shared with the other tests in this process, so the
+        // assertion above can be met by a line another test logged in the same
+        // window; this one names the message only the failed restore emits.
+        assert!(
+            lines.iter().any(|line| line.contains("failed to restore")
+                && line.contains(&format!("{:?}", component.name))),
+            "the restore failure log does not name the failed restore: {lines:?}",
         );
     }
 
@@ -540,7 +518,7 @@ mod tests {
         );
         failure.process_may_still_run = true;
 
-        let lines = logged_by(|| {
+        let lines = captured_logs_while(|| {
             let refusal = handle_installation_failure(&backup, &component, &failure).unwrap_err();
             assert_eq!(refusal.kind, FailureKind::Install);
             assert!(
@@ -726,7 +704,7 @@ mod tests {
         const ROOT: &str = "PU_TEST_VERSION_READ_ROOT";
 
         if std::env::var_os(CHILD).is_some() {
-            crate::installer::testutil::capture_logs();
+            crate::testutil::logs::capture_logs();
             let root = PathBuf::from(std::env::var(ROOT).unwrap());
             let share = root.join("share");
             let data = root.join("data");
@@ -744,7 +722,7 @@ mod tests {
             let system_path = PathBuf::from("/usr/share/color-schemes/FakeScheme.colors");
             let outcome = verify_installed_version(&system_scheme_update(system_path, "2.0", 42));
             assert!(!outcome.verified);
-            let logs = crate::installer::testutil::captured_logs();
+            let logs = crate::testutil::logs::captured_logs();
             assert!(
                 logs.iter().any(|line| line.starts_with("paths: ")
                     && line.contains(&share.display().to_string())),

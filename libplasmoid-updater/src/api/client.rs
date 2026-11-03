@@ -353,10 +353,10 @@ fn parse_retry_after(response: &reqwest::blocking::Response) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::testutil::{ok, serve};
 
     fn entry(id: u64) -> String {
         format!(
@@ -385,45 +385,9 @@ mod tests {
     }
 
     /// Serves `bodies[page]` for each catalog page request, and counts them.
-    fn serve(bodies: Vec<String>) -> (String, Arc<AtomicUsize>) {
+    fn serve_pages(bodies: Vec<String>) -> (String, Arc<AtomicUsize>) {
         let bodies = Arc::new(bodies);
-        let requests = Arc::new(AtomicUsize::new(0));
-        let served = Arc::clone(&requests);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let bodies = Arc::clone(&bodies);
-                let served = Arc::clone(&served);
-                std::thread::spawn(move || respond(stream, &bodies, &served));
-            }
-        });
-        (format!("http://127.0.0.1:{port}/ocs/v1"), requests)
-    }
-
-    fn respond(mut stream: TcpStream, bodies: &[String], requests: &AtomicUsize) {
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut request_line = String::new();
-        if reader.read_line(&mut request_line).is_err() {
-            return;
-        }
-        loop {
-            let mut header = String::new();
-            match reader.read_line(&mut header) {
-                Ok(0) | Err(_) => break,
-                Ok(_) if header == "\r\n" || header == "\n" => break,
-                Ok(_) => {}
-            }
-        }
-        let target = request_line.split_whitespace().nth(1).unwrap_or("");
-        requests.fetch_add(1, Ordering::SeqCst);
-        let body = bodies.get(page_of(target)).cloned().unwrap_or_default();
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(body.as_bytes());
+        serve(move |target| ok(bodies.get(page_of(target)).cloned().unwrap_or_default()))
     }
 
     fn client_for(base_url: String) -> ApiClient {
@@ -432,7 +396,7 @@ mod tests {
 
     #[test]
     fn catalog_pages_are_deduplicated_by_content_id() {
-        let (base, _requests) = serve(vec![
+        let (base, _requests) = serve_pages(vec![
             ocs(Some(101), &entry(1)),
             ocs(Some(101), &format!("{}{}", entry(1), entry(2))),
         ]);
@@ -444,7 +408,7 @@ mod tests {
 
     #[test]
     fn catalog_page_without_totalitems_keeps_its_entries_and_fetches_no_more_pages() {
-        let (base, requests) = serve(vec![ocs(None, &entry(1))]);
+        let (base, requests) = serve_pages(vec![ocs(None, &entry(1))]);
         let catalog = client_for(base).fetch_all(&[ComponentType::PlasmaWidget]);
         let ids: Vec<u64> = catalog.entries.iter().map(|item| item.id).collect();
         assert_eq!(ids, vec![1]);
@@ -458,7 +422,7 @@ mod tests {
 
     #[test]
     fn a_failed_first_page_leaves_the_catalog_empty_and_asks_for_no_more() {
-        let (base, _requests) = serve(vec![
+        let (base, _requests) = serve_pages(vec![
             "<html>maintenance</html>".to_string(),
             ocs(Some(200), &entry(1)),
         ]);
@@ -473,7 +437,7 @@ mod tests {
 
     #[test]
     fn a_bad_page_after_the_first_does_not_stop_later_pages() {
-        let (base, _requests) = serve(vec![
+        let (base, _requests) = serve_pages(vec![
             ocs(Some(300), &entry(1)),
             "<html>maintenance</html>".to_string(),
             ocs(Some(300), &entry(3)),

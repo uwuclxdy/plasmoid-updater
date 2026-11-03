@@ -985,6 +985,22 @@ fn edit_config_splits_an_editor_command_with_arguments() {
     );
 }
 
+/// `--edit-config` never parses the file: it must still open a config whose
+/// keys the run itself would refuse.
+#[test]
+fn edit_config_opens_a_config_with_an_unknown_key() {
+    let sandbox = Sandbox::new();
+    std::fs::write(
+        sandbox.config_dir().join("plasmoid-updater.toml"),
+        "asume_yes = true\n",
+    )
+    .unwrap();
+
+    let run = edit_config(&sandbox, "true");
+
+    assert_eq!(run.code, 0, "{run}");
+}
+
 #[test]
 fn completions_print_a_shell_script_on_stdout() {
     let sandbox = Sandbox::new();

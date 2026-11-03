@@ -63,7 +63,7 @@ impl Log for StderrLogger {
 /// so a multi-line message never reads as several log entries.
 fn line(level: Level, message: &str, color: bool) -> String {
     let level = level.as_str().to_ascii_lowercase();
-    let message = message.replace('\n', "\n  ");
+    let message = message.trim_end_matches('\n').replace('\n', "\n  ");
     if color {
         format!("\u{1b}[1m{level}:\u{1b}[0m {message}")
     } else {
@@ -103,6 +103,14 @@ mod tests {
         assert_eq!(
             line(log::Level::Error, "unclosed group\nin pattern", true),
             "\u{1b}[1merror:\u{1b}[0m unclosed group\n  in pattern"
+        );
+    }
+
+    #[test]
+    fn a_trailing_newline_leaves_no_blank_indented_line() {
+        assert_eq!(
+            line(log::Level::Error, "bad config\n  | snippet\n", false),
+            "error: bad config\n    | snippet"
         );
     }
 

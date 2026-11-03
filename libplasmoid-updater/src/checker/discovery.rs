@@ -269,51 +269,13 @@ fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::sync::{Mutex, Once};
-
     use super::*;
 
-    static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    static CAPTURE: Capture = Capture;
-    static INSTALL: Once = Once::new();
-
-    /// Keeps the warnings the discovery target logs, so a test can read them.
-    struct Capture;
-
-    impl log::Log for Capture {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            if record.level() <= log::Level::Warn && record.target() == "discovery" {
-                captured().push(record.args().to_string());
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    /// The captured warnings. A test that fails while holding the lock poisons
-    /// it, and every later log must keep working, so a poisoned lock is read
-    /// through rather than propagated.
-    fn captured() -> std::sync::MutexGuard<'static, Vec<String>> {
-        CAPTURED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn capture_discovery_warnings() {
-        INSTALL.call_once(|| {
-            let _ = log::set_logger(&CAPTURE);
-            log::set_max_level(log::LevelFilter::Warn);
-        });
-        captured().clear();
-    }
+    use crate::testutil::logs::{capture_logs, captured_warnings_for};
 
     #[test]
     fn an_unstattable_entry_is_reported_and_the_scan_continues() {
-        capture_discovery_warnings();
+        capture_logs();
         let dir = tempfile::tempdir().unwrap();
         let dangling = dir.path().join("org.example.dangling");
         std::os::unix::fs::symlink(dir.path().join("missing-target"), &dangling).unwrap();
@@ -330,7 +292,7 @@ mod tests {
 
         assert_eq!(components.len(), 1);
         assert_eq!(components[0].directory_name, "org.example.good");
-        let warnings = captured().clone();
+        let warnings = captured_warnings_for("discovery");
         assert!(
             warnings
                 .iter()
@@ -349,7 +311,7 @@ mod tests {
         if crate::installer::privilege::is_root() {
             return; // root searches a directory whatever its mode
         }
-        capture_discovery_warnings();
+        capture_logs();
         let dir = tempfile::tempdir().unwrap();
         let blocked = dir.path().join("blocked");
         std::fs::create_dir(&blocked).unwrap();
@@ -362,7 +324,7 @@ mod tests {
             metadata.is_none(),
             "an unreadable package reported metadata"
         );
-        let warnings = captured().clone();
+        let warnings = captured_warnings_for("discovery");
         let json = blocked.join("metadata.json");
         assert!(
             warnings
@@ -376,7 +338,7 @@ mod tests {
 
     #[test]
     fn read_metadata_skips_a_metadata_json_past_the_cap() {
-        capture_discovery_warnings();
+        capture_logs();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.json");
         std::fs::write(
@@ -391,7 +353,7 @@ mod tests {
         let metadata = read_metadata(dir.path());
 
         assert!(metadata.is_none(), "a capped metadata.json was read");
-        let warnings = captured().clone();
+        let warnings = captured_warnings_for("discovery");
         assert!(
             warnings
                 .iter()

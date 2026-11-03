@@ -1033,29 +1033,11 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_sudo() {
-        if !is_root() {
-            assert!(needs_sudo(Path::new("/usr/share/plasma/test")));
-            assert!(!needs_sudo(Path::new("/home/user/.local/share/plasma")));
-            assert!(!needs_sudo(Path::new("/tmp/test")));
-        }
-    }
-
-    #[test]
-    fn test_sudo_command() {
-        let cmd = sudo_command("kpackagetool6");
-        let program = cmd.get_program().to_string_lossy().to_string();
-        if is_root() {
-            assert_eq!(program, "kpackagetool6");
-        } else {
-            assert_eq!(program, "sudo");
-        }
-    }
-    #[test]
-    fn needs_sudo_for_system_paths_when_not_root() {
+    fn system_paths_need_sudo_when_not_root() {
         if is_root() {
             return;
         }
+        assert!(needs_sudo(Path::new("/usr/share/plasma/test")));
         assert!(needs_sudo(Path::new("/usr/share/plasma/plasmoids/test")));
         assert!(needs_sudo(Path::new("/usr/local/share/kwin/effects")));
         assert!(needs_sudo(Path::new("/lib/kde/plasma")));

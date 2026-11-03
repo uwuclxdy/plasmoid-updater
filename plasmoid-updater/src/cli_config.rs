@@ -50,6 +50,12 @@ fn with_api_url(config: libplasmoid_updater::Config) -> libplasmoid_updater::Con
     }
 }
 
+fn parse_error(path: &Path, e: &toml::de::Error) -> Stop {
+    Stop::Fatal(libplasmoid_updater::Error::Config(format!(
+        "failed to parse config file {path:?}: {e}"
+    )))
+}
+
 fn config_error(path: &Path, e: std::io::Error) -> Stop {
     Stop::Io {
         path: path.to_path_buf(),
@@ -58,7 +64,7 @@ fn config_error(path: &Path, e: std::io::Error) -> Stop {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct TomlConfig {
     excluded_packages: Vec<String>,
     excluded_patterns: Vec<String>,
@@ -66,6 +72,11 @@ struct TomlConfig {
     assume_yes: bool,
     prompt_restart: bool,
 }
+
+/// A key the 0.1.x releases documented and the run no longer reads. It is no
+/// `TomlConfig` field, so the unknown-key error never offers it, and it is
+/// dropped before the strict pass, so a config holding it still loads.
+const RETIRED_KEY: &str = "verbosity";
 
 #[derive(Debug, Clone)]
 pub struct CliConfig {
@@ -105,12 +116,17 @@ impl CliConfig {
 
         let content = fs::read_to_string(&path).map_err(|e| config_error(&path, e))?;
 
-        toml::from_str(&content).map_err(|e| {
-            Stop::Fatal(libplasmoid_updater::Error::Config(format!(
-                "failed to parse config file {}: {e}",
-                path.display()
-            )))
-        })
+        // A file without the retired key gets the strict pass on its own text,
+        // so toml's error keeps the line/column snippet.
+        let mut table: toml::Table =
+            toml::from_str(&content).map_err(|e| parse_error(&path, &e))?;
+        if table.remove(RETIRED_KEY).is_none() {
+            return toml::from_str(&content).map_err(|e| parse_error(&path, &e));
+        }
+        log::warn!(
+            "config key `{RETIRED_KEY}` in {path:?} is no longer used; remove it from the config (-q and -v set the log level)"
+        );
+        table.try_into().map_err(|e| parse_error(&path, &e))
     }
 
     pub fn edit_config() -> Result<(), Stop> {

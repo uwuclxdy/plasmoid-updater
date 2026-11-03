@@ -49,6 +49,8 @@ pub(crate) mod installer;
 pub(crate) mod paths;
 pub(crate) mod registry;
 pub(crate) mod reporter;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub(crate) mod types;
 pub(crate) mod utils;
 pub(crate) mod version;
@@ -524,7 +526,7 @@ mod tests {
                 wait_for(&root.join("release"));
             }
             "body" => {
-                installer::testutil::capture_logs();
+                testutil::logs::capture_logs();
                 let config = Config::new()
                     .with_skip_plasma_detection(true)
                     .with_inhibit_idle(false);
@@ -536,7 +538,7 @@ mod tests {
                     result.succeeded.is_empty() && result.failed.is_empty(),
                     "{result:?}"
                 );
-                let logged = installer::testutil::captured_logs();
+                let logged = testutil::logs::captured_logs();
                 assert!(
                     logged.iter().any(|line| line.starts_with("lock: ")
                         && line.contains("another run holds the update lock")),

@@ -37,9 +37,19 @@ fn bin() -> &'static str {
 }
 
 fn run(sandbox: &Sandbox, api_url: &str, args: &[&str]) -> Run {
+    run_in_config_dir(sandbox, api_url, &sandbox.config_dir(), args)
+}
+
+fn run_in_config_dir(
+    sandbox: &Sandbox,
+    api_url: &str,
+    config_dir: &std::path::Path,
+    args: &[&str],
+) -> Run {
     let output = sandbox
         .command(bin())
         .env(API_URL_VAR, api_url)
+        .env("PLASMOID_UPDATER_CONFIG_DIR", config_dir)
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -527,6 +537,201 @@ fn completions_ignore_a_malformed_config() {
     );
     assert_eq!(run.code, 0, "{run}");
     assert!(run.stdout.contains("complete -F"), "{run}");
+}
+
+#[test]
+fn completions_ignore_a_config_with_an_unknown_key() {
+    let sandbox = Sandbox::new();
+    write_config(&sandbox, "asume_yes = true\n");
+    let run = run(
+        &sandbox,
+        &common::dead_store_url(),
+        &["completions", "bash"],
+    );
+    assert_eq!(run.code, 0, "{run}");
+    assert!(run.stdout.contains("complete -F"), "{run}");
+}
+
+/// `verbosity` was a config key the 0.1.x releases documented. A config
+/// written then must still run after the upgrade: the key is reported as
+/// unused, not fatal, in exactly one warning whose path is quoted (this one
+/// holds a newline, so quoting is what keeps it a single line).
+#[test]
+fn a_retired_config_key_is_ignored_with_a_warning() {
+    let (sandbox, store) = up_to_date();
+    let config_dir = sandbox.tmp_dir().join("quoting\ndir");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("plasmoid-updater.toml");
+    std::fs::write(&config_path, "verbosity = \"verbose\"\n").unwrap();
+    let run = run_in_config_dir(
+        &sandbox,
+        store.url(),
+        &config_dir,
+        &["--skip-plasma-detection", "check"],
+    );
+    assert_eq!(run.code, 0, "{run}");
+    assert!(run.stderr.contains("warn:"), "{run}");
+    assert!(run.stderr.contains("verbosity"), "{run}");
+    assert!(run.stderr.contains("no longer used"), "{run}");
+    let expected = format!(
+        "warn: config key `verbosity` in {config_path:?} is no longer used; \
+         remove it from the config (-q and -v set the log level)"
+    );
+    assert_eq!(
+        run.stderr
+            .lines()
+            .filter(|line| line.starts_with("warn:"))
+            .collect::<Vec<_>>(),
+        vec![expected.as_str()],
+        "{run}"
+    );
+}
+
+/// A typo'd config key must not be silently ignored: the run fails on the
+/// config the way a malformed file does, naming the key and the file.
+#[test]
+fn an_unknown_config_key_fails_the_run_naming_the_key_and_the_file() {
+    let (sandbox, store) = pending_update();
+    write_config(&sandbox, "asume_yes = true\n");
+    let run = run(&sandbox, store.url(), &["--skip-plasma-detection", "check"]);
+    assert_eq!(run.code, 3, "{run}");
+    assert!(run.stderr.contains("configuration error:"), "{run}");
+    assert!(run.stderr.contains("asume_yes"), "{run}");
+    assert!(run.stderr.contains("unknown field `asume_yes`"), "{run}");
+    assert!(
+        run.stderr.contains(
+            &sandbox
+                .config_dir()
+                .join("plasmoid-updater.toml")
+                .display()
+                .to_string()
+        ),
+        "{run}"
+    );
+    let quoted = format!("{:?}", sandbox.config_dir().join("plasmoid-updater.toml"));
+    assert!(run.stderr.contains(&quoted), "{run}");
+}
+
+/// The keys the config accepts, as the unknown-key error lists them: the
+/// retired `verbosity` key is read and reported, never offered as valid.
+const UNKNOWN_KEY_ERROR: &str = "unknown field `asume_yes`, expected one of \
+    `excluded_packages`, `excluded_patterns`, `update_all_by_default`, \
+    `assume_yes`, `prompt_restart`";
+
+/// Runs `check` against a config dir named `quoting\ndir` holding `toml`, so a
+/// path interpolated raw would split its message onto a second line.
+fn check_with_config_in_a_quoting_dir(toml: &str) -> (Run, std::path::PathBuf) {
+    let (sandbox, store) = up_to_date();
+    let config_dir = sandbox.tmp_dir().join("quoting\ndir");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("plasmoid-updater.toml");
+    std::fs::write(&config_path, toml).unwrap();
+    let run = run_in_config_dir(
+        &sandbox,
+        store.url(),
+        &config_dir,
+        &["--skip-plasma-detection", "check"],
+    );
+    (run, config_path)
+}
+
+/// A file without the retired key keeps toml's own error: the first line
+/// quotes the path and gives the position, then the source snippet, then the
+/// expected keys.
+#[test]
+fn an_unknown_key_error_keeps_the_snippet_and_lists_only_live_keys() {
+    let (run, config_path) = check_with_config_in_a_quoting_dir("asume_yes = true\n");
+    assert_eq!(run.code, 3, "{run}");
+    let lines: Vec<&str> = run.stderr.lines().map(str::trim).collect();
+    let expected_first = format!(
+        "error: configuration error: failed to parse config file {config_path:?}: \
+         TOML parse error at line 1, column 1"
+    );
+    assert_eq!(
+        lines.first().copied(),
+        Some(expected_first.as_str()),
+        "{run}"
+    );
+    assert!(lines.contains(&"1 | asume_yes = true"), "{run}");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("unknown field"))
+            .collect::<Vec<_>>(),
+        vec![&UNKNOWN_KEY_ERROR],
+        "{run}"
+    );
+}
+
+/// A file holding the retired key is checked without it: the error still
+/// names the typo and lists only live keys, and the retired key still earns
+/// its one warning.
+#[test]
+fn an_unknown_key_beside_the_retired_one_lists_only_live_keys() {
+    let (run, config_path) =
+        check_with_config_in_a_quoting_dir("verbosity = \"verbose\"\nasume_yes = true\n");
+    assert_eq!(run.code, 3, "{run}");
+    let expected_error = format!(
+        "error: configuration error: failed to parse config file {config_path:?}: \
+         {UNKNOWN_KEY_ERROR}"
+    );
+    assert_eq!(
+        run.stderr
+            .lines()
+            .filter(|line| line.starts_with("error:"))
+            .collect::<Vec<_>>(),
+        vec![expected_error.as_str()],
+        "{run}"
+    );
+    assert_eq!(
+        run.stderr
+            .lines()
+            .filter(|line| line.starts_with("warn:"))
+            .count(),
+        1,
+        "{run}"
+    );
+}
+
+/// The retired key is dropped before the strict pass, so a value of the wrong
+/// type is reported and ignored like any other.
+#[test]
+fn a_retired_config_key_of_the_wrong_type_is_ignored_with_a_warning() {
+    let (run, config_path) = check_with_config_in_a_quoting_dir("verbosity = 1\n");
+    assert_eq!(run.code, 0, "{run}");
+    let expected = format!(
+        "warn: config key `verbosity` in {config_path:?} is no longer used; \
+         remove it from the config (-q and -v set the log level)"
+    );
+    assert_eq!(
+        run.stderr
+            .lines()
+            .filter(|line| line.starts_with("warn:"))
+            .collect::<Vec<_>>(),
+        vec![expected.as_str()],
+        "{run}"
+    );
+}
+
+/// A file that is not TOML at all keeps toml's position and snippet, with or
+/// without the retired key.
+#[test]
+fn a_config_syntax_error_keeps_the_snippet() {
+    for (toml, position) in [
+        ("assume_yes = \n", "line 1, column 14"),
+        (
+            "verbosity = \"verbose\"\nassume_yes = \n",
+            "line 2, column 14",
+        ),
+    ] {
+        let (run, config_path) = check_with_config_in_a_quoting_dir(toml);
+        assert_eq!(run.code, 3, "{run}");
+        let expected = format!(
+            "error: configuration error: failed to parse config file {config_path:?}: \
+             TOML parse error at {position}"
+        );
+        assert_eq!(run.stderr.lines().next(), Some(expected.as_str()), "{run}");
+    }
 }
 
 /// Writes an executable `sudo` that appends its arguments to `log`, and

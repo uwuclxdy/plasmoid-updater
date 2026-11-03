@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn an_unverified_download_is_capped_at_its_advertised_size_and_warns() {
-        use crate::installer::testutil::{capture_logs, captured_logs};
+        use crate::testutil::logs::{capture_logs, captured_logs};
 
         capture_logs();
         let client = reqwest::blocking::Client::new();

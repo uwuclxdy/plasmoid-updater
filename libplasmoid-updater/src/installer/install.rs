@@ -1053,7 +1053,7 @@ fn kpackagetool_failure(output: &std::process::Output) -> ComponentFailure {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let detail = match (stderr.trim(), stdout.trim()) {
-        ("", "") => format!("kpackagetool6 exited with {}", output.status),
+        ("", "") => crate::error::command_failure("kpackagetool6", &output.status),
         (stderr, "") => stderr.to_string(),
         ("", stdout) => stdout.to_string(),
         (stderr, stdout) => format!("{stderr}\n{stdout}"),
@@ -1427,7 +1427,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::installer::testutil::{capture_logs, captured_logs};
+    use crate::testutil::logs::{capture_logs, captured_logs};
 
     #[test]
     fn atomic_install_file_creates_dest() {
@@ -3054,5 +3054,65 @@ exit 0
         // No KDE Store package nests its root 64 directories down; a walker
         // that still finds it has no bound.
         assert_eq!(find_package_dir(dir.path()), None);
+    }
+
+    const SILENT_KPACKAGETOOL_CHILD: &str =
+        "installer::install::tests::a_silent_kpackagetool_failure_names_the_exit_status";
+
+    /// A `kpackagetool6` that exits nonzero printing nothing is reported with
+    /// the shared exit-status form, the one `systemctl`, `bsdtar` and `sudo`
+    /// use, never the doubled `exited with exit status: 1` an `ExitStatus`
+    /// interpolates.
+    #[test]
+    fn a_silent_kpackagetool_failure_names_the_exit_status() {
+        if std::env::var_os("PU_TEST_SILENT_KPACKAGETOOL").is_some() {
+            let extract = PathBuf::from(std::env::var("PU_TEST_EXTRACT").unwrap());
+            let component = widget_at(
+                Path::new(&std::env::var("PU_TEST_COMPONENT").unwrap()),
+                "org.test.widget",
+            );
+
+            let refusal = install_via_kpackage(&extract, &component, "2.0").unwrap_err();
+
+            assert_eq!(
+                refusal.message,
+                "kpackagetool6 failed: kpackagetool6 exited with status 1"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("kpackagetool6"), "#!/bin/sh\nexit 1\n");
+        let extract = dir.path().join("extract");
+        std::fs::create_dir_all(extract.join("org.test.widget")).unwrap();
+        std::fs::write(
+            extract.join("org.test.widget").join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        let component = dir.path().join("component");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            SILENT_KPACKAGETOOL_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_SILENT_KPACKAGETOOL", "1"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_EXTRACT", extract.to_str().unwrap()),
+                ("PU_TEST_COMPONENT", component.to_str().unwrap()),
+            ],
+        );
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }

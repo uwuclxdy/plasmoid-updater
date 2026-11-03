@@ -715,7 +715,7 @@ fn remove_backup(path: &Path, type_subdir: &str, system: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::installer::testutil::{capture_logs, captured_logs};
+    use crate::testutil::logs::{capture_logs, captured_logs};
     use crate::types::ComponentType;
 
     #[test]

@@ -375,10 +375,6 @@ impl FakeStore {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let host = format!("http://127.0.0.1:{port}");
-        let dead_port = {
-            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
         let entry = format!(
             "<content details=\"full\"><id>{SCHEME_ID}</id><name>{SCHEME_NAME}</name>\
              <version>{version}</version><typeid>{COLOR_SCHEME_CATEGORY}</typeid>\
@@ -427,7 +423,6 @@ impl FakeStore {
             catalog_garbage: listing.catalog_garbage,
             download_stalls: listing.download_stalls,
             total_items: listing.total_items,
-            dead_port,
             catalog_requests: AtomicUsize::new(0),
         });
         let shared = Arc::clone(&state);
@@ -454,12 +449,13 @@ impl FakeStore {
     }
 }
 
-/// A store URL nothing listens on.
+/// A store URL nothing can answer.
+///
+/// Port 0 is reserved: a listener bound to it is given an ephemeral port
+/// instead, so no process can ever own port 0. A bound-and-dropped ephemeral
+/// port leaves a window where another process takes it and answers as a store.
 pub fn dead_store_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}/ocs/v1")
+    "http://127.0.0.1:0/ocs/v1".to_string()
 }
 
 /// One extra entry the fake store answers with, its XML and archive prepared.
@@ -486,7 +482,6 @@ struct Served {
     catalog_garbage: bool,
     download_stalls: bool,
     total_items: TotalItems,
-    dead_port: u16,
     catalog_requests: AtomicUsize,
 }
 
@@ -528,7 +523,7 @@ fn serve(mut stream: TcpStream, served: &Served) {
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
         if served.per_id_connects_nowhere {
-            location = Some(format!("http://127.0.0.1:{}/nope", served.dead_port));
+            location = Some(dead_store_url());
             ("302 Found", Vec::new())
         } else if served.per_id_drops_mid_body {
             let head = "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
@@ -551,7 +546,7 @@ fn serve(mut stream: TcpStream, served: &Served) {
     } else if let Some(query) = target.strip_prefix("/ocs/v1/content/data?") {
         served.catalog_requests.fetch_add(1, Ordering::SeqCst);
         if served.catalog_connects_nowhere {
-            location = Some(format!("http://127.0.0.1:{}/nope", served.dead_port));
+            location = Some(dead_store_url());
             ("302 Found", Vec::new())
         } else {
             let names = |category: u16| {
