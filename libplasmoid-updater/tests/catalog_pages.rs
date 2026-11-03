@@ -37,7 +37,7 @@ fn add_widget(sandbox: &Sandbox) {
 #[test]
 fn check_issues_at_most_the_page_cap() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         child.done();
         return;
@@ -62,7 +62,7 @@ fn check_issues_at_most_the_page_cap() {
 #[test]
 fn a_widget_in_the_713_subcategory_resolves_by_name() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         assert_eq!(result.available_updates[0].installed.name, "Fake Widget");
         child.done();
@@ -93,7 +93,7 @@ fn a_per_id_lookup_answered_then_cut_mid_body_counts_as_answered() {
     if let Some(child) = common::child() {
         let mut table = HashMap::new();
         table.insert("org.fake.widget".to_string(), SCHEME_ID);
-        let result = check(&config(&child.store_url).with_widgets_id_table(table))
+        let result = check(&config(&child.store_url).with_widgets_id_table(table), &())
             .expect("an answered per-id lookup is not a network failure");
         let diagnostic = result
             .diagnostics
@@ -126,7 +126,7 @@ fn a_failed_targeted_fetch_names_the_id_it_could_not_fetch() {
     if let Some(child) = common::child() {
         let mut table = HashMap::new();
         table.insert("org.fake.widget".to_string(), SCHEME_ID);
-        let result = check(&config(&child.store_url).with_widgets_id_table(table)).unwrap();
+        let result = check(&config(&child.store_url).with_widgets_id_table(table), &()).unwrap();
         let widget = result
             .diagnostics
             .iter()
@@ -156,7 +156,7 @@ fn a_failed_targeted_fetch_names_the_id_it_could_not_fetch() {
 #[test]
 fn check_survives_an_answered_catalog_with_no_entries() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert!(result.available_updates.is_empty(), "{result:?}");
         let reasons: Vec<&str> = result
             .diagnostics

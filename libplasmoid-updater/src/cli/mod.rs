@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Terminal pieces behind the `cli` feature: a progress reporter, the
-//! multi-select prompt, failure/table printers, and the styling predicate they
-//! all share.
+//! multi-select prompt, failure/table printers, the run summary, the path a
+//! log line takes above the live progress, and the styling predicate they all
+//! share.
 //!
 //! These components are separate from the core library functionality so
 //! non-CLI consumers (like topgrade) can use the library without pulling in
@@ -12,9 +13,10 @@
 mod output;
 mod progress;
 mod select;
+mod theme;
 
-pub use output::{components_table, print_failures, updates_table};
-pub use progress::ProgressReporter;
+pub use output::{components_table, print_failures, update_summary, updates_table};
+pub use progress::{ProgressReporter, print_above};
 pub use select::select;
 
 /// Which stream a piece of terminal output is drawn on.

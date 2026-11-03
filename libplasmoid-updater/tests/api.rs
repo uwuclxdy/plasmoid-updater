@@ -91,7 +91,7 @@ fn get_installed_lists_the_registered_color_scheme() {
 #[test]
 fn check_reports_the_newer_store_version() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         let available = &result.available_updates[0];
         assert_eq!(available.installed.name, SCHEME_NAME);
@@ -109,7 +109,7 @@ fn check_reports_the_newer_store_version() {
 #[test]
 fn check_reports_nothing_when_the_store_has_the_installed_version() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert!(result.available_updates.is_empty(), "{result:?}");
         child.done();
         return;
@@ -130,7 +130,7 @@ fn check_reports_nothing_when_the_store_has_the_installed_version() {
 fn check_leaves_an_excluded_component_out_and_reports_it_skipped() {
     if let Some(child) = common::child() {
         let cfg = config(&child.store_url).with_excluded_patterns(vec!["(?i)^fake".to_string()]);
-        let result = check(&cfg).unwrap();
+        let result = check(&cfg, &()).unwrap();
         assert!(result.available_updates.is_empty(), "{result:?}");
         assert_eq!(result.skipped, vec![SCHEME_NAME.to_string()]);
         assert!(
@@ -152,7 +152,7 @@ fn check_leaves_an_excluded_component_out_and_reports_it_skipped() {
 #[test]
 fn check_turns_a_failed_lookup_into_a_diagnostic() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert!(result.available_updates.is_empty(), "{result:?}");
         assert_eq!(result.diagnostics.len(), 1, "{result:?}");
         assert_eq!(result.diagnostics[0].name, SCHEME_NAME);
@@ -172,7 +172,7 @@ fn check_turns_a_failed_lookup_into_a_diagnostic() {
 #[test]
 fn check_turns_a_dropped_lookup_on_a_reachable_store_into_a_diagnostic() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert!(result.available_updates.is_empty(), "{result:?}");
         assert_eq!(result.diagnostics.len(), 1, "{result:?}");
         assert_eq!(result.diagnostics[0].name, SCHEME_NAME);
@@ -195,7 +195,7 @@ fn check_turns_a_dropped_lookup_on_a_reachable_store_into_a_diagnostic() {
 #[test]
 fn check_retries_a_lookup_the_store_briefly_refuses() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         assert!(result.diagnostics.is_empty(), "{result:?}");
         child.done();
@@ -217,7 +217,7 @@ fn check_retries_a_lookup_the_store_briefly_refuses() {
 #[test]
 fn check_against_an_unreachable_store_is_a_network_error() {
     if let Some(child) = common::child() {
-        let err = check(&config(&child.store_url)).unwrap_err();
+        let err = check(&config(&child.store_url), &()).unwrap_err();
         assert!(matches!(err, Error::Network(_)), "{err:?}");
         child.done();
         return;
@@ -226,6 +226,58 @@ fn check_against_an_unreachable_store_is_a_network_error() {
     sandbox.install_old_scheme();
     sandbox.run_child(
         "check_against_an_unreachable_store_is_a_network_error",
+        &common::dead_store_url(),
+    );
+}
+
+#[test]
+fn check_against_an_unreachable_store_still_emits_checked() {
+    if let Some(child) = common::child() {
+        let reporter = Recording::default();
+        let err = check(&config(&child.store_url), &reporter).unwrap_err();
+        assert!(matches!(err, Error::Network(_)), "{err:?}");
+        let events = reporter.0.into_inner().unwrap();
+        assert_eq!(
+            events,
+            vec![
+                "Checking { components: 1 }".to_string(),
+                "Checked".to_string()
+            ],
+            "a failed check must still close the checking part"
+        );
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    sandbox.run_child(
+        "check_against_an_unreachable_store_still_emits_checked",
+        &common::dead_store_url(),
+    );
+}
+
+#[test]
+fn update_against_an_unreachable_store_still_emits_checked() {
+    if let Some(child) = common::child() {
+        let reporter = Recording::default();
+        let err = update(&config(&child.store_url), &reporter).unwrap_err();
+        assert!(matches!(err, Error::Network(_)), "{err:?}");
+        let events = reporter.0.into_inner().unwrap();
+        assert_eq!(
+            events,
+            vec![
+                "Checking { components: 1 }".to_string(),
+                "Checked".to_string()
+            ],
+            "a failed update must still close the checking part"
+        );
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    sandbox.run_child(
+        "update_against_an_unreachable_store_still_emits_checked",
         &common::dead_store_url(),
     );
 }
@@ -371,7 +423,9 @@ fn update_skips_an_excluded_component() {
 #[test]
 fn install_installs_exactly_the_given_selection() {
     if let Some(child) = common::child() {
-        let available = check(&config(&child.store_url)).unwrap().available_updates;
+        let available = check(&config(&child.store_url), &())
+            .unwrap()
+            .available_updates;
         let excluding =
             config(&child.store_url).with_excluded_packages(vec![SCHEME_NAME.to_string()]);
         let result = install(&available, &excluding, &Quiet).unwrap();
@@ -391,7 +445,7 @@ fn install_installs_exactly_the_given_selection() {
 fn install_applies_the_selection_from_check() {
     if let Some(child) = common::child() {
         let cfg = config(&child.store_url);
-        let available = check(&cfg).unwrap().available_updates;
+        let available = check(&cfg, &()).unwrap().available_updates;
         let result = install(&available, &cfg, &Quiet).unwrap();
         assert_eq!(result.succeeded.len(), 1, "{result:?}");
         assert!(result.failed.is_empty(), "{result:?}");
@@ -637,7 +691,7 @@ exit 0
 #[test]
 fn check_reports_a_newer_cursor_theme_installed_under_home_icons() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         let available = &result.available_updates[0];
         assert_eq!(available.installed.name, CURSOR_NAME);
@@ -732,7 +786,7 @@ fn an_empty_cursor_registry_version_is_not_an_update_by_itself() {
         assert_eq!(installed.len(), 1, "{installed:?}");
         assert_eq!(installed[0].component_type, ComponentType::CursorTheme);
         assert_eq!(installed[0].version, "");
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert!(result.available_updates.is_empty(), "{result:?}");
         assert!(result.diagnostics.is_empty(), "{result:?}");
         child.done();
@@ -759,7 +813,7 @@ fn an_empty_cursor_registry_version_is_not_an_update_by_itself() {
 #[test]
 fn an_empty_cursor_registry_version_counts_as_an_update_when_the_store_has_a_version() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         let available = &result.available_updates[0];
         assert_eq!(
@@ -791,7 +845,7 @@ fn an_empty_cursor_registry_version_counts_as_an_update_when_the_store_has_a_ver
 #[test]
 fn check_reports_a_newer_comic_plugin() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         let available = &result.available_updates[0];
         assert_eq!(available.installed.name, COMIC_NAME);
@@ -871,7 +925,7 @@ const NEW_ICON_THEME: &str = "[Icon Theme]\nName=Shared Icon Theme\n# new\n";
 #[test]
 fn an_icon_theme_and_a_cursor_theme_with_one_directory_name_keep_their_own_ids() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 2, "{result:?}");
         let resolved: Vec<(ComponentType, u64)> = result
             .available_updates
@@ -973,7 +1027,7 @@ fn an_icon_theme_and_a_cursor_theme_with_one_directory_name_keep_their_own_ids()
 #[test]
 fn a_plasma_style_and_an_icon_theme_with_one_directory_name_keep_their_own_ids() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert!(
             result.diagnostics.is_empty(),
             "a component did not resolve to its own type's entry: {result:?}"
@@ -1069,7 +1123,7 @@ fn a_plasma_style_and_an_icon_theme_with_one_directory_name_keep_their_own_ids()
 #[test]
 fn a_wallpaper_registered_from_a_size_category_updates() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         let available = &result.available_updates[0];
         assert_eq!(
@@ -1117,7 +1171,7 @@ fn a_wallpaper_registered_from_a_size_category_updates() {
 #[test]
 fn a_wallpaper_is_not_updated_from_a_store_entry_of_another_type() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert!(result.available_updates.is_empty(), "{result:?}");
         assert!(
             result
@@ -1152,7 +1206,7 @@ fn a_wallpaper_is_not_updated_from_a_store_entry_of_another_type() {
 #[test]
 fn a_widget_resolves_its_registry_id_when_xdg_data_home_is_spelled_with_dot_dot() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         let available = &result.available_updates[0];
         assert_eq!(
@@ -1219,7 +1273,7 @@ fn a_widget_resolves_its_registry_id_when_xdg_data_home_is_spelled_with_dot_dot(
 #[test]
 fn a_widget_resolves_its_registry_id_from_an_installedfile_spelled_with_dot_dot() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         let available = &result.available_updates[0];
         assert_eq!(
@@ -1315,5 +1369,61 @@ fn a_registered_icon_theme_is_listed_when_xdg_data_home_is_spelled_with_dot_dot(
         "a_registered_icon_theme_is_listed_when_xdg_data_home_is_spelled_with_dot_dot",
         &common::dead_store_url(),
         &dotted_data,
+    );
+}
+
+#[test]
+fn check_reports_the_scanned_component_count_through_the_reporter() {
+    if let Some(child) = common::child() {
+        let reporter = Recording::default();
+        check(&config(&child.store_url), &reporter).unwrap();
+        let events = reporter.0.into_inner().unwrap();
+        assert_eq!(
+            events,
+            vec![
+                "Checking { components: 1 }".to_string(),
+                "Checked".to_string()
+            ],
+            "check must emit Checking with the scanned count, then Checked"
+        );
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing::default());
+    sandbox.run_child(
+        "check_reports_the_scanned_component_count_through_the_reporter",
+        store.url(),
+    );
+}
+
+#[test]
+fn update_reports_the_count_and_the_installed_version() {
+    if let Some(child) = common::child() {
+        let reporter = Recording::default();
+        update(&config(&child.store_url), &reporter).unwrap();
+        let events = reporter.0.into_inner().unwrap();
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("Checking { components: 1 }"),
+            "{events:?}"
+        );
+        let version = format!("version: {NEW_VERSION:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("Installed") && e.contains(&version)),
+            "Installed does not carry the installed version: {events:?}"
+        );
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing::default());
+    sandbox.run_child(
+        "update_reports_the_count_and_the_installed_version",
+        store.url(),
     );
 }

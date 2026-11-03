@@ -12,11 +12,22 @@
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// The core is scanning installed components and querying the store.
+    /// The core finished scanning installed components and is querying the
+    /// store for them.
     ///
-    /// Emitted by [`update`](crate::update) only; a caller of
-    /// [`install`](crate::install) drives the check itself and can emit it.
-    Checking,
+    /// Emitted once by [`check`](crate::check) and [`update`](crate::update)
+    /// after the scan, carrying how many installed components this run will
+    /// check.
+    Checking {
+        /// Number of installed components the run will check.
+        components: usize,
+    },
+    /// The check part of the run is over: the scan and the store lookups are
+    /// done, and no further [`Event::Checking`] line is live.
+    ///
+    /// A reporter that drew the checking line ends it here, so the caller can
+    /// print its own output below without a half-drawn line above it.
+    Checked,
     /// A chunk of one component's download arrived.
     Downloading {
         /// Display name of the component being downloaded.
@@ -37,6 +48,10 @@ pub enum Event {
         name: String,
         /// The component's installed path, as in [`Event::Downloading`].
         id: String,
+        /// The version the install verified: what
+        /// [`UpdateResult::succeeded`](crate::UpdateResult::succeeded) records
+        /// for the component.
+        version: String,
     },
     /// One component failed; the row lands in
     /// [`UpdateResult::failed`](crate::UpdateResult::failed) and the run

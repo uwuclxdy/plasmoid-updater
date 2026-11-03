@@ -180,7 +180,7 @@ fn an_empty_install_restores_a_component_stranded_by_a_killed_run() {
 #[test]
 fn check_carries_a_no_matching_download_in_unavailable() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert!(result.available_updates.is_empty(), "{result:?}");
         assert_eq!(result.unavailable.len(), 1, "{result:?}");
         assert_eq!(result.unavailable[0].kind, FailureKind::NoMatchingDownload);
@@ -214,7 +214,7 @@ fn check_carries_a_no_matching_download_in_unavailable() {
 #[test]
 fn check_reports_a_component_stranded_by_a_killed_run() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         let stranded = result
             .diagnostics
             .iter()

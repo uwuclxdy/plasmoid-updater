@@ -30,6 +30,7 @@ nix = { workspace = true }
 md5 = "0.8.1"
 nix = { workspace = true, features = ["term", "signal"] }
 tempfile = "3.27.0"
+vt100 = "0.18.1"
 
 [lints]
 workspace = true

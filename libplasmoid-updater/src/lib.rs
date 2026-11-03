@@ -15,8 +15,9 @@
 //! The core entry points ([`check`], [`update`], [`install`]) never print,
 //! prompt, read stdin or restart plasmashell; progress leaves only through a
 //! [`Reporter`], and the opt-in [`cli`] feature provides the terminal pieces
-//! ([`cli::ProgressReporter`], [`cli::select`], [`cli::print_failures`]) the
-//! caller wires in explicitly.
+//! ([`cli::ProgressReporter`], [`cli::print_above`], [`cli::select`],
+//! [`cli::print_failures`], [`cli::update_summary`]) the caller wires in
+//! explicitly.
 //!
 //! ```no_run
 //! # #[cfg(feature = "cli")]
@@ -82,6 +83,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// not be checked, so use [`CheckResult::has_updates`] for "is there anything
 /// to install" and [`CheckResult::is_empty`] for "nothing found at all".
 ///
+/// Once the scan has counted the installed components, one
+/// [`Event::Checking`] carrying that count leaves through `reporter`; one
+/// [`Event::Checked`] closes the check part on every path, a store error or a
+/// panic unwinding out of the check included, so a failed check never leaves
+/// the checking line live.
+///
 /// # Errors
 ///
 /// - [`Error::UnsupportedOs`] — not running on Linux
@@ -94,11 +101,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///   registry file that cannot be parsed is logged and skipped instead)
 /// - [`Error::Io`] — a filesystem scan failed
 /// - [`Error::Config`] — the configuration is unusable
-pub fn check(config: &Config) -> Result<CheckResult> {
+pub fn check(config: &Config, reporter: &dyn Reporter) -> Result<CheckResult> {
     crate::utils::validate_environment(config.skip_plasma_detection)?;
 
     let api_client = api::ApiClient::new(config)?;
-    let result = crate::utils::fetch_updates(&api_client, config)?;
+    let result = crate::utils::fetch_updates(&api_client, config, reporter)?;
 
     Ok(CheckResult::from_internal(crate::utils::apply_exclusions(
         result, config,
@@ -190,9 +197,11 @@ impl CheckResult {
 /// for its version is a [`FailureKind::NoMatchingDownload`] row in
 /// [`UpdateResult::failed`].
 ///
-/// Progress and per-component outcomes are reported through `reporter`.
-/// This function never prompts and never restarts plasmashell; call
-/// [`restart_plasmashell`] when [`UpdateResult::needs_restart`] says so.
+/// One [`Event::Checking`] carrying the scanned component count is the first
+/// event, and one [`Event::Checked`] closes the check part on every path;
+/// progress and per-component outcomes follow through `reporter`. This function never
+/// prompts and never restarts plasmashell; call [`restart_plasmashell`] when
+/// [`UpdateResult::needs_restart`] says so.
 ///
 /// # Errors
 ///
@@ -212,11 +221,9 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
     crate::utils::require_extractor()?;
     repair_after_interrupted_run(config);
 
-    reporter.event(&Event::Checking);
-
     let api_client = api::ApiClient::new(config)?;
-    let mut check_result =
-        crate::utils::apply_exclusions(crate::utils::fetch_updates(&api_client, config)?, config);
+    let fetched = crate::utils::fetch_updates(&api_client, config, reporter)?;
+    let mut check_result = crate::utils::apply_exclusions(fetched, config);
 
     let mut skipped = check_result.skipped;
     skipped.extend(

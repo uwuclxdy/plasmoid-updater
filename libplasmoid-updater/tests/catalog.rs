@@ -19,7 +19,7 @@ fn config(api_url: &str) -> Config {
 #[test]
 fn check_survives_an_unparseable_catalog_page() {
     if let Some(child) = common::child() {
-        let result = check(&config(&child.store_url)).unwrap();
+        let result = check(&config(&child.store_url), &()).unwrap();
         assert_eq!(result.available_updates.len(), 1, "{result:?}");
         assert_eq!(result.available_updates[0].installed.name, SCHEME_NAME);
         assert_eq!(result.available_updates[0].latest_version, NEW_VERSION);

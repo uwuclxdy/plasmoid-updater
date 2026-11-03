@@ -319,11 +319,18 @@ fn completions(shell: clap_complete::Shell) -> Result<ExitCode, Stop> {
 
 /// The reporter for a run: `-q` leaves stderr to error lines alone, so the
 /// progress reporter's draws are dropped with it.
-fn reporter(quiet: bool) -> Box<dyn lib::Reporter> {
-    if quiet {
-        Box::new(())
-    } else {
-        Box::new(lib::cli::ProgressReporter::new())
+struct Reporter(Option<lib::cli::ProgressReporter>);
+
+impl Reporter {
+    fn new(quiet: bool) -> Self {
+        Self((!quiet).then(lib::cli::ProgressReporter::new))
+    }
+
+    fn as_dyn(&self) -> &dyn lib::Reporter {
+        match &self.0 {
+            Some(reporter) => reporter,
+            None => &(),
+        }
     }
 }
 
@@ -344,9 +351,8 @@ fn do_check(
         .excluded_packages
         .extend(ignore.iter().cloned());
 
-    reporter(quiet).event(&lib::Event::Checking);
-
-    let result = lib::check(&check_config)?;
+    let reporter = Reporter::new(quiet);
+    let result = lib::check(&check_config, reporter.as_dyn())?;
 
     report_diagnostics(&result);
 
@@ -472,16 +478,14 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
     // stranded tree as an interrupted install, and `install` would only repair
     // it after that check already reported the component. The named path needs
     // the repair first too, since it resolves its name against what is on disk.
-    lib::install(&[], &update_config, reporter(quiet).as_ref())?;
+    lib::install(&[], &update_config, &())?;
 
     if let Some(ref name) = args.component {
         return do_update_single(name, update_config, restart, quiet, args.json);
     }
 
-    let reporter = reporter(quiet);
-    reporter.event(&lib::Event::Checking);
-
-    let check_result = lib::check(&update_config)?;
+    let reporter = Reporter::new(quiet);
+    let check_result = lib::check(&update_config, reporter.as_dyn())?;
     let unavailable_diagnostics: Vec<&lib::Diagnostic> =
         check_result.unavailable_diagnostics().collect();
     report_diagnostics_except(&check_result, &unavailable_diagnostics);
@@ -514,7 +518,7 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
     // `install` runs even for an empty selection: it takes the lock and
     // repairs what a killed run left stranded, which is what a check's
     // "run update to restore" tells the user to do.
-    let mut result = lib::install(&installable, &update_config, reporter.as_ref())?;
+    let mut result = lib::install(&installable, &update_config, reporter.as_dyn())?;
     result.skipped.extend(skipped);
     result.failed.extend(check_result.unavailable);
 
@@ -558,9 +562,8 @@ fn dry_run(
     quiet: bool,
     json: bool,
 ) -> Result<ExitCode, Stop> {
-    reporter(quiet).event(&lib::Event::Checking);
-
-    let check_result = lib::check(config)?;
+    let reporter = Reporter::new(quiet);
+    let check_result = lib::check(config, reporter.as_dyn())?;
 
     match name {
         // A named run ends on the named component's own outcome; another
@@ -680,14 +683,12 @@ fn do_update_single(
     quiet: bool,
     json: bool,
 ) -> Result<ExitCode, Stop> {
-    let reporter = reporter(quiet);
-    reporter.event(&lib::Event::Checking);
-
-    let check_result = lib::check(&config)?;
+    let reporter = Reporter::new(quiet);
+    let check_result = lib::check(&config, reporter.as_dyn())?;
 
     match resolve_named(name, &config, &check_result)? {
         Named::Updates(updates) => {
-            let result = lib::install(&updates, &config, reporter.as_ref())?;
+            let result = lib::install(&updates, &config, reporter.as_dyn())?;
             finish_update(result, restart, false, json)
         }
         Named::Excluded(display_name) => {
@@ -849,11 +850,8 @@ fn finish_update(
         payload_json(&result)
     } else {
         payload(format_args!(
-            "Update Summary: {} succeeded, {} failed, {} skipped ({} total)",
-            result.succeeded.len(),
-            result.failed.len(),
-            result.skipped.len(),
-            result.succeeded.len() + result.failed.len() + result.skipped.len(),
+            "{}",
+            lib::cli::update_summary(&result, lib::cli::Stream::Stdout)
         ))
     };
     match written {

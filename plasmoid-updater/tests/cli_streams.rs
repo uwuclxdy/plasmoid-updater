@@ -337,7 +337,7 @@ fn a_dry_run_draws_the_checking_progress_line() {
         check
             .stderr
             .lines()
-            .any(|line| line == "checking for updates..."),
+            .any(|line| line == "checking 1 component"),
         "check does not draw the line this test pins: {check}"
     );
 
@@ -350,7 +350,7 @@ fn a_dry_run_draws_the_checking_progress_line() {
     assert!(
         dry.stderr
             .lines()
-            .any(|line| line == "checking for updates..."),
+            .any(|line| line == "checking 1 component"),
         "{dry}"
     );
 
@@ -393,7 +393,7 @@ fn a_failed_install_is_reported_by_the_reporter_and_the_table_only() {
     assert!(
         run.stderr
             .lines()
-            .any(|line| line.starts_with(&format!("failed {SCHEME_NAME}: "))),
+            .any(|line| line.starts_with(&format!("\u{2717} {SCHEME_NAME} [ failed ] "))),
         "the reporter did not report the failure:\n{run}"
     );
 }

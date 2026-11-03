@@ -501,7 +501,22 @@ struct Capture {
 
 impl Capture {
     fn new() -> Self {
-        let pty = openpty(None, None).unwrap();
+        Self::from_pty(openpty(None, None).unwrap())
+    }
+
+    /// A pty whose window is `cols` × `rows`, so the terminal it stands in for
+    /// reports a width and wraps where the wrapping under test happens.
+    fn sized(cols: u16, rows: u16) -> Self {
+        let size = nix::pty::Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        Self::from_pty(openpty(Some(&size), None).unwrap())
+    }
+
+    fn from_pty(pty: nix::pty::OpenptyResult) -> Self {
         let mut master = std::fs::File::from(pty.master);
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&bytes);
@@ -857,5 +872,599 @@ fn term_dumb_turns_the_prompt_styling_off() {
         0,
         "prompt styled: {:?}",
         String::from_utf8_lossy(&screen)
+    );
+}
+
+/// The final screen a terminal shows after `bytes`, one trimmed string per
+/// row, with trailing blank rows dropped: what a person reads once the run
+/// ends, which a byte count cannot show (a stale row is still bytes).
+fn final_screen(bytes: &[u8]) -> Vec<String> {
+    let mut parser = vt100::Parser::new(
+        std::num::NonZero::new(500).unwrap(),
+        std::num::NonZero::new(400).unwrap(),
+        0,
+    );
+    parser.process(bytes);
+    let mut rows: Vec<String> = parser
+        .screen()
+        .rows(0, 400)
+        .map(|row| row.trim_end().to_string())
+        .collect();
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    rows
+}
+
+const NO_CHECKSUM_WARNING: &str = "warn: Fake Scheme: the store advertises no checksum, \
+     so the download is unverified and capped at ";
+
+#[test]
+fn a_warning_during_the_progress_stays_intact_above_one_row_per_component() {
+    let env = [("TERM", "xterm-256color")];
+    let listing = Listing {
+        no_md5: true,
+        ..Listing::default()
+    };
+    // `-vv` adds debug lines from the backup and registry steps, which run
+    // while the component's row is drawn: the case a redraw used to erase.
+    let args = [UPDATE, &["-vv"]].concat();
+    let run = on_terminals_against(listing, &args, &env);
+    assert_eq!(run.code, 0, "{}", describe(&env, &run));
+    let screen = final_screen(&run.stderr);
+    let warnings: Vec<&String> = screen
+        .iter()
+        .filter(|row| row.starts_with(NO_CHECKSUM_WARNING) && row.ends_with(" bytes"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "warning not intact once: {screen:#?}");
+    let written = count(&run.stderr, b"debug:");
+    let shown = screen
+        .iter()
+        .filter(|row| row.starts_with("debug: "))
+        .count();
+    assert!(written > 0, "-vv wrote no debug line: {screen:#?}");
+    assert_eq!(
+        shown, written,
+        "a log line was erased or overwritten: {screen:#?}"
+    );
+    let rows: Vec<&String> = screen
+        .iter()
+        .filter(|row| {
+            row.contains(SCHEME_NAME) && !row.starts_with("warn:") && !row.starts_with("debug:")
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a stale or missing progress row: {screen:#?}"
+    );
+    assert_eq!(rows[0], "\u{2713} Fake Scheme 2.0", "{screen:#?}");
+}
+
+#[test]
+fn a_finished_animated_run_shows_the_done_row_and_no_bar() {
+    let env = [("TERM", "xterm-256color")];
+    let run = on_terminals(UPDATE, &env);
+    assert_eq!(run.code, 0, "{}", describe(&env, &run));
+    let screen = final_screen(&run.stderr);
+    assert!(
+        screen.iter().any(|row| row == "\u{2713} Fake Scheme 2.0"),
+        "{screen:#?}"
+    );
+    assert!(
+        !screen
+            .iter()
+            .any(|row| row.contains('\u{2588}') || row.contains('\u{2591}')),
+        "a progress bar is left on the final screen: {screen:#?}"
+    );
+}
+
+#[test]
+fn a_failed_row_carries_the_failed_pill_and_the_kind_pill_sits_in_the_table() {
+    let env = [("TERM", "xterm-256color")];
+    let run = failing_update(&env);
+    assert_eq!(run.code, 1, "{}", describe(&env, &run));
+    let screen = final_screen(&run.stderr);
+    assert!(
+        screen
+            .iter()
+            .any(|row| row.starts_with("\u{2717} Fake Scheme [ failed ] ")),
+        "{screen:#?}"
+    );
+    assert!(
+        screen
+            .iter()
+            .any(|row| row.starts_with("Fake Scheme") && row.contains("[ checksum ]")),
+        "the failure table carries no kind pill: {screen:#?}"
+    );
+    let header = header_line(&run.stderr, b"NAME");
+    assert!(
+        !contains(header, BOLD),
+        "the failure table header is bold: {:?}",
+        String::from_utf8_lossy(header)
+    );
+}
+
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+/// The raw bytes of the line holding the first `needle`, up to it.
+fn header_line<'a>(bytes: &'a [u8], needle: &[u8]) -> &'a [u8] {
+    let at = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .unwrap_or_else(|| panic!("no {needle:?} in {:?}", String::from_utf8_lossy(bytes)));
+    let start = bytes[..at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    &bytes[start..at]
+}
+
+#[test]
+fn a_piped_update_prints_the_done_and_failed_rows_as_plain_lines() {
+    let (sandbox, store) = pending_update();
+    let ok = run(&sandbox, &store, UPDATE);
+    assert_eq!(ok.code, 0, "{ok}");
+    assert!(
+        ok.stderr.lines().any(|l| l == "\u{2713} Fake Scheme 2.0"),
+        "{ok}"
+    );
+
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing {
+        md5_override: Some("00000000000000000000000000000000"),
+        ..Listing::default()
+    });
+    let failed = run(&sandbox, &store, UPDATE);
+    assert_eq!(failed.code, 1, "{failed}");
+    assert!(
+        failed
+            .stderr
+            .lines()
+            .any(|l| l.starts_with("\u{2717} Fake Scheme [ failed ] ")),
+        "{failed}"
+    );
+}
+
+#[test]
+fn the_summary_names_each_non_zero_count_and_hides_the_zeros() {
+    let (sandbox, store) = pending_update();
+    let ok = run(&sandbox, &store, UPDATE);
+    assert_eq!(ok.code, 0, "{ok}");
+    assert_eq!(ok.stdout, "updated 1\n", "{ok}");
+
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing {
+        md5_override: Some("00000000000000000000000000000000"),
+        ..Listing::default()
+    });
+    let failed = run(&sandbox, &store, UPDATE);
+    assert_eq!(failed.code, 1, "{failed}");
+    assert_eq!(failed.stdout, "failed 1\n", "{failed}");
+
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing::default());
+    let mixed = run(
+        &sandbox,
+        &store,
+        &[
+            "update",
+            "-y",
+            "--no-restart-plasma",
+            "--ignore",
+            SCHEME_NAME,
+        ],
+    );
+    assert_eq!(mixed.code, 0, "{mixed}");
+    assert_eq!(mixed.stdout, "skipped 1\n", "{mixed}");
+}
+
+#[test]
+fn the_checking_line_names_the_scanned_count() {
+    let (sandbox, store) = pending_update();
+    for args in [CHECK, UPDATE] {
+        let piped = run(&sandbox, &store, args);
+        assert!(
+            piped.stderr.lines().any(|l| l == "checking 1 component"),
+            "{args:?}: {piped}"
+        );
+    }
+}
+
+#[test]
+fn the_palette_tier_follows_colorterm() {
+    let truecolor = on_terminals(
+        CHECK,
+        &[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")],
+    );
+    assert_eq!(truecolor.code, 100);
+    assert!(
+        contains(&truecolor.stdout, b"38;2;166;173;200"),
+        "no 24-bit TEXT_DIM header: {:?}",
+        String::from_utf8_lossy(&truecolor.stdout)
+    );
+    let indexed = on_terminals(CHECK, &[("TERM", "xterm-256color")]);
+    assert_eq!(indexed.code, 100);
+    assert!(
+        contains(&indexed.stdout, b"38;5;145"),
+        "no xterm-256 TEXT_DIM header: {:?}",
+        String::from_utf8_lossy(&indexed.stdout)
+    );
+    assert!(
+        !contains(&indexed.stdout, b"38;2;"),
+        "24-bit colour without COLORTERM=truecolor: {:?}",
+        String::from_utf8_lossy(&indexed.stdout)
+    );
+    assert!(
+        !contains(&indexed.stdout, BOLD),
+        "the check table carries bold: {:?}",
+        String::from_utf8_lossy(&indexed.stdout)
+    );
+}
+
+/// The final screen after `bytes`, one trimmed string per row, on a terminal
+/// `cols` × `rows` — the size the pty reported, so the parser wraps where the
+/// terminal did.
+fn sized_screen(bytes: &[u8], cols: u16, rows: u16) -> Vec<String> {
+    let mut parser = vt100::Parser::new(
+        std::num::NonZero::new(rows).unwrap(),
+        std::num::NonZero::new(cols).unwrap(),
+        0,
+    );
+    parser.process(bytes);
+    // `rows` takes the slice width, not a row count: a 110-column screen's
+    // lines are read whole only when the width matches.
+    let mut rows: Vec<String> = parser
+        .screen()
+        .rows(0, cols)
+        .map(|row| row.trim_end().to_string())
+        .collect();
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    rows
+}
+
+/// Runs `args` against `sandbox`'s store with stdout and stderr each on their
+/// own pty of `cols` × `rows`.
+fn on_sized_terminals(
+    sandbox: &Sandbox,
+    store: &FakeStore,
+    args: &[&str],
+    env: &[(&str, &str)],
+    cols: u16,
+    rows: u16,
+) -> StyledRun {
+    let out = Capture::sized(cols, rows);
+    let err = Capture::sized(cols, rows);
+    let mut command = command(sandbox, store, args);
+    command
+        .envs(env.iter().copied())
+        .stdout(out.stdio())
+        .stderr(err.stdio());
+    let status = command.stdin(Stdio::null()).status().unwrap();
+    drop(command);
+    StyledRun {
+        code: status.code().expect("killed by a signal"),
+        stdout: out.finish(),
+        stderr: err.finish(),
+    }
+}
+
+/// Registers another color scheme resolving to the same store entry, so one
+/// update run installs one more component.
+fn install_extra_scheme(sandbox: &Sandbox, file_stem: &str, name: &str) {
+    let path = sandbox
+        .data_home()
+        .join("color-schemes")
+        .join(format!("{file_stem}.colors"));
+    std::fs::write(&path, format!("[General]\nName={name}\n")).unwrap();
+    let registry = sandbox.registry_path();
+    let content = std::fs::read_to_string(&registry).unwrap();
+    let entry = format!(
+        r#"  <stuff category="112">
+    <name>{name}</name>
+    <providerid>api.kde-look.org</providerid>
+    <version>1.0</version>
+    <installedfile>{installed}</installedfile>
+    <id>{id}</id>
+    <status>installed</status>
+  </stuff>
+</hotnewstuffregistry>"#,
+        installed = path.display(),
+        id = common::SCHEME_ID,
+    );
+    std::fs::write(&registry, content.replace("</hotnewstuffregistry>", &entry)).unwrap();
+}
+
+/// Registers a second color scheme that resolves to the same store entry, so
+/// one update run installs two components.
+fn install_second_scheme(sandbox: &Sandbox) {
+    install_extra_scheme(sandbox, "Second", "Second Scheme");
+}
+
+/// At a known width, a failure reason wider than the terminal must leave
+/// exactly one row per component: the redraw can only erase the rows it
+/// counted, so a line that wraps would leave a stale duplicate above.
+#[test]
+fn a_wide_failure_at_a_known_width_leaves_one_row_per_component() {
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    install_second_scheme(&sandbox);
+    let store = FakeStore::start(Listing {
+        md5_override: Some("00000000000000000000000000000000"),
+        ..Listing::default()
+    });
+    let env = [("TERM", "xterm-256color")];
+    let run = on_sized_terminals(&sandbox, &store, UPDATE, &env, 110, 40);
+    assert_eq!(run.code, 1, "{}", describe(&env, &run));
+    let screen = sized_screen(&run.stderr, 110, 40);
+    let failed: Vec<&String> = screen
+        .iter()
+        .filter(|row| row.starts_with("\u{2717} "))
+        .collect();
+    assert_eq!(
+        failed.len(),
+        2,
+        "a component's row was duplicated or lost: {screen:#?}"
+    );
+    assert!(
+        failed
+            .iter()
+            .any(|row| row.starts_with("\u{2717} Second Scheme [ failed ]")),
+        "no row for the second component: {screen:#?}"
+    );
+    assert!(
+        !screen
+            .iter()
+            .any(|row| row.contains('\u{2588}') || row.contains('\u{2591}')),
+        "a progress bar is left on the final screen: {screen:#?}"
+    );
+}
+
+/// The failure table wraps its ERROR cell inside the column at a known width,
+/// instead of letting the terminal wrap the row back to column 0.
+#[test]
+fn the_failure_table_wraps_the_error_inside_its_column() {
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing {
+        md5_override: Some("00000000000000000000000000000000"),
+        ..Listing::default()
+    });
+    let env = [("TERM", "xterm-256color")];
+    let run = on_sized_terminals(&sandbox, &store, UPDATE, &env, 110, 40);
+    assert_eq!(run.code, 1, "{}", describe(&env, &run));
+    let screen = sized_screen(&run.stderr, 110, 40);
+    let header = screen
+        .iter()
+        .position(|row| row.starts_with("NAME") && row.contains("KIND") && row.contains("ERROR"))
+        .unwrap_or_else(|| panic!("no failure table header: {screen:#?}"));
+    let table: Vec<&String> = screen[header..]
+        .iter()
+        .filter(|row| !row.is_empty())
+        .collect();
+    assert!(table.len() > 2, "the message did not wrap: {screen:#?}");
+    // NAME(11) + two spaces + the `[ checksum ]` pill(12) + two spaces.
+    let error_column = 27;
+    let mut message = String::new();
+    for (index, row) in table[1..].iter().enumerate() {
+        let cells: String = row.chars().skip(error_column).collect();
+        if index == 0 {
+            message.push_str(&cells);
+        } else {
+            assert!(
+                row.chars().take(error_column).all(|ch| ch == ' '),
+                "the ERROR cell wrapped back to column 0: {screen:#?}"
+            );
+            message.push(' ');
+            message.push_str(cells.trim());
+        }
+    }
+    assert!(
+        message.starts_with("checksum mismatch: expected 00000000000000000000000000000000, got "),
+        "the wrapped message lost text: {screen:#?}"
+    );
+}
+
+/// Starts the interactive update on one pty of `cols` × `rows`, returning the
+/// running process, the pty's write end and what the pty has shown.
+fn spawn_prompt(
+    sandbox: &Sandbox,
+    store: &FakeStore,
+    env: &[(&str, &str)],
+    cols: u16,
+    rows: u16,
+) -> (
+    std::process::Child,
+    std::fs::File,
+    Arc<Mutex<Vec<u8>>>,
+    JoinHandle<()>,
+) {
+    let size = nix::pty::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(Some(&size), None).unwrap();
+    let mut command = command(sandbox, store, &["update", "--no-restart-plasma"]);
+    command
+        .envs(env.iter().copied())
+        .stdin(Stdio::from(pty.slave.try_clone().unwrap()))
+        .stdout(Stdio::from(pty.slave.try_clone().unwrap()))
+        .stderr(Stdio::from(pty.slave.try_clone().unwrap()));
+    let child = command.spawn().unwrap();
+    drop(command);
+    drop(pty.slave);
+    let master = std::fs::File::from(pty.master);
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&screen);
+    let mut reader = master.try_clone().unwrap();
+    let drain = std::thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&buffer[..n]);
+        }
+    });
+    (child, master, screen, drain)
+}
+
+/// Waits for the prompt's first full frame — the prompt line and the
+/// highlighted option's caret, the content the assertions read — bounded by a
+/// deadline, so a loaded runner that draws the caret late never fails a
+/// correct frame.
+fn wait_for_prompt(screen: &Arc<Mutex<Vec<u8>>>, child: &mut std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let shown = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+        if shown.contains("select to apply") && shown.contains('\u{276f}') {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the prompt never finished drawing: {shown:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The caret belongs to the highlighted option only; the prompt line takes a
+/// plain question mark, so the screen never shows two carets at once.
+#[test]
+fn the_prompt_line_carries_no_caret_glyph() {
+    let (sandbox, store) = pending_update();
+    let env = [("TERM", "xterm-256color")];
+    let (mut child, mut master, screen, drain) = spawn_prompt(&sandbox, &store, &env, 110, 40);
+    wait_for_prompt(&screen, &mut child);
+    let live = screen.lock().unwrap().clone();
+    master.write_all(b"\x1b").unwrap();
+    let status = child.wait().unwrap();
+    drain.join().unwrap();
+    assert_eq!(status.code(), Some(0));
+    let rows = sized_screen(&live, 110, 40);
+    let prompt_row = rows
+        .iter()
+        .find(|row| row.contains("select to apply"))
+        .unwrap_or_else(|| panic!("no prompt row: {rows:#?}"));
+    assert!(
+        !prompt_row.contains('\u{276f}'),
+        "the prompt line shows a caret: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.trim_start().starts_with('\u{276f}')),
+        "the highlighted option lost its caret: {rows:#?}"
+    );
+}
+
+/// The answered prompt's echo is a count, not the selected names, so the one
+/// line the caller clears always holds the whole echo: no half row is left.
+#[test]
+fn an_answered_prompt_leaves_no_half_echo_on_the_final_screen() {
+    let (sandbox, store) = pending_update();
+    let env = [("TERM", "xterm-256color")];
+    let (mut child, mut master, screen, drain) = spawn_prompt(&sandbox, &store, &env, 60, 40);
+    wait_for_prompt(&screen, &mut child);
+    master.write_all(b"\r").unwrap();
+    let status = child.wait().unwrap();
+    drain.join().unwrap();
+    let bytes = screen.lock().unwrap().clone();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "screen: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let rows = sized_screen(&bytes, 60, 40);
+    assert!(
+        !rows.iter().any(|row| row.contains("select to apply")),
+        "a half echo is left on the final screen: {rows:#?}"
+    );
+}
+
+/// The answered prompt's echo wraps below ~52 cols, so one clear must remove
+/// every row the wrapped line occupies. A one-row clear leaves exactly one of
+/// the two wrapped rows — the prompt text or the trailing ` selected` answer —
+/// so the assertion rejects both remnants.
+#[test]
+fn an_answered_prompt_at_a_narrow_width_leaves_no_half_echo() {
+    let (sandbox, store) = pending_update();
+    let env = [("TERM", "xterm-256color")];
+    let (mut child, mut master, screen, drain) = spawn_prompt(&sandbox, &store, &env, 40, 40);
+    wait_for_prompt(&screen, &mut child);
+    master.write_all(b"\r").unwrap();
+    let status = child.wait().unwrap();
+    drain.join().unwrap();
+    let bytes = screen.lock().unwrap().clone();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "screen: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let rows = sized_screen(&bytes, 40, 40);
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("select to apply") || row.contains("selected")),
+        "a half echo is left on the final screen: {rows:#?}"
+    );
+}
+
+/// With more components than the terminal has rows, the live block is bounded
+/// by the screen height, so no stale bar frame lands in scrollback and the
+/// final screen keeps exactly one row per component.
+#[test]
+fn a_block_taller_than_the_screen_leaves_no_stale_frames_in_scrollback() {
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    install_second_scheme(&sandbox);
+    install_extra_scheme(&sandbox, "Third", "Third Scheme");
+    let store = FakeStore::start(Listing {
+        md5_override: Some("00000000000000000000000000000000"),
+        ..Listing::default()
+    });
+    let env = [("TERM", "xterm-256color")];
+    let run = on_sized_terminals(&sandbox, &store, UPDATE, &env, 100, 3);
+    assert_eq!(run.code, 1, "{}", describe(&env, &run));
+    let mut parser = vt100::Parser::new(
+        std::num::NonZero::new(3).unwrap(),
+        std::num::NonZero::new(100).unwrap(),
+        1000,
+    );
+    parser.process(&run.stderr);
+    let scrollback = parser.screen().scrollback_len();
+    parser.screen_mut().set_scrollback(scrollback);
+    let rows: Vec<String> = parser
+        .screen()
+        .rows(0, 100)
+        .map(|row| row.trim_end().to_string())
+        .collect();
+    let failed: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.starts_with('\u{2717}'))
+        .collect();
+    assert_eq!(
+        failed.len(),
+        3,
+        "a component's row was duplicated or lost: {rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains('\u{2588}') || row.contains('\u{2591}')),
+        "a stale bar frame is left in the scrollback or the final screen: {rows:#?}"
     );
 }

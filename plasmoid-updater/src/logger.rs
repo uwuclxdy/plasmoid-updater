@@ -3,10 +3,9 @@
 //! The stderr log backend: `-q` keeps errors, the default keeps warnings,
 //! `-v` adds info and `-vv` debug. `RUST_LOG` is deliberately not consulted.
 
-use std::io::Write as _;
 use std::sync::OnceLock;
 
-use libplasmoid_updater::cli::{Stream, styled};
+use libplasmoid_updater::cli::{Stream, print_above, styled};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 static LOGGER: OnceLock<StderrLogger> = OnceLock::new();
@@ -47,13 +46,11 @@ impl Log for StderrLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let mut stderr = std::io::stderr().lock();
-        let _ = writeln!(
-            stderr,
-            "{}",
-            line(record.level(), &record.args().to_string(), self.color)
-        );
-        let _ = stderr.flush();
+        print_above(&line(
+            record.level(),
+            &record.args().to_string(),
+            self.color,
+        ));
     }
 
     fn flush(&self) {}

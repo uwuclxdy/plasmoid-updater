@@ -246,8 +246,8 @@ fn a_component_with_no_matching_download_is_a_failure_not_a_skip() {
         &["--skip-plasma-detection", "update", "-y"],
     );
     assert_eq!(run.code, 1, "{run}");
-    assert!(run.stdout.contains("1 failed"), "{run}");
-    assert!(run.stdout.contains("0 skipped"), "{run}");
+    assert!(run.stdout.contains("failed 1"), "{run}");
+    assert!(!run.stdout.contains("skipped"), "{run}");
     common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
 }
 
@@ -270,7 +270,7 @@ fn a_named_component_with_no_matching_download_fails_the_update() {
         ],
     );
     assert_eq!(run.code, 1, "{run}");
-    assert!(run.stdout.contains("1 failed"), "{run}");
+    assert!(run.stdout.contains("failed 1"), "{run}");
     assert!(run.stderr.contains(SCHEME_NAME), "{run}");
 }
 
@@ -410,7 +410,7 @@ fn a_no_matching_download_prints_one_failure_row_not_a_diagnostic() {
         &["--skip-plasma-detection", "update", "-y"],
     );
     assert_eq!(update_run.code, 1, "{update_run}");
-    assert!(update_run.stdout.contains("1 failed"), "{update_run}");
+    assert!(update_run.stdout.contains("failed 1"), "{update_run}");
     assert!(
         !update_run.stderr.contains("failed to check"),
         "{update_run}"

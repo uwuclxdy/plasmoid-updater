@@ -37,9 +37,26 @@ fn check_dependency(name: &'static str) -> crate::Result<()> {
 pub(crate) fn fetch_updates(
     api_client: &ApiClient,
     config: &Config,
+    reporter: &dyn Reporter,
 ) -> crate::Result<UpdateCheckResult> {
     let components = find_installed(config.system)?;
+    reporter.event(&Event::Checking {
+        components: components.len(),
+    });
+    // Closes the check part on every path out of this function, a panic
+    // unwinding out of the store check included.
+    let _checked = CheckedOnDrop(reporter);
     check_with_components(config, api_client, components)
+}
+
+/// Emits [`Event::Checked`] once when dropped, so a check that sent
+/// [`Event::Checking`] always sends its closing event, a panic included.
+struct CheckedOnDrop<'a>(&'a dyn Reporter);
+
+impl Drop for CheckedOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.event(&Event::Checked);
+    }
 }
 
 /// Decides whether a candidate update is excluded from selection.
@@ -231,6 +248,7 @@ fn report_outcome(
             reporter.event(&Event::Installed {
                 name: component.name.clone(),
                 id,
+                version: outcome.expected_version.clone(),
             });
         }
         Ok(outcome) => {
