@@ -18,7 +18,7 @@ Runtime dependencies:
 
 - **Component Discovery** – Detects installed Plasmoids and other Plasma components
 - **Multithreaded** update checking and installation via Rayon
-- **Automatic Backups** with rollback on failure, kept under `$XDG_CACHE_HOME/plasmoid-updater/backups/` (the 5 most recent per component type are kept)
+- **Automatic Backups** with rollback on failure, kept under `$XDG_CACHE_HOME/plasmoid-updater/backups/` for user components and `/var/lib/plasmoid-updater/backups/` (root-owned) for `--system` ones (the 5 most recent per component type are kept)
 - **Registry Integration** – Maintains KNewStuff registry compatibility
 - **Sleep Inhibition** – Prevents system sleep during installs (logind DBus or systemd-inhibit)
 - **Plasma 6 Support** – Linux and KDE Plasma 6 only
