@@ -33,7 +33,7 @@ Plasma Widgets, Wallpaper Plugins, KWin Effects/Scripts/Switchers, Global Themes
 
 | function | description |
 | --- | --- |
-| `check(&Config) -> Result<CheckResult>` | scan for available updates to installed KDE components |
+| `check(&Config, &dyn Reporter) -> Result<CheckResult>` | scan for available updates to installed KDE components |
 | `update(&Config, &dyn Reporter) -> Result<UpdateResult>` | install every non-excluded available update |
 | `install(&[AvailableUpdate], &Config, &dyn Reporter) -> Result<UpdateResult>` | install a caller-chosen selection exactly as given (exclusions apply once, in `check`; an empty selection takes the run lock and repairs what a killed run left stranded, or returns an empty result when another run already holds the lock) |
 | `restart_plasmashell() -> Result<()>` | restart plasmashell via systemd; the caller decides when |
@@ -41,7 +41,7 @@ Plasma Widgets, Wallpaper Plugins, KWin Effects/Scripts/Switchers, Global Themes
 
 ### Reporter
 
-Progress leaves the core only through a `Reporter` hook that does nothing by default (plain `&()` works; a named type is an empty `impl Reporter for T {}`). `Event::Checking` is emitted by `update()` (not `install()`, whose caller drives the check itself); `Event::Downloading { name, id, bytes, total }`, `Event::Installed { name, id }` and `Event::Failed { name, id, message }` are emitted by both during the install. `Event` is `#[non_exhaustive]`. Each per-component event carries `name`, the display name to render, and `id`, the component's installed path — unique within a run, so reporters can key progress rows on it.
+Progress leaves the core only through a `Reporter` hook that does nothing by default (plain `&()` works; a named type is an empty `impl Reporter for T {}`). `Event::Checking { components }` is emitted once by `check()` and by `update()`, after the scan has counted the installed components the run will check, and `Event::Checked` closes that part on every path, a store error or a panic included (`install()` emits neither; its caller drives the check itself and passes the reporter to `check()`). `Event::Downloading { name, id, bytes, total }`, `Event::Installed { name, id, version }` and `Event::Failed { name, id, message }` are emitted during the install; `version` is the version the install verified, the same one `UpdateResult::succeeded` records. `Event` is `#[non_exhaustive]`. Each per-component event carries `name`, the display name to render, and `id`, the component's installed path — unique within a run, so reporters can key progress rows on it.
 
 ### Errors
 
@@ -98,7 +98,7 @@ Default features: `cli`, `inhibit`.
 
 | feature | description |
 | --- | --- |
-| `cli` | Terminal kit: `cli::styled(Stream)` (whether a stream takes styling, with the rule clap's `--help` follows), `cli::ProgressReporter` (stderr progress; colour follows `cli::styled`, animation additionally needs a terminal stderr), `cli::select` (multi-select prompt, styled by the same predicate; an empty list returns empty, a non-empty one needs a TTY stdin, and Ctrl-C raises SIGINT in the calling process so a caller that handles it gets an empty selection back while a killed run's terminal is restored by a watchdog process; needs `sh` and `stty` while the prompt is open), `cli::print_failures` (failure table on stderr), and the check/installed tables as strings the caller prints (`updates_table`, `components_table`; the caller names the stream it prints on, and their bold follows `cli::styled` for that stream). Pulls in comfy-table, bytesize, inquire, anstream. |
+| `cli` | Terminal kit: `cli::styled(Stream)` (whether a stream takes styling, with the rule clap's `--help` follows), `cli::ProgressReporter` (stderr progress; colour follows `cli::styled`, animation additionally needs a terminal stderr; one reporter draws at a time, a settled one starts a fresh block below later output, and on a terminal each redrawn line is clipped to the terminal width so a redraw never miscounts its rows), `cli::print_above` (writes a log line above the live progress block and redraws its rows intact, or plainly on stderr when none is live; safe from any thread), `cli::select` (multi-select prompt, styled by the same predicate; an empty list returns empty, a non-empty one needs a TTY stdin, and Ctrl-C raises SIGINT in the calling process so a caller that handles it gets an empty selection back while a killed run's terminal is restored by a watchdog process; needs `sh` and `stty` while the prompt is open), `cli::print_failures` (failure table on stderr), `cli::update_summary` (the `updated 1 · failed 1 · skipped 2` line, hiding zero counts), and the check/installed tables as strings the caller prints (`updates_table`, `components_table`; the caller names the stream it prints on). Every colour comes from one palette: 24-bit RGB on a `COLORTERM=truecolor` terminal, the xterm-256 index otherwise, and plain text when `cli::styled` is false. Pulls in comfy-table, bytesize, inquire, anstream. |
 | `inhibit` | Inhibit system sleep/shutdown via logind DBus during installs. Pulls in zbus. Without this feature the library falls back to spawning `systemd-inhibit` as a subprocess. |
 
 To use the library without terminal dependencies:

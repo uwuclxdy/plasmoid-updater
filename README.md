@@ -93,7 +93,7 @@ With `--system`, only a real `update` authenticates through `sudo -v`; `check`, 
 
 By default a run restarts nothing. After updates to widgets, plasma styles, global themes, splash screens or KWin switchers, `--restart-plasma` restarts plasmashell, `prompt_restart = true` in the config asks first (on a terminal only; on a non-interactive stdin the prompt is skipped with a warning naming `--restart-plasma`), and `--no-restart-plasma` skips it. The two flags conflict at parse time (exit 2).
 
-Components that fail to update don't stop the run: failures are summarized at the end, and the run exits 1 when any component failed or could not be checked. An install whose post-install version cannot be verified counts as a failure too, so it exits 1 as well.
+Components that fail to update don't stop the run: the run ends with a one-line summary on stdout naming the non-zero counts (`updated 1 · failed 1 · skipped 2`, with a zero count left out), and it exits 1 when any component failed or could not be checked. An install whose post-install version cannot be verified counts as a failure too, so it exits 1 as well.
 
 ## Exit codes
 
