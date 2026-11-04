@@ -1425,13 +1425,20 @@ fn an_answered_prompt_at_a_narrow_width_leaves_no_half_echo() {
 
 /// With more components than the terminal has rows, the live block is bounded
 /// by the screen height, so no stale bar frame lands in scrollback and the
-/// final screen keeps exactly one row per component.
+/// final screen keeps exactly one row per component. A warning printed above
+/// the block keeps the read honest: a check that looks only at the oldest
+/// screenful sees the warning and loses a row.
 #[test]
 fn a_block_taller_than_the_screen_leaves_no_stale_frames_in_scrollback() {
     let sandbox = Sandbox::new();
     sandbox.install_old_scheme();
     install_second_scheme(&sandbox);
     install_extra_scheme(&sandbox, "Third", "Third Scheme");
+    std::fs::write(
+        sandbox.config_dir().join("plasmoid-updater.toml"),
+        "excluded_patterns = [\"(\"]\n",
+    )
+    .unwrap();
     let store = FakeStore::start(Listing {
         md5_override: Some("00000000000000000000000000000000"),
         ..Listing::default()
@@ -1446,6 +1453,11 @@ fn a_block_taller_than_the_screen_leaves_no_stale_frames_in_scrollback() {
     );
     parser.process(&run.stderr);
     let rows = whole_history(&mut parser, 100);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("ignoring invalid exclude pattern")),
+        "the fixture's warning is missing from the history: {rows:#?}"
+    );
     let failed: Vec<&String> = rows
         .iter()
         .filter(|row| row.starts_with('\u{2717}'))
@@ -1485,7 +1497,8 @@ fn whole_history(parser: &mut vt100::Parser, cols: u16) -> Vec<String> {
 
 /// A user run reads no system data directory, so an `XDG_DATA_DIRS` entry that
 /// fails the trust check (a per-user export directory, the GitHub runner's
-/// `/usr/share`) draws no trust warning on `check` or `update`.
+/// `/usr/share`) draws no trust warning on `check` or `update`; a `--system`
+/// run in the same env names that entry once.
 #[test]
 fn a_user_run_draws_no_warning_from_an_untrusted_xdg_data_dir() {
     // As root the sandbox directory is root-owned and passes the trust check,
@@ -1513,4 +1526,27 @@ fn a_user_run_draws_no_warning_from_an_untrusted_xdg_data_dir() {
             describe(&env, &run)
         );
     }
+
+    // Positive control in the same env: a `--system` run does judge the dir,
+    // and names it exactly once however many registries and component types
+    // consult the system data dirs.
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    std::fs::create_dir_all(sandbox.data_home().join("plasma/plasmoids")).unwrap();
+    let store = FakeStore::start(Listing::default());
+    let user_owned = sandbox.data_home().to_str().unwrap().to_owned();
+    let env = [("XDG_DATA_DIRS", user_owned.as_str())];
+    // No exit-code pin: the KPackage types scan fixed system dirs
+    // (`/usr/share/plasma/plasmoids`, ...) whatever `XDG_DATA_DIRS` says, so
+    // the outcome depends on what the host has installed.
+    let run = on_sized_terminals(&sandbox, &store, &["--system", "check"], &env, 200, 40);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let named = format!("warn: ignoring {user_owned:?}: ");
+    let warnings = stderr.lines().filter(|line| line.contains(&named)).count();
+    assert_eq!(
+        warnings,
+        1,
+        "a --system run must warn about the untrusted dir once: {}",
+        describe(&env, &run)
+    );
 }

@@ -75,9 +75,9 @@ pub(crate) fn captured_warnings_for(target: &str) -> Vec<String> {
 /// Runs `run`, returning the lines logged from the moment it started.
 ///
 /// The buffer is shared by every test in the process and never cleared, so a
-/// line another test's thread logs in the window can appear here too; every
-/// caller checks with `any`, and clearing would make a concurrent test's
-/// evidence vanish.
+/// line another test's thread logs in the window can appear here too; a caller
+/// checks with `any`, or counts only lines naming a fixture no other test
+/// uses, and clearing would make a concurrent test's evidence vanish.
 pub(crate) fn captured_logs_while(run: impl FnOnce()) -> Vec<String> {
     capture_logs();
     let mark = LOG_LINES.lock().map(|lines| lines.len()).unwrap_or(0);

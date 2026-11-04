@@ -294,14 +294,9 @@ fn post_install_tasks(update: &AvailableUpdate) -> Result<(), ComponentFailure> 
 }
 
 fn verify_installed_version(update: &AvailableUpdate) -> InstallOutcome {
-    let system_roots = if update.installed.is_system {
-        crate::paths::system_data_dirs()
-    } else {
-        Vec::new()
-    };
     verify_installed_version_trusting(
         update,
-        &system_roots,
+        crate::paths::system_data_dirs(update.installed.is_system),
         &crate::paths::knewstuff_dir(),
         crate::paths::is_trusted_system_path,
     )

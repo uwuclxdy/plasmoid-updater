@@ -35,7 +35,7 @@ pub(crate) fn scan_registry_components(
     system: bool,
 ) -> Result<Vec<InstalledComponent>> {
     if system {
-        return scan_system_components(component_type, &crate::paths::system_data_dirs());
+        return scan_system_components(component_type, crate::paths::system_data_dirs(system));
     }
 
     let Some(manager) = RegistryManager::for_component_type(component_type) else {
@@ -185,7 +185,8 @@ fn scan_system_components_trusting(
 
 /// Returns each trusted root's registry file for `registry_file`, in root
 /// order, keeping only the ones whose `knewstuff3` directory and file are
-/// trusted too. A path that fails the check is named in a warning by `trusted`.
+/// trusted too. A path that fails the check is named in a warning by `trusted`
+/// the first time it is refused.
 fn trusted_registries(
     roots: &[PathBuf],
     registry_file: &str,
@@ -226,16 +227,11 @@ pub(crate) fn load_registry_map(
     component_type: ComponentType,
     system: bool,
 ) -> Result<HashMap<String, RegistryEntry>> {
-    let system_roots = if system {
-        crate::paths::system_data_dirs()
-    } else {
-        Vec::new()
-    };
     load_registry_map_trusting(
         component_type,
         system,
         &crate::paths::knewstuff_dir(),
-        &system_roots,
+        crate::paths::system_data_dirs(system),
         crate::paths::is_trusted_system_path,
     )
 }
@@ -326,15 +322,10 @@ fn install_key(component_type: ComponentType, installed_path: &Path) -> Registry
 /// running as the user, so an entry in it must never choose the store content a
 /// privileged update installs.
 pub(crate) fn build_id_cache(system: bool) -> RegistryIdCache {
-    let system_roots = if system {
-        crate::paths::system_data_dirs()
-    } else {
-        Vec::new()
-    };
     build_id_cache_trusting(
         system,
         &crate::paths::knewstuff_dir(),
-        &system_roots,
+        crate::paths::system_data_dirs(system),
         crate::paths::is_trusted_system_path,
     )
 }
@@ -417,13 +408,9 @@ fn build_id_cache_trusting(
 /// system registries.
 pub(crate) fn update_registry_after_install(update: &AvailableUpdate) -> Result<()> {
     let component = &update.installed;
-    let system_roots = if component.is_system {
-        crate::paths::system_data_dirs()
-    } else {
-        Vec::new()
-    };
+    let system_roots = crate::paths::system_data_dirs(component.is_system);
 
-    let Some((registry, system)) = registry_target(component, &system_roots) else {
+    let Some((registry, system)) = registry_target(component, system_roots) else {
         if component.is_system {
             log::warn!(
                 target: "registry",
