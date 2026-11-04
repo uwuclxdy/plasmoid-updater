@@ -75,7 +75,17 @@ impl<'a> ExcludeMatcher<'a> {
     pub(crate) fn new(exact: &'a [String], patterns: &'a [String]) -> ExcludeMatcher<'a> {
         Self {
             exact,
-            patterns: compile_exclude_patterns(patterns),
+            patterns: compile_exclude_patterns(patterns, InvalidPattern::Warn),
+        }
+    }
+
+    /// Builds a matcher like [`new`](Self::new) but drops invalid patterns
+    /// silently: a run's own matcher already warned about them, and a caller
+    /// asking about one component after that run must not warn again.
+    pub(crate) fn quiet(exact: &'a [String], patterns: &'a [String]) -> ExcludeMatcher<'a> {
+        Self {
+            exact,
+            patterns: compile_exclude_patterns(patterns, InvalidPattern::Ignore),
         }
     }
 
@@ -100,18 +110,34 @@ impl<'a> ExcludeMatcher<'a> {
     }
 }
 
+/// What compiling an exclusion set does with a pattern that does not parse.
+#[derive(Clone, Copy)]
+enum InvalidPattern {
+    Warn,
+    Ignore,
+}
+
 /// Compiles exclusion patterns into a single [`regex::RegexSet`].
 ///
 /// Each pattern is validated individually so a single bad pattern only drops
-/// itself (with a warning) instead of discarding the whole set. Returns `None`
-/// when no usable pattern remains, letting the matcher skip regex work entirely.
-fn compile_exclude_patterns(patterns: &[String]) -> Option<regex::RegexSet> {
+/// itself (with a warning under [`InvalidPattern::Warn`]) instead of discarding
+/// the whole set. Returns `None` when no usable pattern remains, letting the
+/// matcher skip regex work entirely.
+fn compile_exclude_patterns(
+    patterns: &[String],
+    invalid: InvalidPattern,
+) -> Option<regex::RegexSet> {
     let valid: Vec<&str> = patterns
         .iter()
         .filter(|p| match regex::Regex::new(p) {
             Ok(_) => true,
             Err(e) => {
-                log::warn!(target: "config", "ignoring invalid exclude pattern {p:?}: {e}");
+                match invalid {
+                    InvalidPattern::Warn => {
+                        log::warn!(target: "config", "ignoring invalid exclude pattern {p:?}: {e}");
+                    }
+                    InvalidPattern::Ignore => {}
+                }
                 false
             }
         })
@@ -282,12 +308,17 @@ fn unverified_message(outcome: &InstallOutcome) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compile_exclude_patterns;
+    use crate::testutil::logs::captured_logs_while;
+
+    use super::{ExcludeMatcher, InvalidPattern, compile_exclude_patterns};
 
     #[test]
     fn compile_keeps_valid_patterns_and_matches_both_substrings_and_anchors() {
-        let set = compile_exclude_patterns(&[r"^org\.kde\.".to_string(), "weather".to_string()])
-            .expect("two valid patterns should compile");
+        let set = compile_exclude_patterns(
+            &[r"^org\.kde\.".to_string(), "weather".to_string()],
+            InvalidPattern::Warn,
+        )
+        .expect("two valid patterns should compile");
 
         assert!(set.is_match("org.kde.plasma.systemmonitor"));
         assert!(set.is_match("my-weather-widget"));
@@ -297,10 +328,13 @@ mod tests {
 
     #[test]
     fn compile_drops_only_the_invalid_pattern() {
-        let set = compile_exclude_patterns(&[
-            "valid".to_string(),
-            "(".to_string(), // unbalanced group — invalid
-        ])
+        let set = compile_exclude_patterns(
+            &[
+                "valid".to_string(),
+                "(".to_string(), // unbalanced group — invalid
+            ],
+            InvalidPattern::Warn,
+        )
         .expect("the one valid pattern should survive");
 
         assert_eq!(set.len(), 1);
@@ -309,8 +343,68 @@ mod tests {
 
     #[test]
     fn compile_returns_none_when_empty_or_all_invalid() {
-        assert!(compile_exclude_patterns(&[]).is_none());
-        assert!(compile_exclude_patterns(&["(".to_string()]).is_none());
+        assert!(compile_exclude_patterns(&[], InvalidPattern::Warn).is_none());
+        assert!(compile_exclude_patterns(&["(".to_string()], InvalidPattern::Warn).is_none());
+    }
+
+    /// Invalid patterns no other test compiles, one per test: the capture is
+    /// process-wide, so a pattern two concurrent tests share lets one test's
+    /// warning land in the other's window.
+    const QUIET_INVALID_PATTERN: &str = "(quiet-unclosed";
+    const RUN_INVALID_PATTERN: &str = "(run-unclosed";
+
+    fn invalid_pattern_warnings<'a>(lines: &'a [String], pattern: &str) -> Vec<&'a str> {
+        let warning = format!("ignoring invalid exclude pattern {pattern:?}");
+        lines
+            .iter()
+            .filter(|line| line.contains(&warning))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// An invalid pattern is dropped with a warning on the run's matcher, but
+    /// asking `Config::excludes` after that run repeats no warning.
+    #[test]
+    fn excludes_logs_no_warning_for_an_invalid_pattern() {
+        let config =
+            crate::Config::new().with_excluded_patterns(vec![QUIET_INVALID_PATTERN.to_string()]);
+        let component = crate::InstalledComponent::new(
+            "Weather Widget",
+            "org.example.weather",
+            crate::ComponentType::PlasmaWidget,
+            "/plasmoids/org.example.weather",
+        );
+
+        let mut excluded = None;
+        let logged = captured_logs_while(|| {
+            excluded = Some(config.excludes(&component));
+        });
+
+        assert_eq!(
+            excluded,
+            Some(false),
+            "an invalid pattern excluded the component"
+        );
+        let warnings = invalid_pattern_warnings(&logged, QUIET_INVALID_PATTERN);
+        assert!(
+            warnings.is_empty(),
+            "asking whether a component is excluded warned again: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn the_run_matcher_logs_an_invalid_pattern_once() {
+        let patterns = vec![RUN_INVALID_PATTERN.to_string()];
+        let logged = captured_logs_while(|| {
+            let _matcher = ExcludeMatcher::new(&[], &patterns);
+        });
+
+        let warnings = invalid_pattern_warnings(&logged, RUN_INVALID_PATTERN);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the run's matcher did not warn exactly once for the invalid pattern: {warnings:?}"
+        );
     }
 
     #[test]

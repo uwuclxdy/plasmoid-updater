@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::{InstalledComponent, utils::ExcludeMatcher};
+
 /// Default embedded widgets-id mapping file provided by Apdatifier.
 ///
 /// This file maps component directory names to KDE Store content IDs
@@ -247,6 +249,37 @@ impl Config {
     pub fn with_excluded_patterns(mut self, patterns: Vec<String>) -> Self {
         self.excluded_patterns = patterns;
         self
+    }
+
+    /// Tells whether this configuration's exclusion rules exclude `component`,
+    /// by the same rules [`check`](crate::check) and [`update`](crate::update)
+    /// apply: an [`excluded_packages`](Self::excluded_packages) entry equal to
+    /// its directory name or display name, or an
+    /// [`excluded_patterns`](Self::excluded_patterns) regex matching either,
+    /// unanchored.
+    ///
+    /// An invalid pattern matches nothing. Unlike a run, this logs no warning
+    /// for it, so asking after a run on the same configuration repeats none.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use libplasmoid_updater::{ComponentType, Config, InstalledComponent};
+    ///
+    /// let widget = InstalledComponent::new(
+    ///     "Weather Widget",
+    ///     "org.example.weather",
+    ///     ComponentType::PlasmaWidget,
+    ///     "/home/me/.local/share/plasma/plasmoids/org.example.weather",
+    /// );
+    ///
+    /// let config = Config::new().with_excluded_patterns(vec![r"\.weather$".to_string()]);
+    /// assert!(config.excludes(&widget));
+    /// assert!(!Config::new().excludes(&widget));
+    /// ```
+    pub fn excludes(&self, component: &InstalledComponent) -> bool {
+        ExcludeMatcher::quiet(&self.excluded_packages, &self.excluded_patterns)
+            .is_excluded_component(component)
     }
 
     /// Sets the OCS base URL every store request (listing and per-id lookup)

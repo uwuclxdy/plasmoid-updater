@@ -1603,3 +1603,53 @@ fn update_reports_the_count_and_the_installed_version() {
         store.url(),
     );
 }
+
+/// `Config::excludes` answers with the same rules `check` and `update` apply:
+/// an exact rule matches the directory name or the display name, a pattern
+/// matches either unanchored, and an invalid pattern matches nothing while the
+/// valid ones beside it still apply.
+#[test]
+fn excludes_applies_the_exact_and_pattern_rules_to_a_component() {
+    let widget = InstalledComponent::new(
+        "Weather Widget",
+        "org.example.weather",
+        ComponentType::PlasmaWidget,
+        "/tmp/plasmoids/org.example.weather",
+    );
+    let other = InstalledComponent::new(
+        "Clock",
+        "org.example.clock",
+        ComponentType::PlasmaWidget,
+        "/tmp/plasmoids/org.example.clock",
+    );
+
+    assert!(
+        !Config::new().excludes(&widget),
+        "a config with no exclusion rules excluded the component"
+    );
+
+    let by_dir = Config::new().with_excluded_packages(vec!["org.example.weather".to_string()]);
+    assert!(by_dir.excludes(&widget));
+    assert!(!by_dir.excludes(&other));
+
+    let by_name = Config::new().with_excluded_packages(vec!["Weather Widget".to_string()]);
+    assert!(by_name.excludes(&widget));
+    assert!(!by_name.excludes(&other));
+
+    // An exact rule is whole-name: a prefix of the name excludes nothing.
+    let partial = Config::new().with_excluded_packages(vec!["Weather".to_string()]);
+    assert!(!partial.excludes(&widget));
+
+    let by_dir_pattern = Config::new().with_excluded_patterns(vec![r"\.weath".to_string()]);
+    assert!(by_dir_pattern.excludes(&widget));
+    assert!(!by_dir_pattern.excludes(&other));
+
+    let by_name_pattern = Config::new().with_excluded_patterns(vec!["r Wid".to_string()]);
+    assert!(by_name_pattern.excludes(&widget));
+    assert!(!by_name_pattern.excludes(&other));
+
+    let invalid_beside_valid =
+        Config::new().with_excluded_patterns(vec!["(".to_string(), "^Clock$".to_string()]);
+    assert!(!invalid_beside_valid.excludes(&widget));
+    assert!(invalid_beside_valid.excludes(&other));
+}

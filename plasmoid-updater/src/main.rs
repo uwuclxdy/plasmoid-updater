@@ -604,31 +604,12 @@ fn dry_run(
                 Ok(ExitCode::Success)
             }
             Named::Excluded(display_name) => {
-                if json {
-                    payload_json(&named_check_result(
-                        Vec::new(),
-                        vec![display_name],
-                        Vec::new(),
-                        Vec::new(),
-                    ))?;
-                } else {
-                    payload(format_args!("{name:?} is excluded"))?;
-                }
-                Ok(ExitCode::Success)
+                settled_dry_run(Settled::Excluded, vec![display_name], name, json)
             }
-            Named::UpToDate => {
-                if json {
-                    payload_json(&named_check_result(
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ))?;
-                } else {
-                    payload(format_args!("no update available for {name:?}"))?;
-                }
-                Ok(ExitCode::Success)
+            Named::Unmatched(display_name) => {
+                settled_dry_run(Settled::Unmatched, vec![display_name], name, json)
             }
+            Named::UpToDate => settled_dry_run(Settled::UpToDate, Vec::new(), name, json),
             Named::Unavailable(failure) => {
                 report_failure_rows(vec![failure.clone()]);
                 if json {
@@ -710,23 +691,12 @@ fn do_update_single(
             finish_update(result, restart, false, json)
         }
         Named::Excluded(display_name) => {
-            if json {
-                let mut result = lib::UpdateResult::default();
-                result.skipped.push(display_name);
-                payload_json(&result)?;
-            } else {
-                payload(format_args!("{name:?} is excluded"))?;
-            }
-            Ok(ExitCode::Success)
+            settled_update(Settled::Excluded, vec![display_name], name, json)
         }
-        Named::UpToDate => {
-            if json {
-                payload_json(&lib::UpdateResult::default())?;
-            } else {
-                payload(format_args!("no update available for {name:?}"))?;
-            }
-            Ok(ExitCode::Success)
+        Named::Unmatched(display_name) => {
+            settled_update(Settled::Unmatched, vec![display_name], name, json)
         }
+        Named::UpToDate => settled_update(Settled::UpToDate, Vec::new(), name, json),
         Named::Unavailable(failure) => {
             let mut result = lib::UpdateResult::default();
             result.failed.push(failure);
@@ -749,9 +719,14 @@ fn do_update_single(
 enum Named {
     /// Pending updates for the installed component the name matched.
     Updates(Vec<lib::AvailableUpdate>),
-    /// The installed component is excluded by the configuration, with its
-    /// display name, the name `skipped` lists on every path.
+    /// An exclusion rule in the configuration matches the installed component,
+    /// with its display name, the name `skipped` lists on every path.
     Excluded(String),
+    /// No exclusion rule matches the installed component and the check's
+    /// `skipped` lists its display name: under `--system`, no store entry of
+    /// its type matches it, or a same-named system sibling's does not, since
+    /// `skipped` carries display names only.
+    Unmatched(String),
     /// The installed component has no pending update.
     UpToDate,
     /// The installed component's store entry offers no download link for its
@@ -797,6 +772,15 @@ fn resolve_named(
         return Ok(Named::Unknown);
     };
 
+    Ok(classify_installed(component, config, check_result))
+}
+
+/// Classifies an installed component the check left without an update row.
+fn classify_installed(
+    component: &lib::InstalledComponent,
+    config: &lib::Config,
+    check_result: &lib::CheckResult,
+) -> Named {
     // A component the check could not settle has no update row to match, and
     // saying "no update available" would claim what the check did not learn.
     if let Some(diagnostic) = check_result
@@ -804,20 +788,88 @@ fn resolve_named(
         .iter()
         .find(|diagnostic| diagnostic.name == component.name)
     {
-        return Ok(Named::CheckFailed(diagnostic.clone()));
+        return Named::CheckFailed(diagnostic.clone());
     }
 
-    // The check's skipped list holds an excluded component's display name,
-    // whichever rule — exact or pattern — matched it.
-    let excluded = check_result.skipped.contains(&component.name)
-        || config.excluded_packages.iter().any(|rule| {
-            *rule == name || *rule == component.name || *rule == component.directory_name
-        });
-    if excluded {
-        Ok(Named::Excluded(component.name.clone()))
+    // `skipped` holds excluded components and, under `--system`, those no
+    // store entry matches, so only the rules themselves can tell them apart.
+    // It lists display names, which siblings can share: a user component is
+    // never skipped for want of a store entry, and a system one can read
+    // unmatched through a same-named sibling's skip.
+    if config.excludes(component) {
+        Named::Excluded(component.name.clone())
+    } else if component.is_system && check_result.skipped.contains(&component.name) {
+        Named::Unmatched(component.name.clone())
     } else {
-        Ok(Named::UpToDate)
+        Named::UpToDate
     }
+}
+
+/// The line a named run prints for a component no store entry matches.
+fn unmatched_line(name: &str) -> String {
+    format!("no KDE Store entry matches {name:?}")
+}
+
+/// An outcome the check settled without a failure.
+#[derive(Clone, Copy)]
+enum Settled {
+    Excluded,
+    Unmatched,
+    UpToDate,
+}
+
+/// The stdout line and exit code a named run reports for a settled outcome:
+/// the dry run and the update path share it, so the two cannot drift.
+fn settled_outcome(settled: Settled, name: &str) -> (String, ExitCode) {
+    match settled {
+        Settled::Excluded => (format!("{name:?} is excluded"), ExitCode::Success),
+        Settled::Unmatched => (unmatched_line(name), ExitCode::Success),
+        Settled::UpToDate => (
+            format!("no update available for {name:?}"),
+            ExitCode::Success,
+        ),
+    }
+}
+
+/// Reports a settled outcome on a named dry run: the check shape with the
+/// display names `skipped` lists under `--json`, else its line.
+fn settled_dry_run(
+    settled: Settled,
+    skipped: Vec<String>,
+    name: &str,
+    json: bool,
+) -> Result<ExitCode, Stop> {
+    let (line, code) = settled_outcome(settled, name);
+    if json {
+        payload_json(&named_check_result(
+            Vec::new(),
+            skipped,
+            Vec::new(),
+            Vec::new(),
+        ))?;
+    } else {
+        payload(format_args!("{line}"))?;
+    }
+    Ok(code)
+}
+
+/// Reports a settled outcome on a named update: an update result with the
+/// display names `skipped` lists under `--json`, else its line.
+fn settled_update(
+    settled: Settled,
+    skipped: Vec<String>,
+    name: &str,
+    json: bool,
+) -> Result<ExitCode, Stop> {
+    let (line, code) = settled_outcome(settled, name);
+    if json {
+        let mut result = lib::UpdateResult::default();
+        result.skipped = skipped;
+        payload_json(&result)?;
+    } else {
+        payload(format_args!("{line}"))?;
+    }
+    Ok(code)
 }
 
 /// Reports failure rows the check already settled, before any install runs.
@@ -1251,6 +1303,129 @@ mod tests {
         assert_eq!(
             handles, 1,
             "only the payload helper may take a stdout handle"
+        );
+    }
+
+    fn system_scheme() -> crate::lib::InstalledComponent {
+        crate::lib::InstalledComponent::new(
+            "Breeze Dark",
+            "BreezeDark.colors",
+            crate::lib::ComponentType::ColorScheme,
+            "/usr/share/color-schemes/BreezeDark.colors",
+        )
+        .with_system(true)
+    }
+
+    fn skipping(name: &str) -> crate::lib::CheckResult {
+        let mut result = crate::lib::CheckResult::default();
+        result.skipped.push(name.to_string());
+        result
+    }
+
+    /// A `--system` check skips a system component no store entry matches;
+    /// no exclusion rule names it, so the named path must not call it excluded.
+    #[test]
+    fn a_skipped_component_no_rule_excludes_is_unmatched() {
+        let component = system_scheme();
+        let config = crate::lib::Config::new().with_system(true);
+        let named = super::classify_installed(&component, &config, &skipping("Breeze Dark"));
+        assert!(
+            matches!(&named, super::Named::Unmatched(name) if name == "Breeze Dark"),
+            "an unmatched skip read as another outcome"
+        );
+    }
+
+    /// An exclusion still reads as one, by an exact rule or a pattern, whether
+    /// or not the check listed the component as skipped.
+    #[test]
+    fn an_excluded_component_stays_excluded() {
+        let component = system_scheme();
+        let configs = [
+            crate::lib::Config::new()
+                .with_system(true)
+                .with_excluded_packages(vec!["BreezeDark.colors".to_string()]),
+            crate::lib::Config::new()
+                .with_system(true)
+                .with_excluded_patterns(vec!["^Breeze".to_string()]),
+        ];
+        for config in &configs {
+            for check_result in [skipping("Breeze Dark"), crate::lib::CheckResult::default()] {
+                let named = super::classify_installed(&component, config, &check_result);
+                assert!(
+                    matches!(&named, super::Named::Excluded(name) if name == "Breeze Dark"),
+                    "an excluded component read as another outcome"
+                );
+            }
+        }
+    }
+
+    /// A component neither skipped nor excluded has no pending update.
+    #[test]
+    fn a_component_neither_skipped_nor_excluded_is_up_to_date() {
+        let component = system_scheme();
+        let config = crate::lib::Config::new().with_system(true);
+        let named =
+            super::classify_installed(&component, &config, &crate::lib::CheckResult::default());
+        assert!(matches!(named, super::Named::UpToDate));
+    }
+
+    /// `skipped` lists display names, so on a user run a current component
+    /// shares its name with an excluded sibling's skip; only a system
+    /// component can be skipped for want of a store entry.
+    #[test]
+    fn a_user_component_sharing_a_skipped_name_is_up_to_date() {
+        let current = crate::lib::InstalledComponent::new(
+            "Weather Widget",
+            "b.weather",
+            crate::lib::ComponentType::PlasmaWidget,
+            "/home/me/.local/share/plasma/plasmoids/b.weather",
+        );
+        let config =
+            crate::lib::Config::new().with_excluded_packages(vec!["a.weather".to_string()]);
+        let named = super::classify_installed(&current, &config, &skipping("Weather Widget"));
+        assert!(
+            matches!(named, super::Named::UpToDate),
+            "a user component read as unmatched through a sibling's skip"
+        );
+    }
+
+    #[test]
+    fn the_unmatched_line_names_the_missing_store_entry() {
+        assert_eq!(
+            super::unmatched_line("Breeze Dark"),
+            r#"no KDE Store entry matches "Breeze Dark""#
+        );
+    }
+
+    /// The line and exit code both named paths print for a settled outcome,
+    /// keyed by outcome rather than by print arm, so the two cannot drift.
+    #[test]
+    fn settled_outcomes_print_their_line_and_succeed() {
+        let name = "BreezeDark.colors";
+
+        assert_eq!(
+            super::settled_outcome(super::Settled::Excluded, name),
+            (
+                r#""BreezeDark.colors" is excluded"#.to_string(),
+                super::ExitCode::Success
+            ),
+            "an excluded outcome printed the wrong line or exit code"
+        );
+        assert_eq!(
+            super::settled_outcome(super::Settled::Unmatched, name),
+            (
+                r#"no KDE Store entry matches "BreezeDark.colors""#.to_string(),
+                super::ExitCode::Success
+            ),
+            "an unmatched outcome printed the wrong line or exit code"
+        );
+        assert_eq!(
+            super::settled_outcome(super::Settled::UpToDate, name),
+            (
+                r#"no update available for "BreezeDark.colors""#.to_string(),
+                super::ExitCode::Success
+            ),
+            "an up-to-date outcome printed the wrong line or exit code"
         );
     }
 }
