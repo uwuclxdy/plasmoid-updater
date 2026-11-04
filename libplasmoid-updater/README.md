@@ -61,6 +61,7 @@ Built with a builder table via `Config::new()`:
 | `with_threads(usize)` | max parallel install threads (default: logical CPU count) |
 | `with_skip_plasma_detection(bool)` | skip KDE environment check (for CI/testing) |
 | `with_inhibit_idle(bool)` | inhibit system sleep during installs (default: `true`) |
+| `excludes(&InstalledComponent) -> bool` | whether the exclusion rules above exclude a component, by the same rules `check()` and `update()` apply; an invalid pattern matches nothing and logs no warning |
 | `Config::parse_widgets_id(&str)` | parse text in the `widgets-id` format into a fallback table for `with_widgets_id_table` |
 
 ### Types
