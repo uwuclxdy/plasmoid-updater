@@ -152,7 +152,7 @@ fn compile_exclude_patterns(
 }
 
 /// Applies `config`'s exclusion rules to a check result: excluded components
-/// leave `updates` and their names land in `skipped`.
+/// leave `updates` and `unmatched`, and their names land in `skipped`.
 ///
 /// [`check`](crate::check) and [`update`](crate::update) each call it on their
 /// own result, and every later stage works on the filtered list;
@@ -184,6 +184,12 @@ pub(crate) fn apply_exclusions(
         }
     }
     result.no_matching_download = unavailable;
+
+    // An excluded component is skipped for its exclusion, whatever the store
+    // holds; its name is already in `skipped` from the unmatched skip.
+    result
+        .unmatched
+        .retain(|component| !matcher.is_excluded_component(component));
     result
 }
 
@@ -428,6 +434,7 @@ mod tests {
                 },
                 diagnostic: Diagnostic::new(
                     name.to_string(),
+                    PathBuf::from("/plasmoids").join(name),
                     "no download url available".to_string(),
                 ),
             }
@@ -457,6 +464,42 @@ mod tests {
             kept,
             vec!["keep.widget"],
             "an excluded no-match stayed a failure row"
+        );
+    }
+
+    /// An excluded component is skipped for its exclusion: it leaves
+    /// `unmatched`, and its name stays in `skipped` exactly once.
+    #[test]
+    fn an_excluded_unmatched_component_leaves_unmatched() {
+        use crate::types::{ComponentType, InstalledComponent, UpdateCheckResult};
+
+        let unmatched = |directory: &str| {
+            InstalledComponent::new(
+                "Breeze",
+                directory,
+                ComponentType::ColorScheme,
+                format!("/usr/share/color-schemes/{directory}"),
+            )
+            .with_system(true)
+        };
+        let mut result = UpdateCheckResult::default();
+        result.skip_unmatched(&unmatched("Breeze.colors"));
+        result.skip_unmatched(&unmatched("BreezeAlt.colors"));
+        let config =
+            crate::Config::new().with_excluded_packages(vec!["BreezeAlt.colors".to_string()]);
+
+        let filtered = super::apply_exclusions(result, &config);
+
+        let kept: Vec<&str> = filtered
+            .unmatched
+            .iter()
+            .map(|component| component.directory_name.as_str())
+            .collect();
+        assert_eq!(kept, vec!["Breeze.colors"], "{filtered:?}");
+        assert_eq!(
+            filtered.skipped,
+            vec!["Breeze".to_string(), "Breeze".to_string()],
+            "{filtered:?}"
         );
     }
 

@@ -92,14 +92,14 @@ pub(crate) fn check_components(
                 evaluation::ComponentCheckResult::UpToDate => {}
                 evaluation::ComponentCheckResult::Unmatched(diagnostic) => {
                     if system {
-                        result.skipped.push(diagnostic.name);
+                        result.skip_unmatched(component);
                     } else {
                         result.add_unresolved(diagnostic);
                     }
                 }
                 evaluation::ComponentCheckResult::TypeMismatch(diagnostic) => {
                     if system {
-                        result.skipped.push(diagnostic.name);
+                        result.skip_unmatched(component);
                     } else {
                         result.add_check_failure(diagnostic);
                     }
@@ -111,6 +111,7 @@ pub(crate) fn check_components(
             None => {
                 let diagnostic = Diagnostic::new(
                     component.name.clone(),
+                    component.path.clone(),
                     "failed to fetch store entry".to_string(),
                 )
                 .with_content_id(*content_id);
@@ -126,11 +127,12 @@ pub(crate) fn check_components(
         // A system component no store entry matches is skipped, not failed: a
         // distro package the store never shipped must not fail `--system check`.
         if system {
-            result.skipped.push(component.name.clone());
+            result.skip_unmatched(component);
             continue;
         }
         let diagnostic = Diagnostic::new(
             component.name.clone(),
+            component.path.clone(),
             "could not match to kde store entry".to_string(),
         );
         result.add_unresolved(diagnostic);

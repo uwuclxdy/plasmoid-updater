@@ -139,6 +139,7 @@ pub fn check(config: &Config, reporter: &dyn Reporter) -> Result<CheckResult> {
 /// let _ = CheckResult {
 ///     available_updates: Vec::new(),
 ///     skipped: Vec::new(),
+///     unmatched: Vec::new(),
 ///     diagnostics: Vec::new(),
 ///     unavailable: Vec::new(),
 /// };
@@ -148,14 +149,27 @@ pub fn check(config: &Config, reporter: &dyn Reporter) -> Result<CheckResult> {
 pub struct CheckResult {
     /// Available updates found during the check.
     pub available_updates: Vec<AvailableUpdate>,
-    /// Names of components the run did not attempt: excluded by the
+    /// Display names of components the run did not attempt: excluded by the
     /// [`Config`]'s exclusion rules, and — in a `--system` run — components
     /// with no matching store entry or whose store entry is of a different
     /// component type.
     ///
-    /// An excluded component never appears in `available_updates`.
+    /// An excluded component never appears in `available_updates`. Display
+    /// names are not unique, so a name here does not say which component was
+    /// skipped: [`unmatched`](Self::unmatched) holds the components skipped
+    /// for want of a store entry, and [`Config::excludes`] tells the excluded
+    /// ones.
     pub skipped: Vec<String>,
+    /// Components the run skipped because no store entry of their type
+    /// matches them: no entry matches, or the matching entry is another
+    /// component type. Only a `--system` run skips a component for this; a
+    /// user run reports it in `diagnostics` instead.
+    ///
+    /// Each one's display name is also in `skipped`. An excluded component is
+    /// never listed here.
+    pub unmatched: Vec<InstalledComponent>,
     /// Components that could not be checked, with the reason for each failure.
+    /// Each [`Diagnostic::path`] names its component.
     pub diagnostics: Vec<Diagnostic>,
     /// Components whose store entry offers no download link for its version.
     ///
@@ -182,6 +196,7 @@ impl CheckResult {
         Self {
             available_updates: result.updates,
             skipped: result.skipped,
+            unmatched: result.unmatched,
             diagnostics,
             unavailable,
         }
@@ -454,6 +469,35 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+
+    /// `from_internal` carries a populated `unmatched` into the public
+    /// `CheckResult`, so a `--system` run's store-entry skips reach callers
+    /// as components, not only as `skipped` names.
+    #[test]
+    fn from_internal_carries_unmatched_into_the_check_result() {
+        let component = InstalledComponent::new(
+            "Breeze Dark",
+            "BreezeDark.colors",
+            ComponentType::ColorScheme,
+            "/usr/share/color-schemes/BreezeDark.colors",
+        );
+        let mut internal = UpdateCheckResult::default();
+        internal.unmatched.push(component.clone());
+
+        let result = CheckResult::from_internal(internal);
+
+        assert_eq!(
+            result.unmatched.len(),
+            1,
+            "unmatched did not carry over: {result:?}"
+        );
+        let carried = &result.unmatched[0];
+        assert_eq!(
+            carried.path, component.path,
+            "unmatched carried the wrong component"
+        );
+        assert_eq!(carried.component_type, component.component_type);
+    }
 
     const LOCK_CHILD: &str = "tests::an_empty_install_defers_the_repair_to_a_running_lock_holder";
     const LOCK_ROLE: &str = "PU_TEST_EMPTY_INSTALL_ROLE";

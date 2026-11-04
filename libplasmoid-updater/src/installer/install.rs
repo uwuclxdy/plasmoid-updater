@@ -413,20 +413,22 @@ fn recover_in_dir(dir: &Path) {
     }
 }
 
-/// The display names of the components a killed run stranded in their
-/// `.plasmoid-updater-old` sibling with no visible component beside them.
+/// The display name and install path of each component a killed run stranded
+/// in its `.plasmoid-updater-old` sibling with no visible component beside it.
+/// The install path is where the repair puts the component back.
 ///
 /// A `-new` sibling alone is a half-copy that never held the component, and one
 /// beside its component is a dead copy: neither is a component a check names.
-pub(crate) fn stranded_components(system: bool) -> Vec<String> {
+pub(crate) fn stranded_components(system: bool) -> Vec<(String, PathBuf)> {
     recover_dirs(system)
         .iter()
         .flat_map(|dir| stranded_in_dir(dir))
         .collect()
 }
 
-/// The stranded components of one directory, named for display.
-fn stranded_in_dir(dir: &Path) -> Vec<String> {
+/// The stranded components of one directory, each with its display name and
+/// install path.
+fn stranded_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
     let mut stranded = Vec::new();
     for component in sibling_component_names(dir) {
         let dest = dir.join(&component);
@@ -437,7 +439,7 @@ fn stranded_in_dir(dir: &Path) -> Vec<String> {
         }
         let old = temp_sibling(&dest, TEMP_OLD_SUFFIX);
         if path_present(&old).unwrap_or(false) {
-            stranded.push(stranded_display_name(&old, &component));
+            stranded.push((stranded_display_name(&old, &component), dest));
         }
     }
     stranded
@@ -2771,6 +2773,11 @@ exit 0
         // Control: with the component gone, the same sibling is stranded.
         std::fs::remove_dir_all(&dest).unwrap();
         assert_eq!(stranded_in_dir(dir.path()).len(), 1);
+        assert_eq!(
+            stranded_in_dir(dir.path())[0].1,
+            dir.path().join("org.test.widget"),
+            "a stranded component is not named by the path it is restored to"
+        );
     }
 
     #[test]

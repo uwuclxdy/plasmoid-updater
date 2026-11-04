@@ -49,6 +49,7 @@ pub(crate) fn check_component(
         let installed_version = (!component.version.is_empty()).then(|| component.version.clone());
         let diagnostic = Diagnostic::new(
             component.name.clone(),
+            component.path.clone(),
             "could not match to kde store entry".to_string(),
         )
         .with_versions(installed_version, None);
@@ -77,6 +78,7 @@ pub(crate) fn check_component(
         );
         let diagnostic = Diagnostic::new(
             component.name.clone(),
+            component.path.clone(),
             format!("could not fetch store entry {content_id}"),
         )
         .with_content_id(content_id);
@@ -111,6 +113,7 @@ pub(crate) fn evaluate_store_entry(
         );
         let diagnostic = Diagnostic::new(
             component.name.clone(),
+            component.path.clone(),
             format!("store entry {} is a different component type", entry.id),
         )
         .with_content_id(content_id);
@@ -137,6 +140,7 @@ pub(crate) fn evaluate_store_entry(
         let available_version = (!entry.version.is_empty()).then(|| entry.version.clone());
         let diagnostic = Diagnostic::new(
             component.name.clone(),
+            component.path.clone(),
             crate::types::NO_DOWNLOAD_URL_REASON.to_string(),
         )
         .with_versions(installed_version, available_version)

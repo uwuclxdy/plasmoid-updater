@@ -1653,3 +1653,38 @@ fn excludes_applies_the_exact_and_pattern_rules_to_a_component() {
     assert!(!invalid_beside_valid.excludes(&widget));
     assert!(invalid_beside_valid.excludes(&other));
 }
+
+/// A diagnostic names its component by install path, so a caller can tell
+/// it from a same-named sibling: the path is the component's own, here a user
+/// widget no store entry matches.
+#[test]
+fn check_names_a_diagnostics_component_by_its_install_path() {
+    if let Some(child) = common::child() {
+        let result = check(&config(&child.store_url), &()).unwrap();
+        assert_eq!(result.diagnostics.len(), 1, "{result:?}");
+        let data = std::path::PathBuf::from(std::env::var("XDG_DATA_HOME").unwrap());
+        let expected = data.join("plasma/plasmoids/org.example.unlisted");
+        assert_eq!(
+            result.diagnostics[0].path.canonicalize().unwrap(),
+            expected.canonicalize().unwrap(),
+            "{result:?}"
+        );
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let widget = sandbox
+        .data_home()
+        .join("plasma/plasmoids/org.example.unlisted");
+    std::fs::create_dir_all(&widget).unwrap();
+    std::fs::write(
+        widget.join("metadata.json"),
+        r#"{"KPlugin":{"Id":"org.example.unlisted","Name":"Unlisted Widget","Version":"1.0"}}"#,
+    )
+    .unwrap();
+    let store = FakeStore::start(Listing::default());
+    sandbox.run_child(
+        "check_names_a_diagnostics_component_by_its_install_path",
+        store.url(),
+    );
+}

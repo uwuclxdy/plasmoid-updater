@@ -5,7 +5,8 @@
 ///
 /// Every per-component event carries two identifiers: `name`, the component's
 /// display name for rendering, and `id`, its installed path — unique within a
-/// run, which reporters key progress rows on.
+/// run, except that two component types can share one directory under
+/// `--system`; reporters key progress rows on it.
 ///
 /// The enum is `#[non_exhaustive]`: a new stage is not a breaking change, so
 /// match with a wildcard arm. The variants that carry fields are
@@ -64,9 +65,9 @@ pub enum Event {
     Downloading {
         /// Display name of the component being downloaded.
         name: String,
-        /// The component's installed path: unique within a run, so reporters
-        /// can key progress rows on it even when two components share a
-        /// display name.
+        /// The component's installed path, which reporters key progress rows
+        /// on: it tells same-named components apart, though two component
+        /// types can share one directory under `--system`.
         id: String,
         /// Bytes received so far.
         bytes: u64,

@@ -110,7 +110,7 @@ fn record_component_check(
         evaluation::ComponentCheckResult::Unmatched(diagnostic)
         | evaluation::ComponentCheckResult::TypeMismatch(diagnostic) => {
             if component.is_system {
-                result.skipped.push(diagnostic.name);
+                result.skip_unmatched(component);
             } else {
                 result.add_unresolved(diagnostic);
             }
@@ -138,9 +138,10 @@ fn add_stranded_diagnostics(system: bool, result: &mut UpdateCheckResult) {
     if crate::installer::run_lock_held() {
         return;
     }
-    for name in crate::installer::stranded_components(system) {
+    for (name, path) in crate::installer::stranded_components(system) {
         result.add_unresolved(Diagnostic::new(
             name,
+            path,
             "interrupted install, run update to restore".to_string(),
         ));
     }
@@ -179,6 +180,21 @@ mod tests {
             is_system,
             release_date: String::new(),
         }
+    }
+
+    /// Asserts `component` is the one component `result` skipped for want of
+    /// a store entry, by its identity: install path and type.
+    fn assert_unmatched(result: &crate::types::UpdateCheckResult, component: &InstalledComponent) {
+        let unmatched: Vec<(&PathBuf, ComponentType)> = result
+            .unmatched
+            .iter()
+            .map(|skipped| (&skipped.path, skipped.component_type))
+            .collect();
+        assert_eq!(
+            unmatched,
+            vec![(&component.path, component.component_type)],
+            "{result:?}"
+        );
     }
 
     /// Under `--system` the store id a system component resolves to may come
@@ -368,6 +384,7 @@ mod tests {
         let component = component(PathBuf::from("/plasmoids/org.example.distro"), true);
         let diagnostic = crate::types::Diagnostic::new(
             component.name.clone(),
+            component.path.clone(),
             "could not match to kde store entry".to_string(),
         );
         let mut result = crate::types::UpdateCheckResult::default();
@@ -378,7 +395,8 @@ mod tests {
             &mut result,
         );
 
-        assert_eq!(result.skipped, vec![component.name]);
+        assert_eq!(result.skipped, vec![component.name.clone()]);
+        assert_unmatched(&result, &component);
         assert!(
             result.unresolved.is_empty() && result.check_failures.is_empty(),
             "{result:?}"
@@ -390,6 +408,7 @@ mod tests {
         let component = component(PathBuf::from("/plasmoids/org.example.user"), false);
         let diagnostic = crate::types::Diagnostic::new(
             component.name.clone(),
+            component.path.clone(),
             "could not match to kde store entry".to_string(),
         );
         let mut result = crate::types::UpdateCheckResult::default();
@@ -434,7 +453,8 @@ mod tests {
         let check = evaluation::evaluate_store_entry(&component, &foreign_store_entry(123), 123);
         record_component_check(&component, check, &mut result);
 
-        assert_eq!(result.skipped, vec![component.name]);
+        assert_eq!(result.skipped, vec![component.name.clone()]);
+        assert_unmatched(&result, &component);
         assert!(
             result.unresolved.is_empty() && result.check_failures.is_empty(),
             "{result:?}"
@@ -492,7 +512,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.skipped, vec![component.name]);
+        assert_eq!(result.skipped, vec![component.name.clone()]);
+        assert_unmatched(&result, &component);
         assert!(
             result.unresolved.is_empty() && result.check_failures.is_empty(),
             "{result:?}"
@@ -638,7 +659,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.skipped, vec![component.name]);
+        assert_eq!(result.skipped, vec![component.name.clone()]);
+        assert_unmatched(&result, &component);
         assert!(
             result.unresolved.is_empty() && result.check_failures.is_empty(),
             "{result:?}"

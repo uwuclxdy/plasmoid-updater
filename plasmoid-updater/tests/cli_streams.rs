@@ -12,7 +12,9 @@ use std::net::{TcpListener, TcpStream};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use common::{FakeStore, Listing, OLD_VERSION, SCHEME_FILE, SCHEME_ID, SCHEME_NAME, Sandbox};
+use common::{
+    ExtraEntry, FakeStore, Listing, OLD_VERSION, SCHEME_FILE, SCHEME_ID, SCHEME_NAME, Sandbox,
+};
 
 const API_URL_VAR: &str = "PLASMOID_UPDATER_API_URL";
 
@@ -81,19 +83,20 @@ fn write_config(sandbox: &Sandbox, toml: &str) {
     std::fs::write(sandbox.config_dir().join("plasmoid-updater.toml"), toml).unwrap();
 }
 
-/// Registers a second color scheme whose store entry no listing carries, so a
-/// per-id lookup is its only route and the store answers `404`.
-fn install_unresolvable_scheme(sandbox: &Sandbox) {
-    let path = sandbox
-        .data_home()
-        .join("color-schemes")
-        .join("Second.colors");
-    std::fs::write(&path, "[General]\nName=Second Scheme\n").unwrap();
+/// The file of the scheme `install_unresolvable_scheme` registers.
+const SECOND_FILE: &str = "Second.colors";
+
+/// Registers a second color scheme, displayed as `name`, whose store entry no
+/// listing carries, so a per-id lookup is its only route and the store answers
+/// `404`.
+fn install_unresolvable_scheme(sandbox: &Sandbox, name: &str) {
+    let path = sandbox.data_home().join("color-schemes").join(SECOND_FILE);
+    std::fs::write(&path, format!("[General]\nName={name}\n")).unwrap();
     let registry = sandbox.registry_path();
     let content = std::fs::read_to_string(&registry).unwrap();
     let entry = format!(
         r#"  <stuff category="112">
-    <name>Second Scheme</name>
+    <name>{name}</name>
     <providerid>api.kde-look.org</providerid>
     <version>1.0</version>
     <installedfile>{installed}</installedfile>
@@ -110,7 +113,7 @@ fn install_unresolvable_scheme(sandbox: &Sandbox) {
 fn check_exits_1_when_an_update_and_a_failed_check_coexist() {
     let sandbox = Sandbox::new();
     sandbox.install_old_scheme();
-    install_unresolvable_scheme(&sandbox);
+    install_unresolvable_scheme(&sandbox, "Second Scheme");
     let store = FakeStore::start(Listing::default());
     let run = run(&sandbox, store.url(), &["--skip-plasma-detection", "check"]);
     assert_eq!(run.code, 1, "{run}");
@@ -229,6 +232,169 @@ fn the_up_to_date_named_message_quotes_the_name() {
     );
 }
 
+/// Two installed schemes share one display name: the named one is up to date,
+/// its sibling's store entry is gone. The sibling's failed check must not
+/// answer for the named component, on the dry run or the real update.
+#[test]
+fn a_same_named_siblings_failed_check_does_not_answer_for_a_named_component() {
+    let (sandbox, store) = up_to_date();
+    install_unresolvable_scheme(&sandbox, SCHEME_NAME);
+    let expected = format!("no update available for {SCHEME_FILE:?}\n");
+
+    for args in [
+        [
+            "--skip-plasma-detection",
+            "update",
+            "--dry-run",
+            SCHEME_FILE,
+        ],
+        ["--skip-plasma-detection", "update", "-y", SCHEME_FILE],
+    ] {
+        let run = run(&sandbox, store.url(), &args);
+        assert_eq!(run.code, 0, "{args:?}\n{run}");
+        assert_eq!(run.stdout, expected, "{args:?}\n{run}");
+    }
+
+    // The sibling itself still reports its own failed check.
+    let sibling = run(
+        &sandbox,
+        store.url(),
+        &[
+            "--skip-plasma-detection",
+            "update",
+            "--dry-run",
+            SECOND_FILE,
+        ],
+    );
+    assert_eq!(sibling.code, 1, "{sibling}");
+    // One match keeps the display name in its failed-check line.
+    assert!(
+        sibling.stderr.lines().any(|line| line
+            == format!("error: failed to check {SCHEME_NAME:?}: failed to fetch store entry")),
+        "{sibling}"
+    );
+}
+
+/// A display name two installed schemes share covers both: each answers for
+/// itself, named by its directory and kind since the shared name alone cannot
+/// tell them apart, and the run exits with the worst outcome.
+#[test]
+fn a_name_shared_by_two_components_answers_for_each() {
+    let (sandbox, store) = up_to_date();
+    install_unresolvable_scheme(&sandbox, SCHEME_NAME);
+    let run = run(
+        &sandbox,
+        store.url(),
+        &[
+            "--skip-plasma-detection",
+            "update",
+            "--dry-run",
+            SCHEME_NAME,
+        ],
+    );
+    assert_eq!(run.code, 1, "{run}");
+    assert_eq!(
+        run.stdout,
+        format!("no update available for {SCHEME_FILE:?} (Color Scheme)\n"),
+        "{run}"
+    );
+    assert!(
+        run.stderr.lines().any(|line| line
+            == format!(
+                "error: failed to check {SECOND_FILE:?} (Color Scheme): failed to fetch store entry"
+            )),
+        "{run}"
+    );
+}
+
+/// A display name two schemes share: the named scheme's store entry offers no
+/// download link for its version, the same-named sibling is current. Each
+/// answers for itself on the dry run and the real update; the no-download row
+/// never answers for the sibling.
+#[test]
+fn a_same_named_siblings_missing_download_does_not_answer_for_a_component() {
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    // Registered as store id 999002 at 1.0; the extra entry below serves that
+    // id at 1.0, so this scheme is current rather than a 404.
+    install_unresolvable_scheme(&sandbox, SCHEME_NAME);
+    let store = FakeStore::start(Listing {
+        link_version: Some("1.5"),
+        extras: vec![ExtraEntry {
+            id: 999_002,
+            name: SCHEME_NAME,
+            type_id: 112,
+            version: OLD_VERSION,
+            files: &[(SECOND_FILE, "[General]\nName=Fake Scheme\n")],
+        }],
+        ..Listing::default()
+    });
+    let skip = "--skip-plasma-detection";
+
+    let dry = run(
+        &sandbox,
+        store.url(),
+        &[skip, "update", "--dry-run", SCHEME_NAME],
+    );
+    assert_eq!(dry.code, 1, "{dry}");
+    assert_eq!(
+        dry.stdout,
+        format!("no update available for {SECOND_FILE:?} (Color Scheme)\n"),
+        "{dry}"
+    );
+
+    let current = run(
+        &sandbox,
+        store.url(),
+        &[skip, "update", "--dry-run", SECOND_FILE],
+    );
+    assert_eq!(current.code, 0, "{current}");
+    assert_eq!(
+        current.stdout,
+        format!("no update available for {SECOND_FILE:?}\n"),
+        "{current}"
+    );
+
+    let real = run(
+        &sandbox,
+        store.url(),
+        &[skip, "update", "-y", "--no-restart-plasma", SCHEME_NAME],
+    );
+    assert_eq!(real.code, 1, "{real}");
+    assert_eq!(
+        real.stdout,
+        format!("no update available for {SECOND_FILE:?} (Color Scheme)\nfailed 1\n"),
+        "{real}"
+    );
+}
+
+/// `check --json` names each diagnostic's component by its install path, so
+/// a caller can tell same-named components apart, and carries the `unmatched`
+/// list, empty on a user run.
+#[test]
+fn check_json_diagnostics_carry_the_install_path() {
+    let (sandbox, store) = up_to_date();
+    install_unresolvable_scheme(&sandbox, SCHEME_NAME);
+    let run = run(
+        &sandbox,
+        store.url(),
+        &["--skip-plasma-detection", "check", "--json"],
+    );
+    assert_eq!(run.code, 1, "{run}");
+    let value: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+
+    assert_eq!(value["unmatched"], serde_json::json!([]), "{run}");
+    let diagnostics = value["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{run}");
+    let path = std::path::Path::new(diagnostics[0]["path"].as_str().unwrap());
+    let expected = sandbox.data_home().join("color-schemes").join(SECOND_FILE);
+    assert_eq!(
+        path.canonicalize().unwrap(),
+        expected.canonicalize().unwrap(),
+        "{run}"
+    );
+}
+
 #[test]
 fn the_excluded_named_message_quotes_the_name() {
     let (sandbox, store) = pending_update();
@@ -315,7 +481,7 @@ fn a_named_dry_run_whose_check_failed_is_a_failure() {
 fn a_named_dry_run_predicts_the_named_run_when_another_check_failed() {
     let sandbox = Sandbox::new();
     sandbox.install_old_scheme();
-    install_unresolvable_scheme(&sandbox);
+    install_unresolvable_scheme(&sandbox, "Second Scheme");
     let store = FakeStore::start(Listing::default());
     let dry = run(
         &sandbox,
@@ -849,7 +1015,7 @@ fn an_unnamed_update_reports_a_component_whose_check_failed() {
 fn a_named_update_does_not_report_another_components_failed_check() {
     let sandbox = Sandbox::new();
     sandbox.install_old_scheme();
-    install_unresolvable_scheme(&sandbox);
+    install_unresolvable_scheme(&sandbox, "Second Scheme");
     let store = FakeStore::start(Listing {
         version: OLD_VERSION,
         ..Listing::default()

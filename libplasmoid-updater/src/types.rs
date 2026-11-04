@@ -905,8 +905,17 @@ impl PackageMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Diagnostic {
-    /// Display name of the component.
+    /// Display name of the component. Same-named components exist (two
+    /// installed color schemes can both be `Breeze`), and two component types
+    /// can share one directory under `--system` with different names, so match
+    /// a component by [`path`](Self::path) and this name.
     pub name: String,
+    /// Install path of the component the diagnostic is about:
+    /// [`InstalledComponent::path`], the same spelling as the reporter's
+    /// event `id`. A component a killed run stranded is named by the path it
+    /// is restored to.
+    #[serde(with = "pathbuf_serde", default)]
+    pub path: PathBuf,
     /// Why the component could not be checked.
     pub reason: String,
     /// Installed version when one could be read.
@@ -921,9 +930,10 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub(crate) fn new(name: String, reason: String) -> Self {
+    pub(crate) fn new(name: String, path: PathBuf, reason: String) -> Self {
         Self {
             name,
+            path,
             reason,
             installed_version: None,
             available_version: None,
@@ -993,9 +1003,18 @@ pub(crate) struct UpdateCheckResult {
     /// with no matching store entry or a store entry of a different component
     /// type.
     pub skipped: Vec<String>,
+    /// The components behind the store-entry skips in `skipped`.
+    pub unmatched: Vec<InstalledComponent>,
 }
 
 impl UpdateCheckResult {
+    /// Skips a component no store entry of its type matches: its name joins
+    /// `skipped` and the component itself `unmatched`.
+    pub fn skip_unmatched(&mut self, component: &InstalledComponent) {
+        self.skipped.push(component.name.clone());
+        self.unmatched.push(component.clone());
+    }
+
     pub fn add_update(&mut self, update: AvailableUpdate) {
         self.updates.push(update);
     }
@@ -1109,8 +1128,12 @@ mod tests {
                 is_system: false,
                 release_date: String::new(),
             },
-            diagnostic: Diagnostic::new("Widget".to_string(), NO_DOWNLOAD_URL_REASON.to_string())
-                .with_versions(Some("1.0".to_string()), Some("2.0".to_string())),
+            diagnostic: Diagnostic::new(
+                "Widget".to_string(),
+                PathBuf::from("/plasmoids/org.example.widget"),
+                NO_DOWNLOAD_URL_REASON.to_string(),
+            )
+            .with_versions(Some("1.0".to_string()), Some("2.0".to_string())),
         };
 
         let failure = entry.into_failure();

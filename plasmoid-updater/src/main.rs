@@ -407,7 +407,7 @@ fn do_check(
 /// the component it is about.
 fn report_diagnostics(result: &lib::CheckResult) {
     for diagnostic in &result.diagnostics {
-        report_diagnostic(diagnostic);
+        report_diagnostic(&format!("{:?}", diagnostic.name), diagnostic);
     }
 }
 
@@ -418,16 +418,14 @@ fn report_diagnostics_except(result: &lib::CheckResult, except: &[&lib::Diagnost
         if except.contains(&diagnostic) {
             continue;
         }
-        report_diagnostic(diagnostic);
+        report_diagnostic(&format!("{:?}", diagnostic.name), diagnostic);
     }
 }
 
-fn report_diagnostic(diagnostic: &lib::Diagnostic) {
-    log::error!(
-        "failed to check {:?}: {}",
-        diagnostic.name,
-        diagnostic.reason
-    );
+/// Reports a diagnostic on stderr under the label the run names the component
+/// by.
+fn report_diagnostic(label: &str, diagnostic: &lib::Diagnostic) {
+    log::error!("failed to check {label}: {}", diagnostic.reason);
 }
 
 /// The `--json` body of `list-installed`: an object, so a later field can join
@@ -557,17 +555,19 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
     finish_update(result, restart, check_failed, args.json)
 }
 
-/// The check shape a named dry run reports: only the named component's own
-/// outcome, so another component's failures do not leak into it.
+/// The check shape a named dry run reports: only the outcomes of the named
+/// components, so another component's failures do not leak into it.
 fn named_check_result(
     available_updates: Vec<lib::AvailableUpdate>,
     skipped: Vec<String>,
+    unmatched: Vec<lib::InstalledComponent>,
     diagnostics: Vec<lib::Diagnostic>,
     unavailable: Vec<lib::Failure>,
 ) -> lib::CheckResult {
     let mut result = lib::CheckResult::default();
     result.available_updates = available_updates;
     result.skipped = skipped;
+    result.unmatched = unmatched;
     result.diagnostics = diagnostics;
     result.unavailable = unavailable;
     result
@@ -584,65 +584,9 @@ fn dry_run(
     let check_result = lib::check(config, reporter.as_dyn())?;
 
     match name {
-        // A named run ends on the named component's own outcome; another
-        // component's failed check is not this run's.
-        Some(name) => match resolve_named(name, config, &check_result)? {
-            Named::Updates(updates) => {
-                if json {
-                    payload_json(&named_check_result(
-                        updates,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ))?;
-                } else {
-                    payload(format_args!(
-                        "{}",
-                        lib::cli::updates_table(&updates, lib::cli::Stream::Stdout)
-                    ))?;
-                }
-                Ok(ExitCode::Success)
-            }
-            Named::Excluded(display_name) => {
-                settled_dry_run(Settled::Excluded, vec![display_name], name, json)
-            }
-            Named::Unmatched(display_name) => {
-                settled_dry_run(Settled::Unmatched, vec![display_name], name, json)
-            }
-            Named::UpToDate => settled_dry_run(Settled::UpToDate, Vec::new(), name, json),
-            Named::Unavailable(failure) => {
-                report_failure_rows(vec![failure.clone()]);
-                if json {
-                    // The failure and the diagnostic the check settled for it
-                    // travel together, the way `check` reports them.
-                    let diagnostic = check_result
-                        .diagnostics
-                        .iter()
-                        .find(|diagnostic| diagnostic.name == failure.component.name)
-                        .cloned();
-                    payload_json(&named_check_result(
-                        Vec::new(),
-                        Vec::new(),
-                        diagnostic.into_iter().collect(),
-                        vec![failure],
-                    ))?;
-                }
-                Ok(ExitCode::Failure)
-            }
-            Named::CheckFailed(diagnostic) => {
-                report_diagnostic(&diagnostic);
-                if json {
-                    payload_json(&named_check_result(
-                        Vec::new(),
-                        Vec::new(),
-                        vec![diagnostic],
-                        Vec::new(),
-                    ))?;
-                }
-                Ok(ExitCode::Failure)
-            }
-            Named::Unknown => Ok(unknown_component(name)),
-        },
+        // A named run ends on the outcomes of the components the name covers;
+        // another component's failed check is not this run's.
+        Some(name) => named_dry_run(name, config, &check_result, json),
         None => {
             let unavailable_diagnostics: Vec<&lib::Diagnostic> =
                 check_result.unavailable_diagnostics().collect();
@@ -675,6 +619,99 @@ fn dry_run(
     }
 }
 
+/// The named dry run: every component the name covers answers by its own
+/// outcome, and the run exits with the worst of them.
+fn named_dry_run(
+    name: &str,
+    config: &lib::Config,
+    check_result: &lib::CheckResult,
+    json: bool,
+) -> Result<ExitCode, Stop> {
+    let resolved = resolve_named(name, config, check_result)?;
+    if resolved.is_empty() {
+        return Ok(unknown_component(name));
+    }
+    let multi = resolved.len() > 1;
+
+    let mut updates = Vec::new();
+    let mut skipped = Vec::new();
+    let mut unmatched = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut unavailable = Vec::new();
+    let mut failure = false;
+
+    for named in &resolved {
+        match &named.outcome {
+            ComponentOutcome::Update(update) => updates.push(update.clone()),
+            ComponentOutcome::Excluded => {
+                skipped.push(named.component.name.clone());
+                if !json {
+                    payload_settled(Settled::Excluded, name, &named.component, multi)?;
+                }
+            }
+            ComponentOutcome::Unmatched => {
+                skipped.push(named.component.name.clone());
+                unmatched.push(named.component.clone());
+                if !json {
+                    payload_settled(Settled::Unmatched, name, &named.component, multi)?;
+                }
+            }
+            ComponentOutcome::UpToDate => {
+                if !json {
+                    payload_settled(Settled::UpToDate, name, &named.component, multi)?;
+                }
+            }
+            ComponentOutcome::CheckFailed(diagnostic) => {
+                diagnostics.push(diagnostic.clone());
+                report_diagnostic(
+                    &failed_check_label(name, &named.component, diagnostic, multi),
+                    diagnostic,
+                );
+                failure = true;
+            }
+            ComponentOutcome::Unavailable(component_failure) => {
+                // The failure and the diagnostic the check settled for it
+                // travel together, the way `check` reports them.
+                if let Some(diagnostic) =
+                    check_result.unavailable_diagnostics().find(|diagnostic| {
+                        diagnostic.path == component_failure.component.path
+                            && diagnostic.name == component_failure.component.name
+                    })
+                {
+                    diagnostics.push(diagnostic.clone());
+                }
+                unavailable.push(component_failure.clone());
+                failure = true;
+            }
+        }
+    }
+
+    if !unavailable.is_empty() {
+        report_failure_rows(unavailable.clone());
+    }
+
+    if json {
+        payload_json(&named_check_result(
+            updates,
+            skipped,
+            unmatched,
+            diagnostics,
+            unavailable,
+        ))?;
+    } else if !updates.is_empty() {
+        payload(format_args!(
+            "{}",
+            lib::cli::updates_table(&updates, lib::cli::Stream::Stdout)
+        ))?;
+    }
+
+    Ok(if failure {
+        ExitCode::Failure
+    } else {
+        ExitCode::Success
+    })
+}
+
 fn do_update_single(
     name: &str,
     config: lib::Config,
@@ -685,129 +722,203 @@ fn do_update_single(
     let reporter = Reporter::new(quiet);
     let check_result = lib::check(&config, reporter.as_dyn())?;
 
-    match resolve_named(name, &config, &check_result)? {
-        Named::Updates(updates) => {
-            let result = lib::install(&updates, &config, reporter.as_dyn())?;
-            finish_update(result, restart, false, json)
-        }
-        Named::Excluded(display_name) => {
-            settled_update(Settled::Excluded, vec![display_name], name, json)
-        }
-        Named::Unmatched(display_name) => {
-            settled_update(Settled::Unmatched, vec![display_name], name, json)
-        }
-        Named::UpToDate => settled_update(Settled::UpToDate, Vec::new(), name, json),
-        Named::Unavailable(failure) => {
-            let mut result = lib::UpdateResult::default();
-            result.failed.push(failure);
-            finish_update(result, restart, false, json)
-        }
-        Named::CheckFailed(diagnostic) => {
-            report_diagnostic(&diagnostic);
-            if json {
-                let mut result = lib::UpdateResult::default();
-                result.skipped.push(diagnostic.name);
-                payload_json(&result)?;
-            }
-            Ok(ExitCode::Failure)
-        }
-        Named::Unknown => Ok(unknown_component(name)),
+    let resolved = resolve_named(name, &config, &check_result)?;
+    if resolved.is_empty() {
+        return Ok(unknown_component(name));
     }
+    let multi = resolved.len() > 1;
+
+    let mut updates = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+    let mut check_failed = false;
+
+    for named in &resolved {
+        match &named.outcome {
+            ComponentOutcome::Update(update) => updates.push(update.clone()),
+            ComponentOutcome::Excluded => {
+                skipped.push(named.component.name.clone());
+                if !json {
+                    payload_settled(Settled::Excluded, name, &named.component, multi)?;
+                }
+            }
+            ComponentOutcome::Unmatched => {
+                skipped.push(named.component.name.clone());
+                if !json {
+                    payload_settled(Settled::Unmatched, name, &named.component, multi)?;
+                }
+            }
+            ComponentOutcome::UpToDate => {
+                if !json {
+                    payload_settled(Settled::UpToDate, name, &named.component, multi)?;
+                }
+            }
+            ComponentOutcome::CheckFailed(diagnostic) => {
+                skipped.push(diagnostic.name.clone());
+                report_diagnostic(
+                    &failed_check_label(name, &named.component, diagnostic, multi),
+                    diagnostic,
+                );
+                check_failed = true;
+            }
+            ComponentOutcome::Unavailable(failure) => {
+                failed.push(failure.clone());
+                check_failed = true;
+            }
+        }
+    }
+
+    // Every component's update row installs together, the way an unnamed run
+    // installs its selection.
+    if !updates.is_empty() {
+        let mut result = lib::install(&updates, &config, reporter.as_dyn())?;
+        result.skipped.extend(skipped);
+        result.failed.extend(failed);
+        return finish_update(result, restart, check_failed, json);
+    }
+
+    // Nothing to install: every component the name covered settled or failed,
+    // each reported the way the single-component path reports it.
+    if json {
+        let mut result = lib::UpdateResult::default();
+        result.skipped = skipped;
+        result.failed = failed;
+        if result.failed.is_empty() {
+            payload_json(&result)?;
+        } else {
+            return finish_update(result, restart, false, json);
+        }
+    } else if !failed.is_empty() {
+        let mut result = lib::UpdateResult::default();
+        result.skipped = skipped;
+        result.failed = failed;
+        return finish_update(result, restart, false, false);
+    }
+    Ok(if check_failed {
+        ExitCode::Failure
+    } else {
+        ExitCode::Success
+    })
 }
 
-/// What a component name on the command line resolves to.
-enum Named {
-    /// Pending updates for the installed component the name matched.
-    Updates(Vec<lib::AvailableUpdate>),
-    /// An exclusion rule in the configuration matches the installed component,
-    /// with its display name, the name `skipped` lists on every path.
-    Excluded(String),
-    /// No exclusion rule matches the installed component and the check's
-    /// `skipped` lists its display name: under `--system`, no store entry of
-    /// its type matches it, or a same-named system sibling's does not, since
-    /// `skipped` carries display names only.
-    Unmatched(String),
-    /// The installed component has no pending update.
+/// One component a name covers, with the outcome its own identity decides.
+#[derive(Debug)]
+struct NamedComponent {
+    /// The installed component.
+    component: lib::InstalledComponent,
+    /// Its own outcome.
+    outcome: ComponentOutcome,
+}
+
+/// One covered component's own outcome on a named run.
+#[derive(Debug)]
+enum ComponentOutcome {
+    /// The component has a pending update row.
+    Update(lib::AvailableUpdate),
+    /// An exclusion rule in the configuration matches the component.
+    Excluded,
+    /// No store entry of its type matches it, so a `--system` check lists it
+    /// in `unmatched`.
+    Unmatched,
+    /// The component has no pending update.
     UpToDate,
-    /// The installed component's store entry offers no download link for its
-    /// version, so the run reports the failure row the check settled.
+    /// The component's store entry offers no download link for its version,
+    /// so the run reports the failure row the check settled.
     Unavailable(lib::Failure),
-    /// The check could not settle the installed component, with the diagnostic
-    /// naming why.
+    /// The check could not settle the component, with the diagnostic naming
+    /// why.
     CheckFailed(lib::Diagnostic),
-    /// No installed component answers to the name.
-    Unknown,
 }
 
-/// Resolves a display name or directory name to its pending updates, falling
-/// back to the installed set for the components the check left out.
+/// Resolves a display name or directory name to every installed component it
+/// covers, each with the outcome its own identity decides. The empty list is
+/// a name no installed component answers to.
 fn resolve_named(
     name: &str,
     config: &lib::Config,
     check_result: &lib::CheckResult,
-) -> Result<Named, lib::Error> {
-    let matched: Vec<lib::AvailableUpdate> = check_result
-        .available_updates
-        .iter()
-        .filter(|u| u.installed.name == name || u.installed.directory_name == name)
-        .cloned()
-        .collect();
-    if !matched.is_empty() {
-        return Ok(Named::Updates(matched));
-    }
-
-    if let Some(failure) = check_result
-        .unavailable
-        .iter()
-        .find(|failure| failure.component.name == name || failure.component.directory_name == name)
-    {
-        return Ok(Named::Unavailable(failure.clone()));
-    }
-
+) -> Result<Vec<NamedComponent>, lib::Error> {
     let installed = lib::get_installed(config)?;
-    let Some(component) = installed
-        .iter()
-        .find(|c| c.name == name || c.directory_name == name)
-    else {
-        return Ok(Named::Unknown);
-    };
-
-    Ok(classify_installed(component, config, check_result))
+    Ok(resolve_components(name, &installed, config, check_result))
 }
 
-/// Classifies an installed component the check left without an update row.
+/// Decides each installed component the name covers by its own identity: the
+/// update row, the no-download failure row and the classified outcome each
+/// match by install path and type, never by name, so a same-named sibling's
+/// row does not answer for a component. The list comes back in install-path
+/// order, so the lines it drives print stably.
+fn resolve_components(
+    name: &str,
+    installed: &[lib::InstalledComponent],
+    config: &lib::Config,
+    check_result: &lib::CheckResult,
+) -> Vec<NamedComponent> {
+    let mut resolved: Vec<NamedComponent> = installed
+        .iter()
+        .filter(|component| component.name == name || component.directory_name == name)
+        .map(|component| {
+            let outcome = check_result
+                .available_updates
+                .iter()
+                .find(|update| own_row(component, &update.installed))
+                .map(|update| ComponentOutcome::Update(update.clone()))
+                .or_else(|| {
+                    check_result
+                        .unavailable
+                        .iter()
+                        .find(|failure| own_row(component, &failure.component))
+                        .map(|failure| ComponentOutcome::Unavailable(failure.clone()))
+                })
+                .unwrap_or_else(|| classify_installed(component, config, check_result));
+            NamedComponent {
+                component: component.clone(),
+                outcome,
+            }
+        })
+        .collect();
+    resolved.sort_by(|left, right| left.component.path.cmp(&right.component.path));
+    resolved
+}
+
+/// Whether a check row is the component's own: the install path plus the
+/// component type decide, never a name.
+fn own_row(component: &lib::InstalledComponent, row: &lib::InstalledComponent) -> bool {
+    row.path == component.path && row.component_type == component.component_type
+}
+
+/// Classifies an installed component the check left without an update row or
+/// a no-download failure.
 fn classify_installed(
     component: &lib::InstalledComponent,
     config: &lib::Config,
     check_result: &lib::CheckResult,
-) -> Named {
+) -> ComponentOutcome {
     // A component the check could not settle has no update row to match, and
     // saying "no update available" would claim what the check did not learn.
+    // The name joins the path: two component types can share one directory
+    // under `--system` with different names.
     if let Some(diagnostic) = check_result
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.name == component.name)
+        .find(|diagnostic| diagnostic.path == component.path && diagnostic.name == component.name)
     {
-        return Named::CheckFailed(diagnostic.clone());
+        return ComponentOutcome::CheckFailed(diagnostic.clone());
     }
 
-    // `skipped` holds excluded components and, under `--system`, those no
-    // store entry matches, so only the rules themselves can tell them apart.
-    // It lists display names, which siblings can share: a user component is
-    // never skipped for want of a store entry, and a system one can read
-    // unmatched through a same-named sibling's skip.
+    // Display names are shared between components, so identity is the
+    // install path plus the type: an icon theme and a cursor theme can share
+    // one directory under `--system`.
     if config.excludes(component) {
-        Named::Excluded(component.name.clone())
-    } else if component.is_system && check_result.skipped.contains(&component.name) {
-        Named::Unmatched(component.name.clone())
+        ComponentOutcome::Excluded
+    } else if check_result
+        .unmatched
+        .iter()
+        .any(|unmatched| own_row(component, unmatched))
+    {
+        ComponentOutcome::Unmatched
     } else {
-        Named::UpToDate
+        ComponentOutcome::UpToDate
     }
-}
-
-/// The line a named run prints for a component no store entry matches.
-fn unmatched_line(name: &str) -> String {
-    format!("no KDE Store entry matches {name:?}")
 }
 
 /// An outcome the check settled without a failure.
@@ -818,58 +929,57 @@ enum Settled {
     UpToDate,
 }
 
-/// The stdout line and exit code a named run reports for a settled outcome:
-/// the dry run and the update path share it, so the two cannot drift.
-fn settled_outcome(settled: Settled, name: &str) -> (String, ExitCode) {
+/// The name a named run's settled lines call a component by, and on a run
+/// covering several components its failed-check lines too: the argument as
+/// typed when it covered exactly one component, else the directory name and
+/// the kind, since the shared name alone cannot tell them apart.
+fn settled_label(name: &str, component: &lib::InstalledComponent, multi: bool) -> String {
+    if multi {
+        format!(
+            "{:?} ({})",
+            component.directory_name, component.component_type
+        )
+    } else {
+        format!("{name:?}")
+    }
+}
+
+/// The name a named run's failed-check line calls a component by. A failed
+/// check is not a settled outcome, so one match keeps the display name the
+/// diagnostic carries.
+fn failed_check_label(
+    name: &str,
+    component: &lib::InstalledComponent,
+    diagnostic: &lib::Diagnostic,
+    multi: bool,
+) -> String {
+    if multi {
+        settled_label(name, component, multi)
+    } else {
+        format!("{:?}", diagnostic.name)
+    }
+}
+
+/// The stdout line a named run reports for a settled outcome: the dry run and
+/// the update path share it, so the two cannot drift.
+fn settled_outcome(settled: Settled, label: &str) -> String {
     match settled {
-        Settled::Excluded => (format!("{name:?} is excluded"), ExitCode::Success),
-        Settled::Unmatched => (unmatched_line(name), ExitCode::Success),
-        Settled::UpToDate => (
-            format!("no update available for {name:?}"),
-            ExitCode::Success,
-        ),
+        Settled::Excluded => format!("{label} is excluded"),
+        Settled::Unmatched => format!("no KDE Store entry matches {label}"),
+        Settled::UpToDate => format!("no update available for {label}"),
     }
 }
 
-/// Reports a settled outcome on a named dry run: the check shape with the
-/// display names `skipped` lists under `--json`, else its line.
-fn settled_dry_run(
+/// Prints the stdout line of one settled outcome, named by the shared label
+/// rule.
+fn payload_settled(
     settled: Settled,
-    skipped: Vec<String>,
     name: &str,
-    json: bool,
-) -> Result<ExitCode, Stop> {
-    let (line, code) = settled_outcome(settled, name);
-    if json {
-        payload_json(&named_check_result(
-            Vec::new(),
-            skipped,
-            Vec::new(),
-            Vec::new(),
-        ))?;
-    } else {
-        payload(format_args!("{line}"))?;
-    }
-    Ok(code)
-}
-
-/// Reports a settled outcome on a named update: an update result with the
-/// display names `skipped` lists under `--json`, else its line.
-fn settled_update(
-    settled: Settled,
-    skipped: Vec<String>,
-    name: &str,
-    json: bool,
-) -> Result<ExitCode, Stop> {
-    let (line, code) = settled_outcome(settled, name);
-    if json {
-        let mut result = lib::UpdateResult::default();
-        result.skipped = skipped;
-        payload_json(&result)?;
-    } else {
-        payload(format_args!("{line}"))?;
-    }
-    Ok(code)
+    component: &lib::InstalledComponent,
+    multi: bool,
+) -> Result<(), Stop> {
+    let line = settled_outcome(settled, &settled_label(name, component, multi));
+    payload(format_args!("{line}"))
 }
 
 /// Reports failure rows the check already settled, before any install runs.
@@ -1322,16 +1432,181 @@ mod tests {
         result
     }
 
+    /// The check shape of a `--system` run that skipped `component` for want
+    /// of a store entry: its name in `skipped`, the component in `unmatched`.
+    fn unmatching(component: &crate::lib::InstalledComponent) -> crate::lib::CheckResult {
+        let mut result = skipping(&component.name);
+        result.unmatched.push(component.clone());
+        result
+    }
+
+    /// A diagnostic about `path`, built through the public serde shape: the
+    /// type has no public constructor.
+    fn diagnostic_for(name: &str, path: &str) -> crate::lib::Diagnostic {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "path": path,
+            "reason": "failed to fetch store entry",
+        }))
+        .unwrap()
+    }
+
     /// A `--system` check skips a system component no store entry matches;
     /// no exclusion rule names it, so the named path must not call it excluded.
     #[test]
     fn a_skipped_component_no_rule_excludes_is_unmatched() {
         let component = system_scheme();
         let config = crate::lib::Config::new().with_system(true);
-        let named = super::classify_installed(&component, &config, &skipping("Breeze Dark"));
+        let named = super::classify_installed(&component, &config, &unmatching(&component));
         assert!(
-            matches!(&named, super::Named::Unmatched(name) if name == "Breeze Dark"),
+            matches!(&named, super::ComponentOutcome::Unmatched),
             "an unmatched skip read as another outcome"
+        );
+    }
+
+    /// Two system schemes share the display name `Breeze Dark`; only the
+    /// sibling is unmatched. The sibling's skip must not answer for the
+    /// named component, and the sibling still reads unmatched.
+    #[test]
+    fn a_same_named_siblings_unmatched_skip_does_not_answer_for_a_component() {
+        let component = system_scheme();
+        let sibling = crate::lib::InstalledComponent::new(
+            "Breeze Dark",
+            "BreezeDark2.colors",
+            crate::lib::ComponentType::ColorScheme,
+            "/usr/share/color-schemes/BreezeDark2.colors",
+        )
+        .with_system(true);
+        let config = crate::lib::Config::new().with_system(true);
+        let check_result = unmatching(&sibling);
+
+        assert!(
+            matches!(
+                super::classify_installed(&component, &config, &check_result),
+                super::ComponentOutcome::UpToDate
+            ),
+            "a component read as unmatched through a same-named sibling's skip"
+        );
+        assert!(
+            matches!(
+                super::classify_installed(&sibling, &config, &check_result),
+                super::ComponentOutcome::Unmatched
+            ),
+            "the unmatched sibling itself read as another outcome"
+        );
+    }
+
+    /// An icon theme and a cursor theme can share one directory under
+    /// `--system`: the cursor theme's unmatched skip is not the icon theme's.
+    #[test]
+    fn an_unmatched_component_of_another_type_at_the_same_path_does_not_answer() {
+        let path = "/usr/share/icons/Breeze_Snow";
+        let icons = crate::lib::InstalledComponent::new(
+            "Breeze Snow",
+            "Breeze_Snow",
+            crate::lib::ComponentType::IconTheme,
+            path,
+        )
+        .with_system(true);
+        let cursors = crate::lib::InstalledComponent::new(
+            "Breeze Snow",
+            "Breeze_Snow",
+            crate::lib::ComponentType::CursorTheme,
+            path,
+        )
+        .with_system(true);
+        let config = crate::lib::Config::new().with_system(true);
+
+        assert!(
+            matches!(
+                super::classify_installed(&icons, &config, &unmatching(&cursors)),
+                super::ComponentOutcome::UpToDate
+            ),
+            "an icon theme read as unmatched through a cursor theme at its path"
+        );
+    }
+
+    /// A same-named sibling's failed check must not answer for a component
+    /// the check settled, and still answers for the sibling itself.
+    #[test]
+    fn a_same_named_siblings_diagnostic_does_not_answer_for_a_component() {
+        let component = crate::lib::InstalledComponent::new(
+            "Fake Scheme",
+            "FakeScheme.colors",
+            crate::lib::ComponentType::ColorScheme,
+            "/home/me/.local/share/color-schemes/FakeScheme.colors",
+        );
+        let sibling_path = "/home/me/.local/share/color-schemes/Second.colors";
+        let sibling = crate::lib::InstalledComponent::new(
+            "Fake Scheme",
+            "Second.colors",
+            crate::lib::ComponentType::ColorScheme,
+            sibling_path,
+        );
+        let mut check_result = crate::lib::CheckResult::default();
+        check_result
+            .diagnostics
+            .push(diagnostic_for("Fake Scheme", sibling_path));
+        let config = crate::lib::Config::new();
+
+        assert!(
+            matches!(
+                super::classify_installed(&component, &config, &check_result),
+                super::ComponentOutcome::UpToDate
+            ),
+            "a component read as failed through a same-named sibling's diagnostic"
+        );
+        assert!(
+            matches!(
+                super::classify_installed(&sibling, &config, &check_result),
+                super::ComponentOutcome::CheckFailed(diagnostic)
+                    if diagnostic.path == std::path::Path::new(sibling_path)
+            ),
+            "the failed sibling itself read as another outcome"
+        );
+    }
+
+    /// A diagnostic answers only for the component at its path AND name: two
+    /// component types can share one directory under `--system` with
+    /// different names, so the cursor theme's diagnostic is not the icon
+    /// theme's.
+    #[test]
+    fn a_diagnostic_answers_only_for_the_component_of_its_path_and_name() {
+        let path = "/usr/share/icons/Breeze_Snow";
+        let icons = crate::lib::InstalledComponent::new(
+            "Breeze Snow",
+            "Breeze_Snow",
+            crate::lib::ComponentType::IconTheme,
+            path,
+        )
+        .with_system(true);
+        let cursors = crate::lib::InstalledComponent::new(
+            "Breeze Snow Cursors",
+            "Breeze_Snow",
+            crate::lib::ComponentType::CursorTheme,
+            path,
+        )
+        .with_system(true);
+        let mut check_result = crate::lib::CheckResult::default();
+        check_result
+            .diagnostics
+            .push(diagnostic_for("Breeze Snow Cursors", path));
+        let config = crate::lib::Config::new().with_system(true);
+
+        assert!(
+            matches!(
+                super::classify_installed(&icons, &config, &check_result),
+                super::ComponentOutcome::UpToDate
+            ),
+            "an icon theme read as failed through a cursor theme's diagnostic at its path"
+        );
+        assert!(
+            matches!(
+                super::classify_installed(&cursors, &config, &check_result),
+                super::ComponentOutcome::CheckFailed(diagnostic)
+                    if diagnostic.path == std::path::Path::new(path)
+            ),
+            "the cursor theme's own diagnostic read as another outcome"
         );
     }
 
@@ -1352,7 +1627,7 @@ mod tests {
             for check_result in [skipping("Breeze Dark"), crate::lib::CheckResult::default()] {
                 let named = super::classify_installed(&component, config, &check_result);
                 assert!(
-                    matches!(&named, super::Named::Excluded(name) if name == "Breeze Dark"),
+                    matches!(&named, super::ComponentOutcome::Excluded),
                     "an excluded component read as another outcome"
                 );
             }
@@ -1366,7 +1641,7 @@ mod tests {
         let config = crate::lib::Config::new().with_system(true);
         let named =
             super::classify_installed(&component, &config, &crate::lib::CheckResult::default());
-        assert!(matches!(named, super::Named::UpToDate));
+        assert!(matches!(named, super::ComponentOutcome::UpToDate));
     }
 
     /// `skipped` lists display names, so on a user run a current component
@@ -1384,48 +1659,165 @@ mod tests {
             crate::lib::Config::new().with_excluded_packages(vec!["a.weather".to_string()]);
         let named = super::classify_installed(&current, &config, &skipping("Weather Widget"));
         assert!(
-            matches!(named, super::Named::UpToDate),
+            matches!(named, super::ComponentOutcome::UpToDate),
             "a user component read as unmatched through a sibling's skip"
         );
     }
 
+    /// The line both named paths print for a settled outcome, keyed by
+    /// outcome rather than by print arm, so the two cannot drift.
     #[test]
-    fn the_unmatched_line_names_the_missing_store_entry() {
+    fn settled_outcomes_print_their_line() {
+        let component = system_scheme();
+        let label = super::settled_label("BreezeDark.colors", &component, false);
+        let suffixed = super::settled_label("Breeze Dark", &component, true);
+
         assert_eq!(
-            super::unmatched_line("Breeze Dark"),
-            r#"no KDE Store entry matches "Breeze Dark""#
+            super::settled_outcome(super::Settled::Excluded, &label),
+            r#""BreezeDark.colors" is excluded"#.to_string(),
+            "an excluded outcome printed the wrong line"
+        );
+        assert_eq!(
+            super::settled_outcome(super::Settled::Unmatched, &label),
+            r#"no KDE Store entry matches "BreezeDark.colors""#.to_string(),
+            "an unmatched outcome printed the wrong line"
+        );
+        assert_eq!(
+            super::settled_outcome(super::Settled::UpToDate, &label),
+            r#"no update available for "BreezeDark.colors""#.to_string(),
+            "an up-to-date outcome printed the wrong line"
+        );
+        assert_eq!(
+            super::settled_outcome(super::Settled::UpToDate, &suffixed),
+            r#"no update available for "BreezeDark.colors" (Color Scheme)"#.to_string(),
+            "the suffixed line lost the directory name or the kind"
         );
     }
 
-    /// The line and exit code both named paths print for a settled outcome,
-    /// keyed by outcome rather than by print arm, so the two cannot drift.
+    /// A name covering a pending update row and a same-named up-to-date
+    /// sibling answers for each: the row stays the pending component's own,
+    /// and the sibling's line carries the directory name and the kind, since
+    /// the shared name alone cannot tell them apart.
     #[test]
-    fn settled_outcomes_print_their_line_and_succeed() {
-        let name = "BreezeDark.colors";
+    fn a_pending_row_and_an_up_to_date_sibling_answer_each_for_themselves() {
+        let pending = crate::lib::InstalledComponent::new(
+            "Fake Scheme",
+            "First.colors",
+            crate::lib::ComponentType::ColorScheme,
+            "/home/me/.local/share/color-schemes/First.colors",
+        );
+        let current = crate::lib::InstalledComponent::new(
+            "Fake Scheme",
+            "Second.colors",
+            crate::lib::ComponentType::ColorScheme,
+            "/home/me/.local/share/color-schemes/Second.colors",
+        );
+        let row = crate::lib::AvailableUpdate::builder(pending.clone(), 42, "2.0").build();
+        let mut check_result = crate::lib::CheckResult::default();
+        check_result.available_updates.push(row.clone());
+        let config = crate::lib::Config::new();
 
-        assert_eq!(
-            super::settled_outcome(super::Settled::Excluded, name),
-            (
-                r#""BreezeDark.colors" is excluded"#.to_string(),
-                super::ExitCode::Success
+        let resolved = super::resolve_components(
+            "Fake Scheme",
+            &[pending.clone(), current.clone()],
+            &config,
+            &check_result,
+        );
+
+        assert_eq!(resolved.len(), 2, "{resolved:?}");
+        let pending_resolved = resolved
+            .iter()
+            .find(|named| named.component.path == pending.path)
+            .expect("the pending component is covered");
+        assert!(
+            matches!(
+                &pending_resolved.outcome,
+                super::ComponentOutcome::Update(update)
+                    if update.installed.path == pending.path
             ),
-            "an excluded outcome printed the wrong line or exit code"
+            "the pending component's row read as another outcome"
+        );
+        let current_resolved = resolved
+            .iter()
+            .find(|named| named.component.path == current.path)
+            .expect("the current sibling is covered");
+        assert!(
+            matches!(&current_resolved.outcome, super::ComponentOutcome::UpToDate),
+            "the up-to-date sibling read as another outcome"
         );
         assert_eq!(
-            super::settled_outcome(super::Settled::Unmatched, name),
-            (
-                r#"no KDE Store entry matches "BreezeDark.colors""#.to_string(),
-                super::ExitCode::Success
+            super::settled_outcome(
+                super::Settled::UpToDate,
+                &super::settled_label("Fake Scheme", &current, true),
             ),
-            "an unmatched outcome printed the wrong line or exit code"
+            r#"no update available for "Second.colors" (Color Scheme)"#.to_string(),
+            "the suffixed up-to-date line named the wrong component"
         );
-        assert_eq!(
-            super::settled_outcome(super::Settled::UpToDate, name),
-            (
-                r#"no update available for "BreezeDark.colors""#.to_string(),
-                super::ExitCode::Success
+    }
+
+    /// A same-named sibling's own row does not answer for a component: the
+    /// name resolves to every covered component, and each answers by its own
+    /// row's identity. A no-download failure row matches the same way, by
+    /// install path and type.
+    #[test]
+    fn a_same_named_siblings_row_does_not_answer_for_a_component() {
+        let component = crate::lib::InstalledComponent::new(
+            "a.weather",
+            "a.weather",
+            crate::lib::ComponentType::PlasmaWidget,
+            "/home/me/.local/share/plasma/plasmoids/a.weather",
+        );
+        let sibling = crate::lib::InstalledComponent::new(
+            "a.weather",
+            "b.weather",
+            crate::lib::ComponentType::PlasmaWidget,
+            "/home/me/.local/share/plasma/plasmoids/b.weather",
+        );
+        let same_path_other_type = crate::lib::InstalledComponent::new(
+            "a.weather",
+            "a.weather",
+            crate::lib::ComponentType::CursorTheme,
+            component.path.clone(),
+        );
+        let row = crate::lib::AvailableUpdate::builder(sibling.clone(), 42, "2.0").build();
+        let mut check_result = crate::lib::CheckResult::default();
+        check_result.available_updates.push(row.clone());
+        let config = crate::lib::Config::new();
+
+        let resolved = super::resolve_components(
+            "a.weather",
+            &[component.clone(), sibling.clone()],
+            &config,
+            &check_result,
+        );
+
+        let component_resolved = resolved
+            .iter()
+            .find(|named| named.component.path == component.path)
+            .expect("the named component is covered");
+        assert!(
+            matches!(
+                &component_resolved.outcome,
+                super::ComponentOutcome::UpToDate
             ),
-            "an up-to-date outcome printed the wrong line or exit code"
+            "a sibling's own row answered for the component"
+        );
+        let sibling_resolved = resolved
+            .iter()
+            .find(|named| named.component.path == sibling.path)
+            .expect("the sibling is covered");
+        assert!(
+            matches!(
+                &sibling_resolved.outcome,
+                super::ComponentOutcome::Update(update) if update.installed.path == sibling.path
+            ),
+            "the sibling's own row read as another outcome"
+        );
+        assert!(
+            super::own_row(&component, &component)
+                && !super::own_row(&component, &sibling)
+                && !super::own_row(&component, &same_path_other_type),
+            "the row identity predicate answered for the wrong component"
         );
     }
 }
