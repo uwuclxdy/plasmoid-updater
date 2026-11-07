@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Stands in for curl against crates.io's download host. Only the real download
+# path is answered: `https://static.crates.io/crates/<name>/<name>-<version>.crate`
+# is served from $FAKE_CRATES_DIR/<name>-<version>.crate (to stdout, or to the
+# `-o` file) with HTTP 200. A missing file answers 403, the status the live CDN
+# gives both a version and a name crates.io never had; $FAKE_CURL_HTTP forces
+# another status (404, 503, ...). Under `-f` an HTTP error exits 22 the way
+# curl does, and a `-w`/`--write-out` format's `%{http_code}` is printed to
+# stdout either way, as curl prints it after the transfer.
+# $FAKE_CURL_EXIT makes every call fail as a transport error with that exit
+# status instead (7 is curl's "failed to connect"). Any other URL is refused,
+# so a caller reaching elsewhere fails loudly.
+set -euo pipefail
+url="" out="" write_out="" fail=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o | --output) out="${2:-}"; shift 2 ;;
+    --output=*) out="${1#--output=}"; shift ;;
+    -w | --write-out) write_out="${2:-}"; shift 2 ;;
+    --write-out=*) write_out="${1#--write-out=}"; shift ;;
+    -m | --max-time | --connect-timeout | --retry) shift 2 ;;
+    --fail | --fail-with-body) fail=1; shift ;;
+    --*) shift ;;
+    -*)
+      [[ "$1" == *f* ]] && fail=1
+      shift
+      ;;
+    *) url="$1"; shift ;;
+  esac
+done
+if [ -n "${FAKE_CURL_EXIT:-}" ]; then
+  echo "curl: (${FAKE_CURL_EXIT}) Failed to connect to static.crates.io port 443" >&2
+  exit "$FAKE_CURL_EXIT"
+fi
+prefix="https://static.crates.io/crates/"
+rest="${url#"$prefix"}"
+name="${rest%%/*}"
+file_name="${rest#*/}"
+if [ "$rest" = "$url" ] || [[ "$rest" != */* ]] || [[ "$file_name" != "$name-"*.crate ]] || [[ "$file_name" == */* ]]; then
+  echo "fake curl: unexpected URL: $url" >&2
+  exit 1
+fi
+file="${FAKE_CRATES_DIR:-/nonexistent}/${file_name}"
+code="${FAKE_CURL_HTTP:-}"
+if [ -z "$code" ]; then
+  if [ -f "$file" ]; then code=200; else code=403; fi
+fi
+if [ "$code" = 200 ]; then
+  if [ -n "$out" ]; then cp "$file" "$out"; else cat "$file"; fi
+fi
+if [ -n "$write_out" ]; then
+  printf '%s' "${write_out//%\{http_code\}/$code}"
+fi
+if [ "$code" != 200 ] && [ "$fail" = 1 ]; then
+  echo "curl: (22) The requested URL returned error: ${code}" >&2
+  exit 22
+fi
+exit 0

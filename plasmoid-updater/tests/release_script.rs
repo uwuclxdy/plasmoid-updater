@@ -98,6 +98,7 @@ struct Fixture {
     semver_log: PathBuf,
     cargo_log: PathBuf,
     rustup_log: PathBuf,
+    publish_log: PathBuf,
     path_with_tool: String,
     path_without_tool: String,
     prev_tag: String,
@@ -193,12 +194,14 @@ impl Fixture {
         let semver_log = base.join("semver.log");
         let cargo_log = base.join("cargo.log");
         let rustup_log = base.join("rustup.log");
+        let publish_log = base.join("publish.log");
 
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/release");
         install(&fixtures.join("fake-gh"), &bin.join("gh"));
         install(&fixtures.join("fake-cargo"), &bin.join("cargo"));
         install(&fixtures.join("fake-git"), &bin.join("git"));
         install(&fixtures.join("fake-rustup"), &bin.join("rustup"));
+        install(&fixtures.join("fake-curl"), &bin.join("curl"));
         install(
             &fixtures.join("fake-cargo-semver-checks"),
             &tool_bin.join("cargo-semver-checks"),
@@ -217,6 +220,7 @@ impl Fixture {
             semver_log,
             cargo_log,
             rustup_log,
+            publish_log,
             path_with_tool: format!("{}:{}:{BASE_PATH}", bin.display(), tool_bin.display()),
             path_without_tool: format!("{}:{BASE_PATH}", bin.display()),
             prev_tag,
@@ -307,6 +311,10 @@ impl Fixture {
         let dir = self.repo.join("scripts");
         fs::create_dir_all(&dir).unwrap();
         install(&guard_script(), &dir.join("semver-guard.sh"));
+        install(
+            &repo_root().join("scripts").join(CRATES_IO_COPY),
+            &dir.join(CRATES_IO_COPY),
+        );
     }
 
     fn git_at(&self, dir: &Path, args: &[&str]) -> Output {
@@ -423,7 +431,8 @@ impl Fixture {
             .env("FAKE_GH_LOG", &self.gh_log)
             .env("FAKE_SEMVER_LOG", &self.semver_log)
             .env("FAKE_CARGO_LOG", &self.cargo_log)
-            .env("FAKE_RUSTUP_LOG", &self.rustup_log);
+            .env("FAKE_RUSTUP_LOG", &self.rustup_log)
+            .env("FAKE_PUBLISH_LOG", &self.publish_log);
         command
     }
 
@@ -2508,6 +2517,853 @@ fn publish_runs_only_after_a_successful_validate() {
             "always() && needs.validate.result == 'success' && startsWith(github.ref, 'refs/tags/')"
         ),
         "a failed validate skips every build leg, so publish must not run to fail on the missing artifacts"
+    );
+}
+
+const CRATES_JOB: &str = "crates";
+const CRATES_STEP: &str = "Publish the crates to crates.io";
+
+fn release_yaml() -> String {
+    fs::read_to_string(repo_root().join(".github/workflows/release.yml")).unwrap()
+}
+
+/// The package each recorded `cargo publish` call named, in call order.
+fn published_packages(fixture: &Fixture) -> Vec<String> {
+    let log = fs::read_to_string(&fixture.publish_log).unwrap_or_default();
+    log.lines()
+        .map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            words
+                .iter()
+                .position(|word| *word == "-p" || *word == "--package")
+                .map(|at| words[at + 1].to_string())
+                .or_else(|| {
+                    words
+                        .iter()
+                        .find_map(|word| word.strip_prefix("--package="))
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| panic!("publish call names no package: {line}"))
+        })
+        .collect()
+}
+
+/// The shared script release.sh and both release.yml jobs ask about a crate
+/// version's copy on crates.io.
+const CRATES_IO_COPY: &str = "crates-io-copy.sh";
+/// The validate step that stops a tag whose version crates.io holds from
+/// another commit before anything is built or uploaded.
+const CRATES_GUARD_STEP: &str = "Refuse a version crates.io holds from another commit";
+const OTHER_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A crate version already on crates.io: the commit its `.cargo_vcs_info.json`
+/// names (`None`: a `.crate` carrying no such file), and whether cargo marked
+/// the packed tree dirty.
+struct Published {
+    name: &'static str,
+    version: &'static str,
+    sha1: Option<String>,
+    dirty: bool,
+}
+
+fn published(name: &'static str, version: &'static str, sha1: Option<&str>) -> Published {
+    Published {
+        name,
+        version,
+        sha1: sha1.map(str::to_string),
+        dirty: false,
+    }
+}
+
+/// Packs `registry` as crates.io's `.crate` files for the fake `curl` and lists
+/// them for the fake `cargo`, returning the env both read.
+fn fake_registry(fixture: &Fixture, registry: &[Published]) -> Vec<(&'static str, String)> {
+    let crates_dir = fixture.base().join("crates-io");
+    fs::create_dir_all(&crates_dir).unwrap();
+    for entry in registry {
+        let stem = format!("{}-{}", entry.name, entry.version);
+        let tree = fixture.base().join("crate-src").join(&stem);
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("Cargo.toml"), "[package]\n").unwrap();
+        if let Some(sha1) = &entry.sha1 {
+            let dirty = if entry.dirty {
+                r#", "dirty": true"#
+            } else {
+                ""
+            };
+            fs::write(
+                tree.join(".cargo_vcs_info.json"),
+                format!(r#"{{"git": {{"sha1": "{sha1}"{dirty}}}, "path_in_vcs": ""}}"#),
+            )
+            .unwrap();
+        }
+        let status = Command::new(system_program("tar"))
+            .arg("-czf")
+            .arg(crates_dir.join(format!("{stem}.crate")))
+            .arg("-C")
+            .arg(tree.parent().unwrap())
+            .arg(&stem)
+            .status()
+            .unwrap();
+        assert!(status.success(), "packing the fake {stem}.crate failed");
+    }
+    let listed: Vec<String> = registry
+        .iter()
+        .map(|entry| format!("{}@{}", entry.name, entry.version))
+        .collect();
+    vec![
+        env("FAKE_CRATES_ON_REGISTRY", &listed.join(" ")),
+        env("FAKE_CRATES_DIR", &crates_dir.display().to_string()),
+    ]
+}
+
+/// Runs a release.yml step with `registry` already on crates.io and the tag
+/// at the fixture's version.
+fn run_registry_step(
+    fixture: &Fixture,
+    step: &str,
+    registry: &[Published],
+    envs: &[(&'static str, String)],
+) -> Output {
+    fixture.set_manifest_version(VERSION);
+    let mut all = vec![
+        env("GITHUB_REF_NAME", &format!("v{VERSION}")),
+        env("CARGO_REGISTRY_TOKEN", "fake-trusted-publishing-token"),
+    ];
+    all.extend(fake_registry(fixture, registry));
+    all.extend_from_slice(envs);
+    fixture.run_step(&step_script(&release_yaml(), step), &all)
+}
+
+fn run_crates_step(
+    fixture: &Fixture,
+    registry: &[Published],
+    envs: &[(&'static str, String)],
+) -> Output {
+    run_registry_step(fixture, CRATES_STEP, registry, envs)
+}
+
+/// The shared script's one-line answer about `<name>@<VERSION>` on crates.io.
+fn crates_io_copy(
+    fixture: &Fixture,
+    registry: &[Published],
+    envs: &[(&'static str, String)],
+) -> Output {
+    let mut all = fake_registry(fixture, registry);
+    all.extend_from_slice(envs);
+    fixture.run_step(
+        &format!("bash scripts/{CRATES_IO_COPY} libplasmoid-updater {VERSION}\n"),
+        &all,
+    )
+}
+
+#[test]
+fn the_crates_io_copy_script_tells_each_state_apart() {
+    // Each case runs in its own fixture, whose commit sha embeds its creation
+    // time, so a case's registry is built from that fixture's own HEAD.
+    type Registry = fn(&str) -> Vec<Published>;
+    type Case = (
+        &'static str,
+        Registry,
+        Option<(&'static str, &'static str)>,
+        String,
+    );
+    let cases: [Case; 10] = [
+        ("not published", |_| vec![], None, "absent".to_string()),
+        (
+            "a 404",
+            |_| vec![],
+            Some(("FAKE_CURL_HTTP", "404")),
+            "absent".to_string(),
+        ),
+        (
+            "a CDN server error proves nothing",
+            |_| vec![],
+            Some(("FAKE_CURL_HTTP", "503")),
+            "unknown".to_string(),
+        ),
+        (
+            "packed from a dirty tree at another commit",
+            |_| {
+                vec![Published {
+                    dirty: true,
+                    ..published("libplasmoid-updater", VERSION, Some(OTHER_COMMIT))
+                }]
+            },
+            None,
+            format!("other {OTHER_COMMIT}"),
+        ),
+        (
+            "published from this commit",
+            |head| vec![published("libplasmoid-updater", VERSION, Some(head))],
+            None,
+            "same".to_string(),
+        ),
+        (
+            "published from another commit",
+            |_| {
+                vec![published(
+                    "libplasmoid-updater",
+                    VERSION,
+                    Some(OTHER_COMMIT),
+                )]
+            },
+            None,
+            format!("other {OTHER_COMMIT}"),
+        ),
+        (
+            "packed from a dirty tree at this commit",
+            |head| {
+                vec![Published {
+                    dirty: true,
+                    ..published("libplasmoid-updater", VERSION, Some(head))
+                }]
+            },
+            None,
+            "unknown".to_string(),
+        ),
+        (
+            "no readable commit",
+            |_| vec![published("libplasmoid-updater", VERSION, None)],
+            None,
+            "unknown".to_string(),
+        ),
+        (
+            "a commit field that is no object id",
+            |_| vec![published("libplasmoid-updater", VERSION, Some("v0.2.2"))],
+            None,
+            "unknown".to_string(),
+        ),
+        (
+            "download failed for another reason",
+            |head| vec![published("libplasmoid-updater", VERSION, Some(head))],
+            Some(("FAKE_CURL_EXIT", "7")),
+            "unknown".to_string(),
+        ),
+    ];
+    for (case, registry, extra, expected) in cases {
+        let fixture = Fixture::workspace();
+        let registry = registry(&fixture.head());
+        let envs: Vec<(&'static str, String)> = extra
+            .map(|(key, value)| env(key, value))
+            .into_iter()
+            .collect();
+        let out = crates_io_copy(&fixture, &registry, &envs);
+        assert_eq!(out.status.code(), Some(0), "{case}: {}", text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let answer = stdout.trim_end();
+        if expected == "unknown" {
+            assert!(
+                answer == "unknown" || answer.starts_with("unknown "),
+                "{case}: expected unknown, got {answer:?}"
+            );
+        } else {
+            assert_eq!(answer, expected, "{case}");
+        }
+    }
+    let fixture = Fixture::workspace();
+    let out = crates_io_copy(&fixture, &[], &[env("FAKE_CURL_EXIT", "7")]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("curl: (7)"),
+        "a failed download shows curl's own reason: {}",
+        text(&out)
+    );
+}
+
+#[test]
+fn validate_refuses_a_version_crates_io_holds_from_another_commit() {
+    let fixture = Fixture::workspace();
+    let head = fixture.head();
+    let out = run_registry_step(
+        &fixture,
+        CRATES_GUARD_STEP,
+        &[published("plasmoid-updater", VERSION, Some(OTHER_COMMIT))],
+        &[],
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(OTHER_COMMIT) && stderr.contains(&head),
+        "the error names both commits:\n{stderr}"
+    );
+    let error = format!(
+        "::error::plasmoid-updater {VERSION} is already on crates.io but was packed from {OTHER_COMMIT}, not from this tag's {head}; crates.io versions are immutable, so this tag can never publish it: bump to a new version (delete the GitHub release, if release.sh made one, and the tag, then release the next version)"
+    );
+    assert!(
+        stderr.lines().any(|line| line == error),
+        "the one remedy is a new version:\n{stderr}"
+    );
+    assert_eq!(
+        stderr,
+        format!("curl: (22) The requested URL returned error: 403\n{error}\n"),
+        "the error is the step's whole stderr past curl's own line: no second line may offer a do-over"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("::error::"),
+        "{}",
+        text(&out)
+    );
+
+    let fixture = Fixture::workspace();
+    let out = run_registry_step(&fixture, CRATES_GUARD_STEP, &[], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "not yet published: {}",
+        text(&out)
+    );
+
+    let fixture = Fixture::workspace();
+    let head = fixture.head();
+    let registry = [
+        published("libplasmoid-updater", VERSION, Some(&head)),
+        published("plasmoid-updater", VERSION, Some(&head)),
+    ];
+    let out = run_registry_step(&fixture, CRATES_GUARD_STEP, &registry, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a re-run of this commit: {}",
+        text(&out)
+    );
+
+    let yaml = release_yaml();
+    let validate = job_lines(&yaml, "validate");
+    assert!(
+        validate
+            .iter()
+            .any(|line| line.trim() == format!("- name: {CRATES_GUARD_STEP}")),
+        "the guard runs in validate, before any build or upload"
+    );
+}
+
+#[test]
+fn release_refuses_a_version_crates_io_holds_from_another_commit() {
+    let fixture = Fixture::workspace();
+    let head = fixture.head();
+    let before = fixture.snapshot();
+    let mut envs = vec![env("FAKE_SEMVER_EXIT", "0")];
+    envs.extend(fake_registry(
+        &fixture,
+        &[published(
+            "libplasmoid-updater",
+            VERSION,
+            Some(OTHER_COMMIT),
+        )],
+    ));
+    let out = fixture.run_with_env(
+        &fixture.path_with_tool,
+        &["--workspace", "--notes", "docs/RELEASE_NOTES.md", VERSION],
+        &envs,
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    let stderr = stderr_text(&out);
+    assert!(
+        stderr.contains(OTHER_COMMIT) && stderr.contains(&head),
+        "the refusal names both commits:\n{stderr}"
+    );
+    let refusal = format!(
+        "Error: libplasmoid-updater {VERSION} is already on crates.io but was packed from {OTHER_COMMIT}, not from this tree's {head}; crates.io versions are immutable, so v{VERSION} can never be released from this tree: bump to a new version; the release did not start"
+    );
+    assert!(
+        stderr.lines().any(|line| line == refusal),
+        "the one remedy is a new version:\n{stderr}"
+    );
+    assert_eq!(
+        stderr,
+        format!("{refusal}\n"),
+        "the refusal is the whole stderr: no second line may offer a do-over"
+    );
+    assert_eq!(
+        printed_commands(&stderr),
+        Vec::<String>::new(),
+        "no re-run line: it would only repeat the refused version"
+    );
+    assert_eq!(
+        fixture.snapshot(),
+        before,
+        "a refused release changes nothing"
+    );
+}
+
+/// The publish job's missing-release error never advises redoing the same
+/// version: a hand-pushed tag is superseded by the next release.
+#[test]
+fn the_publish_job_never_advises_redoing_a_hand_pushed_tag() {
+    let fixture = Fixture::workspace();
+    fs::create_dir_all(fixture.repo.join("artifacts")).unwrap();
+    let out = fixture.run_step(
+        &step_script(&release_yaml(), "Upload assets to the release"),
+        &[
+            env("GITHUB_REF_NAME", &format!("v{VERSION}")),
+            env("GITHUB_REPOSITORY", "owner/repo"),
+            env("GITHUB_RUN_ID", "42"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let error = format!(
+        "::error::release v{VERSION} does not exist; if release.sh's create step failed, run from the repo root: echo y | ./release.sh --retry --workspace --notes CHANGELOG_FILE {VERSION}, then re-run this job so the assets attach: gh run rerun 42 --failed — if the tag was hand-pushed, release the next version with release.sh"
+    );
+    assert!(
+        text(&out).lines().any(|line| line == error),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        stdout_text(&out),
+        format!("{error}\n"),
+        "the error is the step's whole output: no second line may offer a do-over"
+    );
+    assert_eq!(stderr_text(&out), "", "{}", text(&out));
+}
+
+/// A release whose tag went out is resumed or superseded, never redone: its
+/// first workflow run may still publish the version from the first commit.
+#[test]
+fn an_existing_release_is_resumed_or_superseded_never_redone() {
+    let fixture = Fixture::workspace();
+    let before = fixture.snapshot();
+    let out = fixture.run_with_env(
+        &fixture.path_with_tool,
+        &["--workspace", "--notes", "docs/RELEASE_NOTES.md", VERSION],
+        &[env("FAKE_GH_RELEASES", &format!("v{VERSION}"))],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let refusal = format!(
+        "Error: github release v{VERSION} already exists; rerun with --retry to resume, or release the next version"
+    );
+    assert!(
+        stderr_text(&out).lines().any(|line| line == refusal),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        stderr_text(&out),
+        format!("{refusal}\n"),
+        "the refusal is the whole stderr: no second line may offer a do-over"
+    );
+    assert_eq!(stdout_text(&out), "", "{}", text(&out));
+    assert_eq!(fixture.snapshot(), before, "the refusal changed state");
+}
+
+/// A crates.io answer the check cannot read (here a failed connection) stops
+/// the release before any change, the way a semver check that could not
+/// complete does: a version it cannot see might be another commit's.
+#[test]
+fn release_refuses_when_the_crates_io_check_cannot_complete() {
+    let fixture = Fixture::workspace();
+    let before = fixture.snapshot();
+    let mut envs = vec![env("FAKE_SEMVER_EXIT", "0"), env("FAKE_CURL_EXIT", "7")];
+    envs.extend(fake_registry(&fixture, &[]));
+    let out = fixture.run_with_env(
+        &fixture.path_with_tool,
+        &["--workspace", "--notes", "docs/RELEASE_NOTES.md", VERSION],
+        &envs,
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stderr_text(&out).contains("curl: (7)"),
+        "the refusal shows why the check could not complete:\n{}",
+        text(&out)
+    );
+    assert_eq!(
+        fixture.snapshot(),
+        before,
+        "a refused release changes nothing"
+    );
+}
+
+/// On the tag, an unreadable crates.io answer does not block the release (the
+/// crates job asks again, and crates.io refuses a real duplicate), but the
+/// validate log says what it saw.
+#[test]
+fn validate_passes_an_unreadable_crates_io_answer_and_logs_it() {
+    let fixture = Fixture::workspace();
+    let out = run_registry_step(
+        &fixture,
+        CRATES_GUARD_STEP,
+        &[],
+        &[env("FAKE_CURL_HTTP", "503")],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("unknown"),
+        "validate logs the check's answer:\n{}",
+        text(&out)
+    );
+}
+
+/// Both crates are checked: whichever one crates.io holds from another commit
+/// stops `release.sh` and validate alike.
+#[test]
+fn either_crate_from_another_commit_stops_the_release() {
+    for crate_name in ["libplasmoid-updater", "plasmoid-updater"] {
+        let fixture = Fixture::workspace();
+        let before = fixture.snapshot();
+        let mut envs = vec![env("FAKE_SEMVER_EXIT", "0")];
+        envs.extend(fake_registry(
+            &fixture,
+            &[published(crate_name, VERSION, Some(OTHER_COMMIT))],
+        ));
+        let out = fixture.run_with_env(
+            &fixture.path_with_tool,
+            &["--workspace", "--notes", "docs/RELEASE_NOTES.md", VERSION],
+            &envs,
+        );
+        assert_ne!(out.status.code(), Some(0), "{crate_name}: {}", text(&out));
+        assert_eq!(fixture.snapshot(), before, "{crate_name}: changed the tree");
+
+        let fixture = Fixture::workspace();
+        let out = run_registry_step(
+            &fixture,
+            CRATES_GUARD_STEP,
+            &[published(crate_name, VERSION, Some(OTHER_COMMIT))],
+            &[],
+        );
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "validate, {crate_name}: {}",
+            text(&out)
+        );
+    }
+}
+
+/// A version crates.io already holds from the tagged commit is the same
+/// release: a `--retry` resume at that commit goes on after the crates job
+/// published.
+#[test]
+fn release_proceeds_over_a_version_crates_io_holds_from_this_commit() {
+    let fixture = Fixture::workspace();
+    let args = ["--workspace", "--notes", "docs/RELEASE_NOTES.md", VERSION];
+    let released = fixture.run(&fixture.path_with_tool, &args, 0);
+    assert_eq!(released.status.code(), Some(0), "{}", text(&released));
+    let tagged = fixture.rev_parse(&format!("v{VERSION}^{{commit}}"));
+    let mut envs = vec![env("FAKE_SEMVER_EXIT", "0")];
+    envs.extend(fake_registry(
+        &fixture,
+        &[
+            published("libplasmoid-updater", VERSION, Some(&tagged)),
+            published("plasmoid-updater", VERSION, Some(&tagged)),
+        ],
+    ));
+    let out = fixture.run_with_env(
+        &fixture.path_with_tool,
+        &[
+            "--retry",
+            "--workspace",
+            "--notes",
+            "docs/RELEASE_NOTES.md",
+            VERSION,
+        ],
+        &envs,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    for crate_name in ["libplasmoid-updater", "plasmoid-updater"] {
+        let line = format!("crates.io's {crate_name} {VERSION}: same");
+        assert!(
+            stdout_text(&out).lines().any(|l| l == line),
+            "missing {line:?}:\n{}",
+            text(&out)
+        );
+    }
+}
+
+#[test]
+fn validate_logs_every_crates_io_answer() {
+    let fixture = Fixture::workspace();
+    let head = fixture.head();
+    let out = run_registry_step(
+        &fixture,
+        CRATES_GUARD_STEP,
+        &[published("plasmoid-updater", VERSION, Some(&head))],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let log = text(&out);
+    for line in [
+        format!("crates.io's libplasmoid-updater {VERSION}: absent"),
+        format!("crates.io's plasmoid-updater {VERSION}: same"),
+    ] {
+        assert!(log.lines().any(|l| l == line), "missing {line:?}:\n{log}");
+    }
+}
+
+#[test]
+fn the_plan_lists_the_crates_io_check_between_the_api_check_and_the_bump() {
+    let fixture = Fixture::workspace();
+    let out = fixture.run(
+        &fixture.path_with_tool,
+        &["--workspace", "--notes", "docs/RELEASE_NOTES.md", VERSION],
+        0,
+    );
+    let log = stdout_text(&out);
+    let lines: Vec<&str> = log.lines().collect();
+    let at = |prefix: &str| {
+        lines
+            .iter()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("plan lacks {prefix:?}:\n{log}"))
+    };
+    let copy = at("  - check crates.io ");
+    assert_eq!(
+        lines[copy],
+        format!(
+            "  - check crates.io holds no {VERSION} from another commit, stopping if it cannot tell"
+        )
+    );
+    assert!(at("  - check libplasmoid-updater's API") < copy, "{log}");
+    assert!(copy < at("  - bump "), "{log}");
+}
+
+#[test]
+fn the_crates_step_never_skips_a_crate_packed_from_a_dirty_tree() {
+    let fixture = Fixture::workspace();
+    let head = fixture.head();
+    let out = run_crates_step(
+        &fixture,
+        &[Published {
+            dirty: true,
+            ..published("libplasmoid-updater", VERSION, Some(&head))
+        }],
+        &[],
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(published_packages(&fixture), ["libplasmoid-updater"]);
+}
+
+#[test]
+fn the_crates_step_publishes_the_library_before_the_binary() {
+    let fixture = Fixture::workspace();
+    let out = run_crates_step(&fixture, &[], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        published_packages(&fixture),
+        ["libplasmoid-updater", "plasmoid-updater"],
+        "the binary depends on the library by version, so the library publishes first"
+    );
+    let log = fs::read_to_string(&fixture.publish_log).unwrap();
+    for line in log.lines() {
+        assert!(
+            line.split_whitespace().any(|word| word == "--locked"),
+            "every publish verifies against the committed Cargo.lock: {line}"
+        );
+        assert!(
+            !line.split_whitespace().any(|word| word == "--no-verify"),
+            "every publish builds the packaged crate before upload: {line}"
+        );
+        assert!(
+            line.ends_with(" token=set"),
+            "every publish carries the registry token: {line}"
+        );
+    }
+}
+
+#[test]
+fn the_crates_step_skips_a_crate_already_on_crates_io() {
+    let other = "0123456789abcdef0123456789abcdef01234567";
+    let fixture = Fixture::workspace();
+    let head = fixture.head();
+    let rerun = run_crates_step(
+        &fixture,
+        &[
+            published("libplasmoid-updater", PREV_VERSION, Some(other)),
+            published("libplasmoid-updater", VERSION, Some(&head)),
+        ],
+        &[],
+    );
+    assert_eq!(rerun.status.code(), Some(0), "{}", text(&rerun));
+    assert_eq!(
+        published_packages(&fixture),
+        ["plasmoid-updater"],
+        "a re-run after the library went up from this commit publishes only the binary"
+    );
+
+    let fixture = Fixture::workspace();
+    let older_only = run_crates_step(
+        &fixture,
+        &[
+            published("libplasmoid-updater", PREV_VERSION, Some(other)),
+            published("plasmoid-updater", PREV_VERSION, Some(other)),
+        ],
+        &[],
+    );
+    assert_eq!(older_only.status.code(), Some(0), "{}", text(&older_only));
+    assert_eq!(
+        published_packages(&fixture),
+        ["libplasmoid-updater", "plasmoid-updater"],
+        "only the version under release counts as already published"
+    );
+}
+
+/// crates.io's copy of the version came from another commit (a tag deleted and
+/// pushed again elsewhere while the first run was still publishing, which
+/// validate cannot see yet): the step fails, naming
+/// both commits, and publishes nothing, since a crate version is immutable.
+#[test]
+fn the_crates_step_refuses_a_version_published_from_another_commit() {
+    let other = "0123456789abcdef0123456789abcdef01234567";
+    let fixture = Fixture::workspace();
+    let head = fixture.head();
+    let out = run_crates_step(
+        &fixture,
+        &[published("libplasmoid-updater", VERSION, Some(other))],
+        &[],
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        published_packages(&fixture).is_empty(),
+        "nothing publishes past a mismatched version: {:?}",
+        published_packages(&fixture)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(other) && stderr.contains(&head),
+        "the error names both commits:\n{stderr}"
+    );
+    let error = format!(
+        "::error::libplasmoid-updater {VERSION} is already on crates.io but was packed from {other}, not from this tag's {head}; crates.io versions are immutable, so this tag cannot publish it: bump to a new version (delete the GitHub release and the tag, then release the next version)"
+    );
+    assert!(
+        stderr.lines().any(|line| line == error),
+        "the one remedy is a new version:\n{stderr}"
+    );
+    assert_eq!(
+        stderr,
+        format!("{error}\n"),
+        "the error is the step's whole stderr: no second line may offer a do-over"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("::error::"),
+        "{}",
+        text(&out)
+    );
+}
+
+/// A published `.crate` whose commit cannot be read proves nothing: the step
+/// tries the publish, and crates.io's duplicate refusal fails it loudly.
+#[test]
+fn the_crates_step_never_skips_a_version_whose_commit_it_cannot_read() {
+    let fixture = Fixture::workspace();
+    let out = run_crates_step(
+        &fixture,
+        &[published("libplasmoid-updater", VERSION, None)],
+        &[],
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(published_packages(&fixture), ["libplasmoid-updater"]);
+}
+
+#[test]
+fn the_crates_step_stops_when_the_library_publish_fails() {
+    let fixture = Fixture::workspace();
+    let out = run_crates_step(
+        &fixture,
+        &[],
+        &[env("FAKE_PUBLISH_FAIL", "libplasmoid-updater")],
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        published_packages(&fixture),
+        ["libplasmoid-updater"],
+        "the binary never publishes against a library version crates.io lacks"
+    );
+}
+
+#[test]
+fn the_crates_job_publishes_through_trusted_publishing_after_the_build() {
+    let yaml = release_yaml();
+    let job = job_lines(&yaml, CRATES_JOB);
+    assert_eq!(
+        job_key(&job, "needs").as_deref(),
+        Some("[validate, build, publish]"),
+        "crates.io gets a version only once its GitHub release holds the assets"
+    );
+    for net in [
+        "CARGO_NET_RETRY: \"10\"",
+        "CARGO_HTTP_MULTIPLEXING: \"false\"",
+    ] {
+        assert!(
+            job.iter().any(|line| line.trim() == net),
+            "the publish verify build downloads dependencies the way ci.yml does: {net}"
+        );
+    }
+    assert_eq!(
+        job_key(&job, "if").as_deref(),
+        Some("startsWith(github.ref, 'refs/tags/')"),
+        "a failed validate or build leg publishes nothing"
+    );
+    assert!(
+        job.iter()
+            .any(|line| line.trim() == "id-token: write"
+                || line.trim().starts_with("id-token: write ")),
+        "trusted publishing exchanges the job's OIDC token"
+    );
+    let auth = job
+        .iter()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("- uses: rust-lang/crates-io-auth-action@")
+        })
+        .expect("the job takes its token from rust-lang/crates-io-auth-action");
+    let sha = auth.split_whitespace().next().unwrap();
+    assert!(
+        sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "the auth action is pinned by commit sha, got {auth:?}"
+    );
+    assert!(
+        !job.iter().any(|line| line.contains("secrets.")),
+        "no long-lived registry token: the job reads no repository secret"
+    );
+    let granted: Vec<&str> = job
+        .iter()
+        .skip_while(|line| line.trim() != "permissions:")
+        .skip(1)
+        .take_while(|line| line.starts_with("      "))
+        .map(|line| line.split('#').next().unwrap().trim())
+        .collect();
+    assert_eq!(
+        granted,
+        ["contents: read", "id-token: write"],
+        "the job holds no permission beyond reading the tree and its OIDC token"
+    );
+    let auth_at = job
+        .iter()
+        .position(|line| line.contains("rust-lang/crates-io-auth-action@"))
+        .unwrap();
+    assert_eq!(
+        job[auth_at + 1].trim(),
+        "id: auth",
+        "the publish step reads the token by this step id"
+    );
+    let step = step_script(&yaml, CRATES_STEP);
+    let step_at = job
+        .iter()
+        .position(|line| line.trim() == format!("- name: {CRATES_STEP}"))
+        .unwrap();
+    assert!(
+        job[step_at..]
+            .iter()
+            .take_while(|line| !line.trim_start().starts_with("run:"))
+            .any(|line| line.trim() == "CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}"),
+        "the publish step takes its token from the auth step:\n{step}"
+    );
+    let concurrency_at = job
+        .iter()
+        .position(|line| line.trim() == "concurrency:")
+        .expect("the job sets a concurrency group");
+    let concurrency: Vec<&str> = job[concurrency_at + 1..]
+        .iter()
+        .take_while(|line| line.starts_with("      "))
+        .map(|line| line.trim())
+        .collect();
+    assert_eq!(
+        concurrency,
+        [
+            "group: crates-${{ github.ref }}",
+            "cancel-in-progress: false"
+        ],
+        "two runs for one tag publish one after the other, neither cancelled mid-upload"
     );
 }
 

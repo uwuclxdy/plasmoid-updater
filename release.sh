@@ -9,11 +9,10 @@ ORIG_ARGS=("$@")
 # Cargo.lock, roll the changelog's Unreleased section to the new version,
 # commit, push, tag, and create the GitHub release right after the tag push
 # with the full changelog in the body (--notes FILE, required), so the notes
-# ride GitHub's release email. .github/workflows/release.yml only builds the
-# binary and uploads it to that release; it never creates the release or
-# writes notes.
-#
-# crates.io publishing is out of scope for this script.
+# ride GitHub's release email. .github/workflows/release.yml builds the binary
+# and uploads it to that release, and publishes both crates to crates.io on
+# the same tag; it never creates the release or writes notes, and this script
+# never publishes to crates.io.
 
 # The crate whose public API is a contract (topgrade depends on it); the binary
 # has no library API to keep compatible. The shared semver-guard script holds
@@ -21,6 +20,8 @@ ORIG_ARGS=("$@")
 # CI use), the release-type helpers and the check invocation.
 # shellcheck source=scripts/semver-guard.sh
 source "$(dirname "${BASH_SOURCE[0]}")/scripts/semver-guard.sh"
+# the crates.io copy check release.yml's validate and crates jobs share
+crates_io_copy="$(dirname "${BASH_SOURCE[0]}")/scripts/crates-io-copy.sh"
 
 RETRY=0
 WORKSPACE=0
@@ -145,10 +146,14 @@ command -v cargo-semver-checks >/dev/null 2>&1 || {
 require_semver_toolchain || exit 1
 
 # Refuse to (re)release over an existing github release on a clean run: a clean
-# re-run would collide on gh release create. --retry resumes a partial run; a
-# do-over deletes the old release and tag first.
+# re-run would collide on gh release create. Once the tag is out, --retry (the
+# same commit) and the next version are the only ways forward. Redoing this
+# version from another commit could race the first tag's workflow, which may
+# still be on its way to cargo publish: crates.io would get the version from
+# the first commit while the tag and the binaries sit at the second. A release
+# that broke before publishing uses up its version.
 if [ "$RETRY" -ne 1 ] && gh release view "v${VERSION}" >/dev/null 2>&1; then
-  echo "Error: github release v${VERSION} already exists; delete it and the tag, or rerun with --retry to resume"
+  echo "Error: github release v${VERSION} already exists; rerun with --retry to resume, or release the next version" >&2
   exit 1
 fi
 
@@ -552,6 +557,7 @@ else
   echo "Release plan: ${CRATE_LABEL:-$(basename "$PWD")} v${CUR_VERSION:-?} -> v${VERSION}"
 fi
 echo "  - check ${SEMVER_PACKAGE}'s API against its previous release tag (an API change needs the bump that announces it)"
+echo "  - check crates.io holds no ${VERSION} from another commit, stopping if it cannot tell"
 if [ "$WORKSPACE" -eq 1 ]; then
   echo "  - bump ${#MEMBERS[@]} member crate(s) + [workspace.package] + dep pins: ${MEMBER_NAMES[*]}"
 else
@@ -625,6 +631,32 @@ elif [ "$semver_status" -ne 0 ]; then
   print_rerun_command
   exit 1
 fi
+
+# crates.io versions are immutable, so refuse before any mutation a version
+# crates.io already holds packed from another commit: the bump, commit and tag
+# push would ship a GitHub release whose binaries never match crates.io's vX,
+# and nothing could fix that in place. absent/same proceed; unknown refuses
+# like an API check that could not complete, since a version the check cannot
+# see might be another commit's and the tag and the release cannot be taken
+# back once out. --retry stays a resume: the copy is judged against HEAD,
+# whatever mode is running.
+for crate in libplasmoid-updater plasmoid-updater; do
+  copy_answer="$(bash "$crates_io_copy" "$crate" "$VERSION")"
+  echo "crates.io's ${crate} ${VERSION}: ${copy_answer}"
+  case "$copy_answer" in
+    "other "*)
+      # no re-run line: it would only repeat the refused version
+      echo "Error: ${crate} ${VERSION} is already on crates.io but was packed from ${copy_answer#other }, not from this tree's $(git rev-parse HEAD); crates.io versions are immutable, so v${VERSION} can never be released from this tree: bump to a new version; the release did not start" >&2
+      exit 1
+      ;;
+    absent | same) ;;
+    *)
+      echo "Error: cannot tell whether crates.io's ${crate} ${VERSION} came from this tree (${copy_answer#unknown }); the release did not start" >&2
+      print_rerun_command
+      exit 1
+      ;;
+  esac
+done
 
 if [ "$RETRY" -eq 1 ] && [ "$CUR_VERSION" = "$VERSION" ]; then
   echo "Skipping Cargo.toml bump (already at ${VERSION})"

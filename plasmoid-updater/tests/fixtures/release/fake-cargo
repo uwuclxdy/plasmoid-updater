@@ -3,6 +3,12 @@
 # build), and `semver-checks` resolves the tool the way cargo resolves any
 # subcommand, through PATH. A leading `+toolchain` is recorded, one line per
 # semver-checks call (empty when none was given), in $FAKE_CARGO_LOG.
+#
+# The registry side stands in for crates.io: $FAKE_CRATES_ON_REGISTRY holds
+# the space-separated `name@version`s already published. `publish` records its
+# argv and whether CARGO_REGISTRY_TOKEN was set, one line per call, in
+# $FAKE_PUBLISH_LOG, and fails like crates.io for a package whose workspace
+# version is already listed there, or one named in $FAKE_PUBLISH_FAIL.
 set -euo pipefail
 toolchain=""
 case "${1:-}" in
@@ -17,6 +23,36 @@ case "${1:-}" in
     shift
     printf '%s\n' "$toolchain" >>"${FAKE_CARGO_LOG:-/dev/null}"
     exec cargo-semver-checks "$@"
+    ;;
+  publish)
+    printf '%s token=%s\n' "$*" "${CARGO_REGISTRY_TOKEN:+set}" >>"${FAKE_PUBLISH_LOG:-/dev/null}"
+    shift
+    package=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -p | --package) package="${2:-}"; shift 2 ;;
+        --package=*) package="${1#--package=}"; shift ;;
+        *) shift ;;
+      esac
+    done
+    if [ -z "$package" ]; then
+      echo "fake cargo: publish without -p/--package" >&2
+      exit 1
+    fi
+    for failing in ${FAKE_PUBLISH_FAIL:-}; do
+      if [ "$failing" = "$package" ]; then
+        echo "error: failed to publish $package to registry at https://crates.io" >&2
+        exit 101
+      fi
+    done
+    version="$(sed -nE '/^\[workspace\.package\]/,/^\[/{ s/^version = "(.*)"/\1/p; }' Cargo.toml | head -n1)"
+    for published in ${FAKE_CRATES_ON_REGISTRY:-}; do
+      if [ "$published" = "$package@$version" ]; then
+        echo "error: crate $published already exists on crates.io index" >&2
+        exit 101
+      fi
+    done
+    exit 0
     ;;
 esac
 echo "fake cargo: unhandled invocation: $*" >&2

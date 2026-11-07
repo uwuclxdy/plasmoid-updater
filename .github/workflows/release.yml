@@ -4,12 +4,13 @@
 #
 # The GitHub release is NOT created here — the repo's release.sh creates it
 # right after the tag push with the full changelog already in the body, so the
-# notes ride along in GitHub's release email. This workflow only builds the
-# binary and uploads it (plus sums) to that release. One upload point (the
-# publish job), so no concurrent release-create can duplicate the release and
-# orphan the notes. If the release does not exist when publish runs (the script
-# never ran for this tag), the publish job fails rather than minting a
-# notes-less release.
+# notes ride along in GitHub's release email. This workflow builds the binary
+# and uploads it (plus sums) to that release, and the crates job publishes the
+# library, then the binary, to crates.io through trusted publishing, so no
+# crates.io token is stored in the repo. One upload point (the publish job), so
+# no concurrent release-create can duplicate the release and orphan the notes.
+# If the release does not exist when publish runs (the script never ran for
+# this tag), the publish job fails rather than minting a notes-less release.
 #
 # The build matrix runs the one target on its NATIVE runner (linux → ubuntu).
 # Linux-only binary today: add rows (macos / windows / musl) to extend the
@@ -54,6 +55,29 @@ jobs:
           # the guard below only runs git ls-remote against the public repo, so
           # the token need not sit in .git/config while code is compiled
           persist-credentials: false
+      - name: Refuse a version crates.io holds from another commit
+        # crates.io versions are immutable: a tag re-pushed at another commit
+        # after its crates went up would build and upload binaries that never
+        # match crates.io's copy, so refuse it before any build or upload.
+        # Only `other` fails; absent/same/unknown pass and are logged: a CDN
+        # blip must not block a tag release.sh already cleared, and the crates
+        # job asks again, where crates.io refuses a real duplicate.
+        # scripts/crates-io-copy.sh is the one check release.sh and the crates
+        # job share.
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          commit="$(git rev-parse HEAD)"
+          for crate in libplasmoid-updater plasmoid-updater; do
+            answer="$(bash scripts/crates-io-copy.sh "$crate" "$ver")"
+            echo "crates.io's ${crate} ${ver}: ${answer}"
+            case "$answer" in
+              "other "*)
+                echo "::error::${crate} ${ver} is already on crates.io but was packed from ${answer#other }, not from this tag's ${commit}; crates.io versions are immutable, so this tag can never publish it: bump to a new version (delete the GitHub release, if release.sh made one, and the tag, then release the next version)" >&2
+                exit 1
+                ;;
+            esac
+          done
       # The toolchain builds the rustdoc JSON the tool reads, and the tool
       # reads only the formats of the toolchains it was released against, so
       # the two pins move together (ci.yml's semver job carries the same pair,
@@ -71,7 +95,8 @@ jobs:
         # baseline, the release type and the check all come from
         # scripts/semver-guard.sh, the one implementation release.sh shares:
         # the baseline is the newest origin v* tag below this one that the tag's
-        # commit contains (never crates.io, which nothing publishes to yet), and
+        # commit contains (never crates.io, which gets a version only after its
+        # tag, so a failed crates job leaves it behind origin), and
         # the release type follows from that baseline version to the tag's.
         run: |
           set -euo pipefail
@@ -162,7 +187,89 @@ jobs:
         run: |
           cd artifacts
           if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "::error::release ${GITHUB_REF_NAME} does not exist; if release.sh's create step failed, run from the repo root: echo y | ./release.sh --retry --workspace --notes CHANGELOG_FILE ${GITHUB_REF_NAME#v}, then re-run this job so the assets attach: gh run rerun ${GITHUB_RUN_ID} --failed — if the tag was hand-pushed, delete it and rerun release.sh"
+            echo "::error::release ${GITHUB_REF_NAME} does not exist; if release.sh's create step failed, run from the repo root: echo y | ./release.sh --retry --workspace --notes CHANGELOG_FILE ${GITHUB_REF_NAME#v}, then re-run this job so the assets attach: gh run rerun ${GITHUB_RUN_ID} --failed — if the tag was hand-pushed, release the next version with release.sh"
             exit 1
           fi
           gh release upload "${GITHUB_REF_NAME}" plasmoid-updater-* sha256sums.txt --clobber --repo "${GITHUB_REPOSITORY}"
+
+  crates:
+    name: Publish to crates.io
+    needs: [validate, build, publish]
+    permissions:
+      contents: read
+      id-token: write      # GitHub OIDC — crates.io trusted publishing, no stored token
+    # Same registry-download workaround as ci.yml: curl's HTTP/2 multiplexing
+    # against the crates.io CDN intermittently dies with "[16] Error in the
+    # HTTP2 framing layer" on the hosted runners, and the extra retries cover
+    # the remaining transient blips. The publish verify build downloads the
+    # whole dependency tree from that CDN.
+    env:
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+    # No always(): unlike an asset, a published crate version cannot be
+    # replaced, so this job runs only when validate, every build leg and the
+    # release upload all succeeded (a failed needed job skips it).
+    if: startsWith(github.ref, 'refs/tags/')
+    # A second run for the same tag waits instead of racing the first to
+    # crates.io's duplicate refusal, then skips what the first published from
+    # the same commit. A tag deleted and re-pushed at another commit while the
+    # first run was still on its way passes validate (crates.io had nothing
+    # yet), so the publish step's `other` arm is the last stop for a version
+    # another commit published. GitHub keeps only one pending run per group:
+    # a third arrival cancels the second while it still waits, so the queue
+    # never holds more than one.
+    concurrency:
+      group: crates-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # cargo publish packages the tree and needs no git credential
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # The trusted publisher registered on crates.io for this repo and
+      # release.yml is what lets the job's OIDC token buy a registry token.
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      - name: Publish the crates to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        # The binary depends on the library by version, so the library goes
+        # first, and -e keeps the binary back when the library fails.
+        #
+        # A version crates.io already has is skipped only when its published
+        # .crate proves it was packed from this tag's commit: the version
+        # number alone cannot tell a deleted-and-re-pushed tag from the
+        # original, so scripts/crates-io-copy.sh (the one check release.sh and
+        # validate share) compares the .crate's .cargo_vcs_info.json git.sha1
+        # with this checkout's HEAD. A .crate packed from another commit fails
+        # the job: crates.io versions are immutable, so this tag can never
+        # publish it. Validate refuses it only when the other commit's crates
+        # were up before validate ran; a tag deleted and re-pushed while the
+        # first run was still publishing gets past validate, so this arm is
+        # the last stop. A missing .crate (an HTTP 403 or 404, the normal
+        # not-yet-published case) or an answer the script cannot read falls
+        # through to cargo publish, whose duplicate refusal decides loudly.
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          commit="$(git rev-parse HEAD)"
+          for crate in libplasmoid-updater plasmoid-updater; do
+            answer="$(bash scripts/crates-io-copy.sh "$crate" "$ver")"
+            case "$answer" in
+              same)
+                echo "${crate} ${ver} is already on crates.io from this commit (${commit}), skipping"
+                ;;
+              "other "*)
+                echo "::error::${crate} ${ver} is already on crates.io but was packed from ${answer#other }, not from this tag's ${commit}; crates.io versions are immutable, so this tag cannot publish it: bump to a new version (delete the GitHub release and the tag, then release the next version)" >&2
+                exit 1
+                ;;
+              *)
+                if [[ "$answer" == unknown* ]]; then
+                  echo "${crate} ${ver}: ${answer}; the publish's duplicate refusal decides"
+                fi
+                cargo publish --locked -p "$crate"
+                ;;
+            esac
+          done

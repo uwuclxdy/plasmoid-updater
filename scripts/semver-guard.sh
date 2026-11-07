@@ -7,8 +7,9 @@ set -euo pipefail
 # computation and the check invocation have one implementation and cannot drift
 # apart.
 #
-# The baseline is read from origin, never from crates.io (nothing publishes
-# there yet): the newest `vX.Y.Z` tag on origin whose commit is an ancestor of
+# The baseline is read from origin, never from crates.io (release.yml publishes
+# a version only after its tag, so a failed publish leaves crates.io behind
+# origin): the newest `vX.Y.Z` tag on origin whose commit is an ancestor of
 # HEAD and whose version is below the requested one (or at it, for a report on
 # a manifest that is not bumped yet).
 #
