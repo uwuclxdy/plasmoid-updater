@@ -318,8 +318,8 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
 /// takes the run lock and repairs what a killed run left stranded, so an
 /// interrupted install is recovered even when this run has nothing to install.
 /// When another run already holds the lock, an empty selection returns an
-/// empty result and leaves the repair to that run; a non-empty selection still
-/// fails. Like [`update`], this never prompts and never restarts plasmashell.
+/// empty result without repairing; a non-empty selection still fails. Like
+/// [`update`], this never prompts and never restarts plasmashell.
 ///
 /// A selected update whose [`download_url`](AvailableUpdate::download_url) is
 /// empty is a [`FailureKind::NoMatchingDownload`] row: it is refused before any
@@ -347,7 +347,7 @@ pub fn install(
         Err(Error::AlreadyRunning) if updates.is_empty() => {
             log::info!(
                 target: "lock",
-                "another run holds the update lock; it owns the interrupted-install repair"
+                "another run holds the update lock; this run skips the interrupted-install repair"
             );
             return Ok(UpdateResult::default());
         }
@@ -449,6 +449,49 @@ impl UpdateResult {
 /// Returns [`Error::Io`] if the filesystem scan fails.
 pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
     checker::find_installed(config.system)
+}
+
+/// Returns whether a killed earlier run left anything in the component
+/// directories that [`install`]'s repair settles: any hidden `-new`/`-old`
+/// sibling it finds — a component stranded in `-old`, both copies of an
+/// interrupted swap, a dead copy beside a live component, or a lone `-new`
+/// copy of an install killed mid-copy.
+///
+/// It scans the directories [`install`]'s repair scans, user-local ones or,
+/// under [`Config::system`], system-wide ones, and reads the disk only: it
+/// never prompts and needs no privilege. A caller that elevates for a
+/// system-wide run asks it before the first [`install`], since only that
+/// repair can need privilege when the selection is empty. Download
+/// directories a killed run left in the temp dir do not count: removing them
+/// needs no privilege.
+///
+/// While another run holds the update lock, an empty [`install`] returns
+/// without repairing, so a held lock answers `false`.
+///
+/// # Errors
+///
+/// The environment errors [`install`] fails on before its repair:
+/// - [`Error::UnsupportedOs`] — not running on Linux
+/// - [`Error::NotKde`] — KDE Plasma not detected and
+///   [`Config::skip_plasma_detection`] is unset
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn main() -> Result<(), libplasmoid_updater::Error> {
+/// use libplasmoid_updater::{Config, install, needs_repair};
+///
+/// let config = Config::new().with_system(true);
+/// if needs_repair(&config)? {
+///     // elevate here, before the repair needs it
+/// }
+/// install(&[], &config, &())?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn needs_repair(config: &Config) -> Result<bool> {
+    crate::utils::validate_environment(config.skip_plasma_detection)?;
+    Ok(!installer::run_lock_held() && installer::has_interrupted_installs(config.system))
 }
 
 /// Restarts the plasmashell service via systemd. The core never calls this;

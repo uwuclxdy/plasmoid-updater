@@ -399,6 +399,15 @@ fn sibling_component_names(dir: &Path) -> BTreeSet<String> {
     names
 }
 
+/// Returns whether [`recover_interrupted_installs`] would find a hidden sibling
+/// to settle. It walks the same directories and names the repair walks, so the
+/// two cannot disagree, and it only reads.
+pub(crate) fn has_interrupted_installs(system: bool) -> bool {
+    recover_dirs(system)
+        .iter()
+        .any(|dir| !sibling_component_names(dir).is_empty())
+}
+
 fn recover_in_dir(dir: &Path) {
     for component in sibling_component_names(dir) {
         let dest = dir.join(component);

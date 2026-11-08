@@ -30,8 +30,8 @@ pub(crate) use backup::{BackupLedger, prune_backups};
 pub(crate) use download::remove_stale_temp_dirs;
 pub(crate) use inhibit::InhibitGuard;
 pub(crate) use install::{
-    MAX_METADATA_BYTES, is_installer_sibling, is_regular_file, metadata_size_ok,
-    recover_interrupted_installs, stranded_components,
+    MAX_METADATA_BYTES, has_interrupted_installs, is_installer_sibling, is_regular_file,
+    metadata_size_ok, recover_interrupted_installs, stranded_components,
 };
 pub(crate) use lock::{UpdateLock, run_lock_held};
 pub(crate) use plasmashell::{requires_restart, restart_plasmashell};

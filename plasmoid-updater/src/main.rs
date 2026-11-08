@@ -477,8 +477,6 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
         ));
     }
 
-    authenticate_system(config.inner.system)?;
-
     let restart = if args.restart_plasma {
         RestartDecision::Always
     } else if args.no_restart_plasma {
@@ -494,7 +492,7 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
     // stranded tree as an interrupted install, and `install` would only repair
     // it after that check already reported the component. The named path needs
     // the repair first too, since it resolves its name against what is on disk.
-    lib::install(&[], &update_config, &())?;
+    install_authenticated(&[], &update_config, &())?;
 
     if let Some(ref name) = args.component {
         return do_update_single(name, update_config, restart, quiet, args.json);
@@ -533,8 +531,11 @@ fn do_update(config: &CliConfig, args: UpdateArgs, quiet: bool) -> Result<ExitCo
 
     // `install` runs even for an empty selection: it takes the lock and
     // repairs what a killed run left stranded, which is what a check's
-    // "run update to restore" tells the user to do.
-    let mut result = lib::install(&installable, &update_config, reporter.as_dyn())?;
+    // "run update to restore" tells the user to do. Authenticating only now,
+    // after the check's line and the selection prompt have settled, keeps the
+    // password prompt off both, and off a run with nothing to install or
+    // repair.
+    let mut result = install_authenticated(&installable, &update_config, reporter.as_dyn())?;
     result.skipped.extend(skipped);
     result.failed.extend(check_result.unavailable);
 
@@ -771,7 +772,7 @@ fn do_update_single(
     // Every component's update row installs together, the way an unnamed run
     // installs its selection.
     if !updates.is_empty() {
-        let mut result = lib::install(&updates, &config, reporter.as_dyn())?;
+        let mut result = install_authenticated(&updates, &config, reporter.as_dyn())?;
         result.skipped.extend(skipped);
         result.failed.extend(failed);
         return finish_update(result, restart, check_failed, json);
@@ -1088,15 +1089,50 @@ fn is_root_user() -> bool {
     nix::unistd::Uid::effective().is_root()
 }
 
-/// Authenticates a system-wide run up front, so the installs do not stop on a
-/// password prompt. Only a run that writes under `--system` gets here; `check`,
-/// `list-installed` and `update --dry-run` read and never authenticate.
-fn authenticate_system(system_wide: bool) -> Result<(), Stop> {
-    if system_wide && !is_root_user() {
-        validate_sudo()
-    } else {
-        Ok(())
+/// Authenticates a system-wide run with privileged work to do — `updates` to
+/// install, or a killed run's leftovers for the repair to settle — then runs
+/// the install: the library's own sudo calls find the cached credential
+/// instead of stopping on a password prompt. `check`, `list-installed` and
+/// `update --dry-run` never get here.
+///
+/// `needs_repair` probes the run lock, so a live run's swap does not count as
+/// work, but another run can take or drop the lock between that probe and
+/// `install`'s own: one that takes it makes `install` decline the work after
+/// the `sudo -v` bought nothing, and one that exits after the probe leaves a
+/// repair behind with no cached credential, so the library's own `sudo`
+/// prompts on a TTY or fails.
+fn install_authenticated(
+    updates: &[lib::AvailableUpdate],
+    config: &lib::Config,
+    reporter: &dyn lib::Reporter,
+) -> Result<lib::UpdateResult, Stop> {
+    let needed = password_needed(config.system, is_root_user(), !updates.is_empty(), || {
+        lib::needs_repair(config)
+    })?;
+    if needed {
+        validate_sudo()?;
     }
+    lib::install(updates, config, reporter).map_err(Stop::from)
+}
+
+/// Whether the `install` that follows needs a password: a system-wide run,
+/// not root, with updates to install or a killed run's leftovers for the
+/// repair to settle. The repair scan runs only when its answer can change the
+/// outcome: a run with updates asks without it, and a user-directory run or
+/// root never asks at all.
+fn password_needed(
+    system: bool,
+    root: bool,
+    has_updates: bool,
+    repair_pending: impl FnOnce() -> Result<bool, lib::Error>,
+) -> Result<bool, lib::Error> {
+    if !system || root {
+        return Ok(false);
+    }
+    if has_updates {
+        return Ok(true);
+    }
+    repair_pending()
 }
 
 fn validate_sudo() -> Result<(), Stop> {
@@ -1150,6 +1186,115 @@ fn spawn_error(command: &'static str, e: &std::io::Error) -> Stop {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    /// Every input of the password decision, with the repair scan asked only
+    /// when its answer can change the outcome.
+    #[test]
+    fn a_password_is_asked_only_for_privileged_work() {
+        let never = || -> Result<bool, crate::lib::Error> {
+            panic!("the repair scan ran although its answer cannot change the outcome")
+        };
+        // (system, root, has_updates, repair_pending, expected)
+        let decided = [
+            (false, false, true, "the run writes only user dirs"),
+            (true, true, true, "root needs no password"),
+        ];
+        for (system, root, has_updates, case) in decided {
+            assert!(
+                !super::password_needed(system, root, has_updates, never).unwrap(),
+                "{case}"
+            );
+        }
+        assert!(
+            super::password_needed(true, false, true, never).unwrap(),
+            "a system update with something to install asks"
+        );
+        assert!(
+            super::password_needed(true, false, false, || Ok(true)).unwrap(),
+            "a system run with a killed run's leftovers to repair asks"
+        );
+        assert!(
+            !super::password_needed(true, false, false, || Ok(false)).unwrap(),
+            "a system run with nothing to install or repair never asks"
+        );
+        let failed = super::password_needed(true, false, false, || {
+            Err(crate::lib::Error::Config("scan failed".into()))
+        });
+        assert!(
+            matches!(failed, Err(crate::lib::Error::Config(ref m)) if m == "scan failed"),
+            "a failed repair scan stops the run: {failed:?}"
+        );
+    }
+
+    /// Library installs called in lines of code; a comment line is skipped.
+    fn library_installs(source: &str) -> usize {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| line.matches(concat!("lib::", "install(")).count())
+            .sum()
+    }
+
+    /// The password decision runs before every library install only when one
+    /// function holds the bin's only call: a second call site could skip it,
+    /// and the host-dependent `--system` tests that reach the call sites skip
+    /// on a machine without system components.
+    #[test]
+    fn every_library_install_passes_the_password_decision() {
+        assert_eq!(
+            library_installs(concat!("let a = lib::", "install(&[]);")),
+            1
+        );
+        assert_eq!(library_installs(concat!("// lib::", "install(&[])")), 0);
+        assert_eq!(library_installs(include_str!("main.rs")), 1);
+    }
+
+    /// Whether the function holding the library install decides the password
+    /// first, then authenticates whenever the decision says so, then installs.
+    /// A narrowing folded into the `let needed = …` expression itself is not
+    /// seen.
+    fn authenticates_before_installing(source: &str) -> bool {
+        let Some(start) = source.find(concat!("fn install_", "authenticated(")) else {
+            return false;
+        };
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let at = |needle: &str| body.find(needle);
+        match (
+            at(concat!("let needed = password_", "needed(")),
+            at(concat!("if needed {\n        validate_", "sudo()?;\n    }")),
+            at(concat!("lib::", "install(")),
+        ) {
+            (Some(decide), Some(authenticate), Some(install)) => {
+                decide < authenticate && authenticate < install
+            }
+            _ => false,
+        }
+    }
+
+    /// The host-dependent `--system` tests that run `sudo -v` skip on a machine
+    /// without system components, so the order is pinned in the source too.
+    #[test]
+    fn the_library_install_follows_the_sudo_check() {
+        let shaped = |inner: &str| format!("fn install_{}(\n{inner}\n}}\n", "authenticated");
+        let decide = concat!("let needed = password_", "needed(");
+        let authenticate = concat!("if needed {\n        validate_", "sudo()?;\n    }");
+        let install = concat!("lib::", "install(u)");
+        assert!(authenticates_before_installing(&shaped(&format!(
+            "{decide}) {authenticate} {install}"
+        ))));
+        assert!(!authenticates_before_installing(&shaped(&format!(
+            "{decide}) {install}"
+        ))));
+        assert!(!authenticates_before_installing(&shaped(&format!(
+            "{decide}) {install} {authenticate}"
+        ))));
+        assert!(!authenticates_before_installing(&shaped(&format!(
+            "{decide}) if needed && false {{\n        validate_{}()?;\n    }} {install}",
+            "sudo"
+        ))));
+        assert!(authenticates_before_installing(include_str!("main.rs")));
+    }
 
     // Assembled from parts so the scan does not match its own source.
     const STDIO_MACROS: [&str; 4] = [

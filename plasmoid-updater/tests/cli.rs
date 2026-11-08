@@ -704,8 +704,10 @@ fn system_list_installed_does_not_authenticate() {
     assert_eq!(run.code, 0, "{run}");
 }
 
+/// The fake color scheme is a user component, so under `--system` its name
+/// matches nothing: the run has nothing to install and asks for no password.
 #[test]
-fn system_update_of_a_named_component_authenticates() {
+fn a_system_update_naming_no_system_component_never_authenticates() {
     let (sandbox, store) = pending_update();
     let (run, calls) = run_with_fake_sudo(
         &sandbox,
@@ -717,27 +719,66 @@ fn system_update_of_a_named_component_authenticates() {
             common::SCHEME_FILE,
         ],
     );
-    assert_eq!(
-        calls,
-        ["-v"],
-        "a named system update did not authenticate: {run}"
+    assert_eq!(run.code, 2, "{run}");
+    assert!(
+        calls.is_empty(),
+        "a named system update with nothing to install ran sudo {calls:?}: {run}"
     );
-    assert_ne!(run.code, 0, "{run}");
+    common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
+}
+
+/// A confirmed `--system` update whose check offers nothing to install asks
+/// for no password: the store serves only a user component, and no killed run
+/// left anything to repair.
+#[test]
+fn a_system_update_with_nothing_to_install_never_authenticates() {
+    let (sandbox, store) = pending_update();
+    let (run, calls) = run_with_fake_sudo(
+        &sandbox,
+        store.url(),
+        &["--system", "--skip-plasma-detection", "update", "-y"],
+    );
+    assert!(
+        calls.is_empty(),
+        "a system update with nothing to install ran sudo {calls:?}: {run}"
+    );
+    assert_ne!(run.code, 3, "{run}");
+    assert!(!run.stderr.contains("sudo"), "{run}");
     common::assert_content(&sandbox.scheme_path(), OLD_CONTENT);
 }
 
 /// A `sudo` that cannot be spawned is named as the missing tool, not as a
-/// configuration problem, and ends the run like any other missing tool.
+/// configuration problem, and ends the run like any other missing tool. Only a
+/// run with something to install authenticates, so the store offers an update
+/// for the named host component. Naming it and `-q` keep the check's progress
+/// and the other host components' check warnings off stderr.
 #[test]
 fn a_missing_sudo_exits_3_naming_the_missing_tool() {
+    // An effective root user installs without authenticating, into the host's
+    // real system directories.
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!("skipped: an effective root user installs without authenticating");
+        return;
+    }
     let sandbox = Sandbox::new();
+    let Some((store, name)) = common::store_updating_a_host_system_component(&sandbox, bin())
+    else {
+        return;
+    };
     let empty_bin = sandbox.tmp_dir().join("empty-bin");
     std::fs::create_dir_all(&empty_bin).unwrap();
     let output = sandbox
         .command(bin())
         .env("PATH", &empty_bin)
-        .env(API_URL_VAR, common::dead_store_url())
-        .args(["--system", "--skip-plasma-detection", "update", "-y"])
+        .env(API_URL_VAR, store.url())
+        .args([
+            "-q",
+            "--system",
+            "--skip-plasma-detection",
+            "update",
+            "-y",
+            name,
+        ])
         .stdin(Stdio::null())
         .output()
         .unwrap();

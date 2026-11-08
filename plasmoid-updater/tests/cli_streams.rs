@@ -975,12 +975,16 @@ fn the_system_pre_flight_runs_sudo_from_path() {
         return;
     }
 
+    // Only a run with something to install authenticates.
     let sandbox = Sandbox::new();
+    let Some((store, _)) = common::store_updating_a_host_system_component(&sandbox, bin()) else {
+        return;
+    };
     let log = sandbox.config_dir().join("sudo.log");
     let sudo = logging_sudo(&sandbox, &log, 1);
     let run = run_with_sudo(
         &sandbox,
-        &common::dead_store_url(),
+        store.url(),
         &sudo,
         &["--skip-plasma-detection", "--system", "update", "-y"],
     );

@@ -458,6 +458,102 @@ pub fn dead_store_url() -> String {
     "http://127.0.0.1:0/ocs/v1".to_string()
 }
 
+/// A store offering a newer version of a real system-wide component this host
+/// has installed, so a `--system` run of `bin` in `sandbox` has something to
+/// install, and that component's name, which names no other component. A
+/// sandboxed system root cannot stand in: system component paths are fixed
+/// under `/usr/share`.
+///
+/// Which candidates the store can answer for depends on how the product
+/// resolves each one, so a check against a candidate's entry decides: the
+/// first one the check reports an update for is returned.
+///
+/// `None`, with the reason on stderr, on a host with no such system component:
+/// no system KWin effect, script, switcher or wallpaper plugin under a name no
+/// other one shares, or none of them it can offer an update for.
+pub fn store_updating_a_host_system_component(
+    sandbox: &Sandbox,
+    bin: &str,
+) -> Option<(FakeStore, &'static str)> {
+    let output = sandbox
+        .command(bin)
+        .env("PLASMOID_UPDATER_API_URL", dead_store_url())
+        .args([
+            "--system",
+            "--skip-plasma-detection",
+            "list-installed",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let components = listed["components"].as_array().unwrap();
+    let name_count = |name: &str| {
+        components
+            .iter()
+            .filter(|component| component["name"] == name || component["directory_name"] == name)
+            .count()
+    };
+    let candidates: Vec<(&'static str, u16)> = components
+        .iter()
+        .filter_map(|component| {
+            let type_id = match component["component_type"].as_str()? {
+                "kwin_effect" => 719,
+                "kwin_script" => 720,
+                "kwin_switcher" => 721,
+                "wallpaper_plugin" => 715,
+                _ => return None,
+            };
+            let name = component["name"].as_str()?;
+            if name_count(name) != 1 {
+                return None;
+            }
+            let name: &'static str = name.to_string().leak();
+            Some((name, type_id))
+        })
+        .collect();
+    if candidates.is_empty() {
+        eprintln!(
+            "skipped: the host lists no system KWin effect, script, switcher or wallpaper \
+             plugin under a unique name to offer an update for"
+        );
+        return None;
+    }
+    for (name, type_id) in candidates {
+        let store = FakeStore::start(Listing {
+            extras: vec![ExtraEntry {
+                id: 999_100,
+                name,
+                type_id,
+                version: "999.0",
+                files: &[("package/metadata.json", "{}")],
+            }],
+            ..Listing::default()
+        });
+        let output = sandbox
+            .command(bin)
+            .env("PLASMOID_UPDATER_API_URL", store.url())
+            .args(["--system", "--skip-plasma-detection", "check", "--json"])
+            .output()
+            .unwrap();
+        let checked: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let updated = checked["available_updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|update| update["installed"]["name"] == name);
+        if updated {
+            return Some((store, name));
+        }
+    }
+    eprintln!(
+        "skipped: no system KWin effect, script, switcher or wallpaper plugin this host \
+         lists resolves to the store entry an update for it needs"
+    );
+    None
+}
+
 /// One extra entry the fake store answers with, its XML and archive prepared.
 struct ServedExtra {
     id: u64,
@@ -621,10 +717,18 @@ fn extra_entry_xml(host: &str, entry: &ExtraEntry) -> String {
          <downloadlink1>{host}/dl/extra-{id}.tar.gz</downloadlink1>\
          <download_version1>{version}</download_version1></content>",
         id = entry.id,
-        name = entry.name,
+        name = xml_text(entry.name),
         version = entry.version,
         type_id = entry.type_id,
     )
+}
+
+/// `text` escaped for an XML text node, so a component's display name taken
+/// from the host cannot make the served catalog page malformed.
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// A `.tar.gz` holding `files`, each at its relative path, built with the
