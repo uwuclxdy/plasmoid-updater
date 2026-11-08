@@ -36,6 +36,7 @@ Plasma Widgets, Wallpaper Plugins, KWin Effects/Scripts/Switchers, Global Themes
 | `check(&Config, &dyn Reporter) -> Result<CheckResult>` | scan for available updates to installed KDE components |
 | `update(&Config, &dyn Reporter) -> Result<UpdateResult>` | install every non-excluded available update |
 | `install(&[AvailableUpdate], &Config, &dyn Reporter) -> Result<UpdateResult>` | install a caller-chosen selection exactly as given (exclusions apply in `check` and `update`; an empty selection takes the run lock and repairs what a killed run left stranded, or returns an empty result when another run already holds the lock) |
+| `needs_repair(&Config) -> Result<bool>` | whether a killed run left a stranded component or a dead `-new`/`-old` copy for `install` to put back or clean up; reads the disk only, so a caller elevating a `--system` run asks it before an empty `install`; while another run holds the update lock it answers `false`, since an empty `install` then returns without repairing |
 | `restart_plasmashell() -> Result<()>` | restart plasmashell via systemd; the caller decides when |
 | `get_installed(&Config) -> Result<Vec<InstalledComponent>>` | return all installed KDE components; no network calls |
 
