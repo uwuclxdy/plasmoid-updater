@@ -1,7 +1,7 @@
 {
   "repository": "uwuclxdy/plasmoid-updater",
   "ref": "refs/heads/main",
-  "commit": "3ec732854a143859ddbf1e446330c6776dce697f",
+  "commit": "b5dc7f9699cc18aa2c831c4f3d13d6f808c905c1",
   "base_ref": "refs/heads/main",
   "coverage": {
     "type": "loc",
@@ -17568,22 +17568,22 @@
             "type": "loc",
             "start_line": 24,
             "end_line": 24,
-            "count": 1614,
-            "count_u64": 1614
+            "count": 1650,
+            "count_u64": 1650
           },
           {
             "type": "loc",
             "start_line": 25,
             "end_line": 25,
-            "count": 1614,
-            "count_u64": 1614
+            "count": 1650,
+            "count_u64": 1650
           },
           {
             "type": "loc",
             "start_line": 26,
             "end_line": 26,
-            "count": 1614,
-            "count_u64": 1614
+            "count": 1650,
+            "count_u64": 1650
           },
           {
             "type": "loc",
@@ -19201,99 +19201,99 @@
             "type": "loc",
             "start_line": 105,
             "end_line": 105,
-            "count": 201,
-            "count_u64": 201
+            "count": 217,
+            "count_u64": 217
           },
           {
             "type": "loc",
             "start_line": 106,
             "end_line": 106,
-            "count": 201,
-            "count_u64": 201
+            "count": 217,
+            "count_u64": 217
           },
           {
             "type": "loc",
             "start_line": 107,
             "end_line": 107,
-            "count": 201,
-            "count_u64": 201
+            "count": 217,
+            "count_u64": 217
           },
           {
             "type": "loc",
             "start_line": 108,
             "end_line": 108,
-            "count": 201,
-            "count_u64": 201
+            "count": 217,
+            "count_u64": 217
           },
           {
             "type": "loc",
             "start_line": 109,
             "end_line": 109,
-            "count": 201,
-            "count_u64": 201
+            "count": 217,
+            "count_u64": 217
           },
           {
             "type": "loc",
             "start_line": 110,
             "end_line": 110,
-            "count": 201,
-            "count_u64": 201
+            "count": 217,
+            "count_u64": 217
           },
           {
             "type": "loc",
             "start_line": 111,
             "end_line": 111,
-            "count": 201,
-            "count_u64": 201
+            "count": 217,
+            "count_u64": 217
           },
           {
             "type": "loc",
             "start_line": 113,
             "end_line": 113,
-            "count": 314,
-            "count_u64": 314
+            "count": 334,
+            "count_u64": 334
           },
           {
             "type": "loc",
             "start_line": 114,
             "end_line": 114,
-            "count": 314,
-            "count_u64": 314
+            "count": 334,
+            "count_u64": 334
           },
           {
             "type": "loc",
             "start_line": 115,
             "end_line": 115,
-            "count": 314,
-            "count_u64": 314
+            "count": 334,
+            "count_u64": 334
           },
           {
             "type": "loc",
             "start_line": 116,
             "end_line": 116,
-            "count": 314,
-            "count_u64": 314
+            "count": 334,
+            "count_u64": 334
           },
           {
             "type": "loc",
             "start_line": 117,
             "end_line": 117,
-            "count": 314,
-            "count_u64": 314
+            "count": 334,
+            "count_u64": 334
           },
           {
             "type": "loc",
             "start_line": 118,
             "end_line": 118,
-            "count": 314,
-            "count_u64": 314
+            "count": 334,
+            "count_u64": 334
           },
           {
             "type": "loc",
             "start_line": 119,
             "end_line": 119,
-            "count": 314,
-            "count_u64": 314
+            "count": 334,
+            "count_u64": 334
           },
           {
             "type": "loc",
@@ -19348,22 +19348,22 @@
             "type": "loc",
             "start_line": 129,
             "end_line": 129,
-            "count": 511,
-            "count_u64": 511
+            "count": 547,
+            "count_u64": 547
           },
           {
             "type": "loc",
             "start_line": 130,
             "end_line": 130,
-            "count": 511,
-            "count_u64": 511
+            "count": 547,
+            "count_u64": 547
           },
           {
             "type": "loc",
             "start_line": 131,
             "end_line": 131,
-            "count": 511,
-            "count_u64": 511
+            "count": 547,
+            "count_u64": 547
           },
           {
             "type": "loc",
@@ -20188,8 +20188,8 @@
             "type": "loc",
             "start_line": 286,
             "end_line": 286,
-            "count": 41,
-            "count_u64": 41
+            "count": 43,
+            "count_u64": 43
           },
           {
             "type": "loc",
@@ -20433,64 +20433,64 @@
             "type": "loc",
             "start_line": 333,
             "end_line": 333,
-            "count": 91,
-            "count_u64": 91
+            "count": 93,
+            "count_u64": 93
           },
           {
             "type": "loc",
             "start_line": 334,
             "end_line": 334,
-            "count": 15,
-            "count_u64": 15
+            "count": 13,
+            "count_u64": 13
           },
           {
             "type": "loc",
             "start_line": 335,
             "end_line": 335,
-            "count": 15,
-            "count_u64": 15
+            "count": 13,
+            "count_u64": 13
           },
           {
             "type": "loc",
             "start_line": 336,
             "end_line": 336,
-            "count": 15,
-            "count_u64": 15
+            "count": 13,
+            "count_u64": 13
           },
           {
             "type": "loc",
             "start_line": 337,
             "end_line": 337,
-            "count": 15,
-            "count_u64": 15
+            "count": 13,
+            "count_u64": 13
           },
           {
             "type": "loc",
             "start_line": 338,
             "end_line": 338,
-            "count": 15,
-            "count_u64": 15
+            "count": 13,
+            "count_u64": 13
           },
           {
             "type": "loc",
             "start_line": 339,
             "end_line": 339,
-            "count": 15,
-            "count_u64": 15
+            "count": 13,
+            "count_u64": 13
           },
           {
             "type": "loc",
             "start_line": 340,
             "end_line": 340,
-            "count": 15,
-            "count_u64": 15
+            "count": 13,
+            "count_u64": 13
           },
           {
             "type": "loc",
             "start_line": 341,
             "end_line": 341,
-            "count": 15,
-            "count_u64": 15
+            "count": 13,
+            "count_u64": 13
           },
           {
             "type": "loc",
@@ -20545,43 +20545,43 @@
             "type": "loc",
             "start_line": 360,
             "end_line": 360,
-            "count": 44,
-            "count_u64": 44
+            "count": 46,
+            "count_u64": 46
           },
           {
             "type": "loc",
             "start_line": 366,
             "end_line": 366,
-            "count": 45,
-            "count_u64": 45
+            "count": 49,
+            "count_u64": 49
           },
           {
             "type": "loc",
             "start_line": 367,
             "end_line": 367,
-            "count": 45,
-            "count_u64": 45
+            "count": 49,
+            "count_u64": 49
           },
           {
             "type": "loc",
             "start_line": 368,
             "end_line": 368,
-            "count": 45,
-            "count_u64": 45
+            "count": 49,
+            "count_u64": 49
           },
           {
             "type": "loc",
             "start_line": 369,
             "end_line": 369,
-            "count": 44,
-            "count_u64": 44
+            "count": 46,
+            "count_u64": 46
           },
           {
             "type": "loc",
             "start_line": 370,
             "end_line": 370,
-            "count": 35,
-            "count_u64": 35
+            "count": 33,
+            "count_u64": 33
           },
           {
             "type": "loc",
@@ -20650,22 +20650,22 @@
             "type": "loc",
             "start_line": 380,
             "end_line": 380,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 381,
             "end_line": 381,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 382,
             "end_line": 382,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
@@ -20769,15 +20769,15 @@
             "type": "loc",
             "start_line": 397,
             "end_line": 397,
-            "count": 44,
-            "count_u64": 44
+            "count": 48,
+            "count_u64": 48
           },
           {
             "type": "loc",
             "start_line": 398,
             "end_line": 398,
-            "count": 44,
-            "count_u64": 44
+            "count": 48,
+            "count_u64": 48
           },
           {
             "type": "loc",
@@ -20832,57 +20832,57 @@
             "type": "loc",
             "start_line": 412,
             "end_line": 412,
-            "count": 87,
-            "count_u64": 87
+            "count": 91,
+            "count_u64": 91
           },
           {
             "type": "loc",
             "start_line": 413,
             "end_line": 413,
-            "count": 87,
-            "count_u64": 87
+            "count": 91,
+            "count_u64": 91
           },
           {
             "type": "loc",
             "start_line": 414,
             "end_line": 414,
-            "count": 87,
-            "count_u64": 87
+            "count": 91,
+            "count_u64": 91
           },
           {
             "type": "loc",
             "start_line": 415,
             "end_line": 415,
-            "count": 87,
-            "count_u64": 87
+            "count": 91,
+            "count_u64": 91
           },
           {
             "type": "loc",
             "start_line": 416,
             "end_line": 416,
-            "count": 420,
-            "count_u64": 420
+            "count": 456,
+            "count_u64": 456
           },
           {
             "type": "loc",
             "start_line": 417,
             "end_line": 417,
-            "count": 420,
-            "count_u64": 420
+            "count": 456,
+            "count_u64": 456
           },
           {
             "type": "loc",
             "start_line": 418,
             "end_line": 418,
-            "count": 420,
-            "count_u64": 420
+            "count": 456,
+            "count_u64": 456
           },
           {
             "type": "loc",
             "start_line": 419,
             "end_line": 419,
-            "count": 76,
-            "count_u64": 76
+            "count": 80,
+            "count_u64": 80
           },
           {
             "type": "loc",
@@ -21070,22 +21070,22 @@
             "type": "loc",
             "start_line": 451,
             "end_line": 451,
-            "count": 87,
-            "count_u64": 87
+            "count": 91,
+            "count_u64": 91
           },
           {
             "type": "loc",
             "start_line": 453,
             "end_line": 453,
-            "count": 522,
-            "count_u64": 522
+            "count": 558,
+            "count_u64": 558
           },
           {
             "type": "loc",
             "start_line": 454,
             "end_line": 454,
-            "count": 522,
-            "count_u64": 522
+            "count": 558,
+            "count_u64": 558
           },
           {
             "type": "loc",
@@ -21098,15 +21098,15 @@
             "type": "loc",
             "start_line": 456,
             "end_line": 456,
-            "count": 347,
-            "count_u64": 347
+            "count": 383,
+            "count_u64": 383
           },
           {
             "type": "loc",
             "start_line": 457,
             "end_line": 457,
-            "count": 347,
-            "count_u64": 347
+            "count": 383,
+            "count_u64": 383
           },
           {
             "type": "loc",
@@ -21119,22 +21119,22 @@
             "type": "loc",
             "start_line": 459,
             "end_line": 459,
-            "count": 207,
-            "count_u64": 207
+            "count": 227,
+            "count_u64": 227
           },
           {
             "type": "loc",
             "start_line": 460,
             "end_line": 460,
-            "count": 132,
-            "count_u64": 132
+            "count": 148,
+            "count_u64": 148
           },
           {
             "type": "loc",
             "start_line": 462,
             "end_line": 462,
-            "count": 522,
-            "count_u64": 522
+            "count": 558,
+            "count_u64": 558
           },
           {
             "type": "loc",
@@ -21644,43 +21644,43 @@
             "type": "loc",
             "start_line": 579,
             "end_line": 579,
-            "count": 44,
-            "count_u64": 44
+            "count": 48,
+            "count_u64": 48
           },
           {
             "type": "loc",
             "start_line": 580,
             "end_line": 580,
-            "count": 44,
-            "count_u64": 44
+            "count": 48,
+            "count_u64": 48
           },
           {
             "type": "loc",
             "start_line": 581,
             "end_line": 581,
-            "count": 44,
-            "count_u64": 44
+            "count": 48,
+            "count_u64": 48
           },
           {
             "type": "loc",
             "start_line": 582,
             "end_line": 582,
-            "count": 44,
-            "count_u64": 44
+            "count": 48,
+            "count_u64": 48
           },
           {
             "type": "loc",
             "start_line": 583,
             "end_line": 583,
-            "count": 44,
-            "count_u64": 44
+            "count": 48,
+            "count_u64": 48
           },
           {
             "type": "loc",
             "start_line": 584,
             "end_line": 584,
-            "count": 44,
-            "count_u64": 44
+            "count": 48,
+            "count_u64": 48
           },
           {
             "type": "loc",
@@ -21784,15 +21784,15 @@
             "type": "loc",
             "start_line": 614,
             "end_line": 614,
-            "count": 47,
-            "count_u64": 47
+            "count": 49,
+            "count_u64": 49
           },
           {
             "type": "loc",
             "start_line": 615,
             "end_line": 615,
-            "count": 47,
-            "count_u64": 47
+            "count": 49,
+            "count_u64": 49
           },
           {
             "type": "loc",
@@ -22001,120 +22001,120 @@
             "type": "loc",
             "start_line": 656,
             "end_line": 656,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 657,
             "end_line": 657,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 658,
             "end_line": 658,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 659,
             "end_line": 659,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 660,
             "end_line": 660,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 662,
             "end_line": 662,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 663,
             "end_line": 663,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 664,
             "end_line": 664,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 665,
             "end_line": 665,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 666,
             "end_line": 666,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 667,
             "end_line": 667,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 668,
             "end_line": 668,
-            "count": 17,
-            "count_u64": 17
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
             "start_line": 669,
             "end_line": 669,
-            "count": 17,
-            "count_u64": 17
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
             "start_line": 670,
             "end_line": 670,
-            "count": 17,
-            "count_u64": 17
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
             "start_line": 671,
             "end_line": 671,
-            "count": 17,
-            "count_u64": 17
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
             "start_line": 672,
             "end_line": 672,
-            "count": 17,
-            "count_u64": 17
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
             "start_line": 673,
             "end_line": 673,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
@@ -22162,50 +22162,50 @@
             "type": "loc",
             "start_line": 680,
             "end_line": 680,
-            "count": 17,
-            "count_u64": 17
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
             "start_line": 681,
             "end_line": 681,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 682,
             "end_line": 682,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 683,
             "end_line": 683,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 684,
             "end_line": 684,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 685,
             "end_line": 685,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 686,
             "end_line": 686,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
@@ -22239,50 +22239,50 @@
             "type": "loc",
             "start_line": 694,
             "end_line": 694,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 695,
             "end_line": 695,
-            "count": 18,
-            "count_u64": 18
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 697,
             "end_line": 697,
-            "count": 36,
-            "count_u64": 36
+            "count": 44,
+            "count_u64": 44
           },
           {
             "type": "loc",
             "start_line": 698,
             "end_line": 698,
-            "count": 36,
-            "count_u64": 36
+            "count": 44,
+            "count_u64": 44
           },
           {
             "type": "loc",
             "start_line": 699,
             "end_line": 699,
-            "count": 36,
-            "count_u64": 36
+            "count": 44,
+            "count_u64": 44
           },
           {
             "type": "loc",
             "start_line": 700,
             "end_line": 700,
-            "count": 36,
-            "count_u64": 36
+            "count": 44,
+            "count_u64": 44
           },
           {
             "type": "loc",
             "start_line": 701,
             "end_line": 701,
-            "count": 36,
-            "count_u64": 36
+            "count": 44,
+            "count_u64": 44
           },
           {
             "type": "loc",
@@ -22309,15 +22309,15 @@
             "type": "loc",
             "start_line": 705,
             "end_line": 705,
-            "count": 36,
-            "count_u64": 36
+            "count": 44,
+            "count_u64": 44
           },
           {
             "type": "loc",
             "start_line": 706,
             "end_line": 706,
-            "count": 36,
-            "count_u64": 36
+            "count": 44,
+            "count_u64": 44
           },
           {
             "type": "loc",
@@ -22330,8 +22330,8 @@
             "type": "loc",
             "start_line": 710,
             "end_line": 710,
-            "count": 36,
-            "count_u64": 36
+            "count": 44,
+            "count_u64": 44
           },
           {
             "type": "loc",
@@ -25841,15 +25841,15 @@
             "type": "loc",
             "start_line": 81,
             "end_line": 81,
-            "count": 504,
-            "count_u64": 504
+            "count": 524,
+            "count_u64": 524
           },
           {
             "type": "loc",
             "start_line": 83,
             "end_line": 83,
-            "count": 504,
-            "count_u64": 504
+            "count": 524,
+            "count_u64": 524
           },
           {
             "type": "loc",
@@ -25883,36 +25883,36 @@
             "type": "loc",
             "start_line": 90,
             "end_line": 90,
-            "count": 504,
-            "count_u64": 504
+            "count": 524,
+            "count_u64": 524
           },
           {
             "type": "loc",
             "start_line": 92,
             "end_line": 92,
-            "count": 504,
-            "count_u64": 504
+            "count": 524,
+            "count_u64": 524
           },
           {
             "type": "loc",
             "start_line": 93,
             "end_line": 93,
-            "count": 504,
-            "count_u64": 504
+            "count": 524,
+            "count_u64": 524
           },
           {
             "type": "loc",
             "start_line": 94,
             "end_line": 94,
-            "count": 74,
-            "count_u64": 74
+            "count": 82,
+            "count_u64": 82
           },
           {
             "type": "loc",
             "start_line": 95,
             "end_line": 95,
-            "count": 309,
-            "count_u64": 309
+            "count": 313,
+            "count_u64": 313
           },
           {
             "type": "loc",
@@ -25925,8 +25925,8 @@
             "type": "loc",
             "start_line": 97,
             "end_line": 97,
-            "count": 66,
-            "count_u64": 66
+            "count": 74,
+            "count_u64": 74
           },
           {
             "type": "loc",
@@ -25953,8 +25953,8 @@
             "type": "loc",
             "start_line": 102,
             "end_line": 102,
-            "count": 504,
-            "count_u64": 504
+            "count": 524,
+            "count_u64": 524
           },
           {
             "type": "loc",
@@ -25974,29 +25974,29 @@
             "type": "loc",
             "start_line": 107,
             "end_line": 107,
-            "count": 496,
-            "count_u64": 496
+            "count": 516,
+            "count_u64": 516
           },
           {
             "type": "loc",
             "start_line": 109,
             "end_line": 109,
-            "count": 504,
-            "count_u64": 504
+            "count": 524,
+            "count_u64": 524
           },
           {
             "type": "loc",
             "start_line": 112,
             "end_line": 112,
-            "count": 309,
-            "count_u64": 309
+            "count": 329,
+            "count_u64": 329
           },
           {
             "type": "loc",
             "start_line": 113,
             "end_line": 113,
-            "count": 309,
-            "count_u64": 309
+            "count": 329,
+            "count_u64": 329
           },
           {
             "type": "loc",
@@ -26009,15 +26009,15 @@
             "type": "loc",
             "start_line": 115,
             "end_line": 115,
-            "count": 307,
-            "count_u64": 307
+            "count": 327,
+            "count_u64": 327
           },
           {
             "type": "loc",
             "start_line": 117,
             "end_line": 117,
-            "count": 309,
-            "count_u64": 309
+            "count": 329,
+            "count_u64": 329
           },
           {
             "type": "loc",
@@ -27849,22 +27849,22 @@
             "type": "loc",
             "start_line": 115,
             "end_line": 115,
-            "count": 117,
-            "count_u64": 117
+            "count": 102,
+            "count_u64": 102
           },
           {
             "type": "loc",
             "start_line": 116,
             "end_line": 116,
-            "count": 117,
-            "count_u64": 117
+            "count": 102,
+            "count_u64": 102
           },
           {
             "type": "loc",
             "start_line": 117,
             "end_line": 117,
-            "count": 117,
-            "count_u64": 117
+            "count": 102,
+            "count_u64": 102
           },
           {
             "type": "loc",
@@ -31265,29 +31265,29 @@
             "type": "loc",
             "start_line": 896,
             "end_line": 896,
-            "count": 37,
-            "count_u64": 37
+            "count": 22,
+            "count_u64": 22
           },
           {
             "type": "loc",
             "start_line": 897,
             "end_line": 897,
-            "count": 36,
-            "count_u64": 36
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
             "start_line": 898,
             "end_line": 898,
-            "count": 36,
-            "count_u64": 36
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
             "start_line": 901,
             "end_line": 901,
-            "count": 36,
-            "count_u64": 36
+            "count": 21,
+            "count_u64": 21
           },
           {
             "type": "loc",
@@ -38519,8 +38519,8 @@
             "type": "loc",
             "start_line": 201,
             "end_line": 201,
-            "count": 273,
-            "count_u64": 273
+            "count": 274,
+            "count_u64": 274
           },
           {
             "type": "loc",
@@ -38540,8 +38540,8 @@
             "type": "loc",
             "start_line": 205,
             "end_line": 205,
-            "count": 273,
-            "count_u64": 273
+            "count": 274,
+            "count_u64": 274
           },
           {
             "type": "loc",
@@ -38554,50 +38554,50 @@
             "type": "loc",
             "start_line": 207,
             "end_line": 207,
-            "count": 202,
-            "count_u64": 202
+            "count": 203,
+            "count_u64": 203
           },
           {
             "type": "loc",
             "start_line": 209,
             "end_line": 209,
-            "count": 202,
-            "count_u64": 202
+            "count": 203,
+            "count_u64": 203
           },
           {
             "type": "loc",
             "start_line": 210,
             "end_line": 210,
-            "count": 202,
-            "count_u64": 202
+            "count": 203,
+            "count_u64": 203
           },
           {
             "type": "loc",
             "start_line": 211,
             "end_line": 211,
-            "count": 202,
-            "count_u64": 202
+            "count": 203,
+            "count_u64": 203
           },
           {
             "type": "loc",
             "start_line": 212,
             "end_line": 212,
-            "count": 202,
-            "count_u64": 202
+            "count": 203,
+            "count_u64": 203
           },
           {
             "type": "loc",
             "start_line": 214,
             "end_line": 214,
-            "count": 202,
-            "count_u64": 202
+            "count": 203,
+            "count_u64": 203
           },
           {
             "type": "loc",
             "start_line": 215,
             "end_line": 215,
-            "count": 202,
-            "count_u64": 202
+            "count": 203,
+            "count_u64": 203
           },
           {
             "type": "loc",
@@ -38638,50 +38638,50 @@
             "type": "loc",
             "start_line": 221,
             "end_line": 221,
-            "count": 201,
-            "count_u64": 201
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 222,
             "end_line": 222,
-            "count": 201,
-            "count_u64": 201
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 223,
             "end_line": 223,
-            "count": 201,
-            "count_u64": 201
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 224,
             "end_line": 224,
-            "count": 201,
-            "count_u64": 201
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 225,
             "end_line": 225,
-            "count": 201,
-            "count_u64": 201
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 226,
             "end_line": 226,
-            "count": 201,
-            "count_u64": 201
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 227,
             "end_line": 227,
-            "count": 201,
-            "count_u64": 201
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
@@ -84752,8 +84752,8 @@
             "type": "loc",
             "start_line": 122,
             "end_line": 122,
-            "count": 314,
-            "count_u64": 314
+            "count": 315,
+            "count_u64": 315
           }
         ]
       },
@@ -101096,7 +101096,7 @@
   },
   "code_to_test_ratio": {
     "code": 17842,
-    "test": 9218,
+    "test": 10005,
     "code_files": [
       {
         "code": 354,
@@ -101521,13 +101521,14 @@
         "language": "Rust"
       },
       {
-        "code": 2796,
-        "comment": 113,
-        "blank": 187,
+        "code": 3583,
+        "comment": 149,
+        "blank": 220,
         "path": "plasmoid-updater/tests/release_script.rs",
         "language": "Rust"
       }
     ]
   },
-  "timestamp": "2026-11-04T17:38:25.595203396Z"
+  "test_execution_time": 60000000000,
+  "timestamp": "2026-11-08T00:16:32.64112085Z"
 }
