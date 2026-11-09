@@ -7,7 +7,7 @@ Updates KDE Plasma 6 components from KDE Store using a combination of Apdatifier
 
 ## Requirements
 
-- bsdtar and kpackagetool6, for `update` and `install` only (`check` needs neither); `systemctl` too, for the optional plasmashell restart
+- bsdtar and kpackagetool6, for `update` and `install` only (`check` needs neither); `systemctl` and `busctl` too, for the optional plasmashell restart
 - `sh` and `stty`, for the interactive selection menu (`sh` also runs `$EDITOR` for `--edit-config`)
 - [Rust](https://rust-lang.org/tools/install/)
 
@@ -92,6 +92,8 @@ Running `plasmoid-updater` without a subcommand prints its help and exits 0. On 
 With `--system`, only a real `update` authenticates through `sudo -v`; `check`, `list-installed` and `update --dry-run` never ask for a password.
 
 By default a run restarts nothing. After updates to widgets, plasma styles, global themes, splash screens or KWin switchers, `--restart-plasma` restarts plasmashell, `prompt_restart = true` in the config asks first (on a terminal only; on a non-interactive stdin the prompt is skipped with a warning naming `--restart-plasma`), and `--no-restart-plasma` skips it. The two flags conflict at parse time (exit 2).
+
+Restarting plasmashell restarts the systemd user service that currently runs it and waits up to 10 seconds for a new plasmashell to take over, reporting an error if none does; with no plasmashell running it starts `plasma-plasmashell.service`. It refuses to restart anything when plasmashell runs in a scope, in another program's service, or in no systemd user unit, or when the user's systemd manager is not on the bus.
 
 Components that fail to update don't stop the run: the run ends with a one-line summary on stdout naming the non-zero counts (`updated 1 · failed 1 · skipped 2`, with a zero count left out), and it exits 1 when any component failed or could not be checked. An install whose post-install version cannot be verified counts as a failure too, so it exits 1 as well.
 

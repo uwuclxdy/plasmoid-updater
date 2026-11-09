@@ -10,7 +10,7 @@ A Rust library for updating KDE Plasma 6 components from the KDE Store.
 Runtime dependencies:
 - `bsdtar` – Archive extraction, for `update` and `install` only (`check` needs no extractor)
 - `kpackagetool6` – KDE package installation
-- `systemctl` – plasmashell restart, when a restart is requested
+- `systemctl` and `busctl` – plasmashell restart, when a restart is requested
 - `sudo` – only for `--system` operations
 - `sh` and `stty` – for `cli::select` (the `cli` feature), while its prompt is open
 
@@ -37,7 +37,7 @@ Plasma Widgets, Wallpaper Plugins, KWin Effects/Scripts/Switchers, Global Themes
 | `update(&Config, &dyn Reporter) -> Result<UpdateResult>` | install every non-excluded available update |
 | `install(&[AvailableUpdate], &Config, &dyn Reporter) -> Result<UpdateResult>` | install a caller-chosen selection exactly as given (exclusions apply in `check` and `update`; an empty selection takes the run lock and repairs what a killed run left stranded, or returns an empty result when another run already holds the lock) |
 | `needs_repair(&Config) -> Result<bool>` | whether a killed run left a stranded component or a dead `-new`/`-old` copy for `install` to put back or clean up; reads the disk only, so a caller elevating a `--system` run asks it before an empty `install`; while another run holds the update lock it answers `false`, since an empty `install` then returns without repairing |
-| `restart_plasmashell() -> Result<()>` | restart plasmashell via systemd; the caller decides when |
+| `restart_plasmashell() -> Result<()>` | restart the systemd user service that runs plasmashell (with none running, start `plasma-plasmashell.service`), then wait for a new plasmashell; fails when that service cannot be identified or no new plasmashell appears; the caller decides when |
 | `get_installed(&Config) -> Result<Vec<InstalledComponent>>` | return all installed KDE components; no network calls |
 
 ### Reporter
@@ -46,7 +46,7 @@ Progress leaves the core only through a `Reporter` hook that does nothing by def
 
 ### Errors
 
-Two levels: `Error` means the run could not start or finish (unsupported OS, no Plasma, already running, missing tool, network, rate limit, API status, parse, io with path, config); `Error` and its struct-like variants are `#[non_exhaustive]`, so match with a wildcard arm and `..`. A per-component problem is a `Failure` row (fields `component`, `kind`, `message`) inside a successful `UpdateResult`, with `FailureKind` one of `NoMatchingDownload`, `Download`, `Checksum`, `Extract`, `Install`, `RestoreFailed`, `Unverified`, `Registry`. `UpdateResult` holds `succeeded` (verified installs), `failed` and `skipped` (excluded and unresolved names); `needs_restart()` tells whether a plasmashell restart is warranted.
+Two levels: `Error` means the run could not start or finish (unsupported OS, no Plasma, already running, missing tool, an external command that exited nonzero, network, rate limit, API status, parse, io with path, config, a restart that cannot be done safely or does not bring up a new plasmashell); `Error` and its struct-like variants are `#[non_exhaustive]`, so match with a wildcard arm and `..`. A per-component problem is a `Failure` row (fields `component`, `kind`, `message`) inside a successful `UpdateResult`, with `FailureKind` one of `NoMatchingDownload`, `Download`, `Checksum`, `Extract`, `Install`, `RestoreFailed`, `Unverified`, `Registry`. `UpdateResult` holds `succeeded` (verified installs), `failed` and `skipped` (excluded and unresolved names); `needs_restart()` tells whether a plasmashell restart is warranted.
 
 ### Config
 
