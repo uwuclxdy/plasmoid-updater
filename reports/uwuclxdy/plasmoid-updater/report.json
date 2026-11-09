@@ -1,7 +1,7 @@
 {
   "repository": "uwuclxdy/plasmoid-updater",
   "ref": "refs/heads/main",
-  "commit": "f6ec73c8fad934dd085373dfdd605c2c2fab1514",
+  "commit": "1469e8e848c85ce2cd62d419b60d96da4bd2b5e0",
   "base_ref": "refs/heads/main",
   "coverage": {
     "type": "loc",
@@ -27849,22 +27849,22 @@
             "type": "loc",
             "start_line": 115,
             "end_line": 115,
-            "count": 144,
-            "count_u64": 144
+            "count": 175,
+            "count_u64": 175
           },
           {
             "type": "loc",
             "start_line": 116,
             "end_line": 116,
-            "count": 144,
-            "count_u64": 144
+            "count": 175,
+            "count_u64": 175
           },
           {
             "type": "loc",
             "start_line": 117,
             "end_line": 117,
-            "count": 144,
-            "count_u64": 144
+            "count": 175,
+            "count_u64": 175
           },
           {
             "type": "loc",
@@ -29781,8 +29781,8 @@
             "type": "loc",
             "start_line": 584,
             "end_line": 584,
-            "count": 71,
-            "count_u64": 71
+            "count": 70,
+            "count_u64": 70
           },
           {
             "type": "loc",
@@ -31265,29 +31265,29 @@
             "type": "loc",
             "start_line": 896,
             "end_line": 896,
-            "count": 64,
-            "count_u64": 64
+            "count": 95,
+            "count_u64": 95
           },
           {
             "type": "loc",
             "start_line": 897,
             "end_line": 897,
-            "count": 63,
-            "count_u64": 63
+            "count": 94,
+            "count_u64": 94
           },
           {
             "type": "loc",
             "start_line": 898,
             "end_line": 898,
-            "count": 63,
-            "count_u64": 63
+            "count": 94,
+            "count_u64": 94
           },
           {
             "type": "loc",
             "start_line": 901,
             "end_line": 901,
-            "count": 63,
-            "count_u64": 63
+            "count": 94,
+            "count_u64": 94
           },
           {
             "type": "loc",
@@ -38519,8 +38519,8 @@
             "type": "loc",
             "start_line": 201,
             "end_line": 201,
-            "count": 274,
-            "count_u64": 274
+            "count": 273,
+            "count_u64": 273
           },
           {
             "type": "loc",
@@ -38540,8 +38540,8 @@
             "type": "loc",
             "start_line": 205,
             "end_line": 205,
-            "count": 274,
-            "count_u64": 274
+            "count": 273,
+            "count_u64": 273
           },
           {
             "type": "loc",
@@ -38554,50 +38554,50 @@
             "type": "loc",
             "start_line": 207,
             "end_line": 207,
-            "count": 203,
-            "count_u64": 203
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 209,
             "end_line": 209,
-            "count": 203,
-            "count_u64": 203
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 210,
             "end_line": 210,
-            "count": 203,
-            "count_u64": 203
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 211,
             "end_line": 211,
-            "count": 203,
-            "count_u64": 203
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 212,
             "end_line": 212,
-            "count": 203,
-            "count_u64": 203
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 214,
             "end_line": 214,
-            "count": 203,
-            "count_u64": 203
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
             "start_line": 215,
             "end_line": 215,
-            "count": 203,
-            "count_u64": 203
+            "count": 202,
+            "count_u64": 202
           },
           {
             "type": "loc",
@@ -38638,50 +38638,50 @@
             "type": "loc",
             "start_line": 221,
             "end_line": 221,
-            "count": 202,
-            "count_u64": 202
+            "count": 201,
+            "count_u64": 201
           },
           {
             "type": "loc",
             "start_line": 222,
             "end_line": 222,
-            "count": 202,
-            "count_u64": 202
+            "count": 201,
+            "count_u64": 201
           },
           {
             "type": "loc",
             "start_line": 223,
             "end_line": 223,
-            "count": 202,
-            "count_u64": 202
+            "count": 201,
+            "count_u64": 201
           },
           {
             "type": "loc",
             "start_line": 224,
             "end_line": 224,
-            "count": 202,
-            "count_u64": 202
+            "count": 201,
+            "count_u64": 201
           },
           {
             "type": "loc",
             "start_line": 225,
             "end_line": 225,
-            "count": 202,
-            "count_u64": 202
+            "count": 201,
+            "count_u64": 201
           },
           {
             "type": "loc",
             "start_line": 226,
             "end_line": 226,
-            "count": 202,
-            "count_u64": 202
+            "count": 201,
+            "count_u64": 201
           },
           {
             "type": "loc",
             "start_line": 227,
             "end_line": 227,
-            "count": 202,
-            "count_u64": 202
+            "count": 201,
+            "count_u64": 201
           },
           {
             "type": "loc",
@@ -84815,8 +84815,8 @@
             "type": "loc",
             "start_line": 122,
             "end_line": 122,
-            "count": 315,
-            "count_u64": 315
+            "count": 314,
+            "count_u64": 314
           }
         ]
       },
@@ -101782,7 +101782,7 @@
   },
   "code_to_test_ratio": {
     "code": 17960,
-    "test": 10238,
+    "test": 10448,
     "code_files": [
       {
         "code": 354,
@@ -102207,14 +102207,14 @@
         "language": "Rust"
       },
       {
-        "code": 3583,
-        "comment": 149,
-        "blank": 220,
+        "code": 3793,
+        "comment": 162,
+        "blank": 238,
         "path": "plasmoid-updater/tests/release_script.rs",
         "language": "Rust"
       }
     ]
   },
   "test_execution_time": 58000000000,
-  "timestamp": "2026-11-08T03:22:38.803196887Z"
+  "timestamp": "2026-11-09T05:07:49.844205554Z"
 }
