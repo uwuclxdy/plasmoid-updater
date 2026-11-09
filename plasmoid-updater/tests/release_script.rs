@@ -1334,10 +1334,14 @@ fn a_failing_origin_tag_listing_stops_with_one_message() {
     assert_eq!(
         error_lines(&stderr_text(&out)),
         vec![
-            "Error: git ls-remote --tags origin failed; cannot determine the API check's baseline"
+            "Error: git ls-remote --tags origin failed; cannot tell whether v0.2.2 is already tagged, so the release did not start; nothing was pushed"
                 .to_string()
         ],
         "a failing origin listing must stop with exactly one message, never read as no previous tag:\n{log}"
+    );
+    assert!(
+        !stdout_text(&out).contains("Release plan"),
+        "the refusal must come before the plan and its prompt:\n{log}"
     );
     assert!(!fixture.semver_log.exists(), "the tool was invoked:\n{log}");
     assert_eq!(
@@ -1345,6 +1349,42 @@ fn a_failing_origin_tag_listing_stops_with_one_message() {
         before,
         "the refusal mutated state:\n{log}"
     );
+}
+
+#[test]
+fn a_retry_whose_origin_tag_listing_fails_stops_with_its_own_message() {
+    let fixture = Fixture::workspace();
+    let before = fixture.snapshot();
+    let out = fixture.run_with_env(
+        &fixture.path_with_tool,
+        &[
+            "--retry",
+            "--workspace",
+            "--notes",
+            "docs/RELEASE_NOTES.md",
+            VERSION,
+        ],
+        &[
+            env("FAKE_SEMVER_EXIT", "0"),
+            env("FAKE_GIT_FAIL_CMD", "ls-remote"),
+        ],
+    );
+    let log = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{log}");
+    assert_eq!(
+        error_lines(&stderr_text(&out)),
+        vec![
+            "Error: git ls-remote --tags origin failed; cannot tell whether v0.2.2 names HEAD, so --retry did not start; nothing was pushed"
+                .to_string()
+        ],
+        "{log}"
+    );
+    assert!(
+        !stdout_text(&out).contains("Release plan"),
+        "the refusal must come before the plan and its prompt:\n{log}"
+    );
+    assert!(!fixture.semver_log.exists(), "the tool was invoked:\n{log}");
+    assert_eq!(fixture.snapshot(), before, "{log}");
 }
 
 #[test]
@@ -3774,6 +3814,207 @@ fn a_retry_at_the_commit_its_tag_names_still_proceeds() {
         text(&out).contains("Done: released v0.2.2"),
         "{}",
         text(&out)
+    );
+}
+
+/// Runs release.sh with `args` and asserts it refuses with exactly `expected`
+/// as its only stderr line, before the plan and its prompt, with no check run
+/// and nothing changed (tree, refs, config, remote).
+fn assert_refused_before_any_change(fixture: &Fixture, case: &str, args: &[&str], expected: &str) {
+    let before = fixture.snapshot();
+    let out = fixture.run(&fixture.path_with_tool, args, 0);
+    let log = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{case}: {log}");
+    assert_eq!(
+        stderr_text(&out).lines().collect::<Vec<_>>(),
+        vec![expected],
+        "{case}: the refusal must be exactly one line naming why:\n{log}"
+    );
+    assert!(
+        !stdout_text(&out).contains("Release plan"),
+        "{case}: the refusal must come before the plan and its prompt:\n{log}"
+    );
+    assert!(
+        !fixture.semver_log.exists(),
+        "{case}: the check ran:\n{log}"
+    );
+    assert_eq!(fixture.snapshot(), before, "{case}: {log}");
+}
+
+/// The commit `rev` names in the bare remote.
+fn remote_commit(fixture: &Fixture, rev: &str) -> String {
+    fixture
+        .git_stdout(&fixture.remote, &["rev-parse", rev])
+        .trim()
+        .to_string()
+}
+
+fn tag_exists_line(place: &str, commit: &str) -> String {
+    format!(
+        "Error: tag v0.2.2 already exists {place} (commit {commit}) but has no GitHub release; a tag is never reused, so release the next version; the release did not start"
+    )
+}
+
+#[test]
+fn a_plain_run_refuses_a_tag_origin_already_has() {
+    let plain = ["--workspace", "--notes", "docs/RELEASE_NOTES.md", VERSION];
+
+    // pushed from another clone, on a commit this clone never fetched
+    let fixture = Fixture::with_remote_only_tag("v0.2.2");
+    let tagged = remote_commit(&fixture, "v0.2.2^{commit}");
+    assert_ne!(tagged, fixture.head());
+    assert_refused_before_any_change(
+        &fixture,
+        "origin tag on another commit",
+        &plain,
+        &tag_exists_line("on origin", &tagged),
+    );
+
+    // a hand-pushed tag at HEAD, whose version is still the previous one
+    let fixture = Fixture::with_remote_tag_on_known_commit("v0.2.2");
+    let head = fixture.head();
+    assert_eq!(remote_commit(&fixture, "v0.2.2^{commit}"), head);
+    assert_refused_before_any_change(
+        &fixture,
+        "origin tag at HEAD",
+        &plain,
+        &tag_exists_line("on origin", &head),
+    );
+
+    // the same tag fetched into this clone too: origin is the one named
+    fixture.git(&["fetch", "--quiet", "origin", "tag", "v0.2.2"]);
+    assert_refused_before_any_change(
+        &fixture,
+        "tag on origin and in this clone",
+        &plain,
+        &tag_exists_line("on origin", &head),
+    );
+
+    // this clone's own v0.2.2 on another commit than origin's: origin's is named
+    let fixture = Fixture::with_remote_only_tag("v0.2.2");
+    let tagged = remote_commit(&fixture, "v0.2.2^{commit}");
+    fixture.git(&["tag", "v0.2.2", "-m", "local"]);
+    assert_ne!(fixture.rev_parse("v0.2.2^{commit}"), tagged);
+    assert_refused_before_any_change(
+        &fixture,
+        "origin and this clone disagree",
+        &plain,
+        &tag_exists_line("on origin", &tagged),
+    );
+}
+
+#[test]
+fn a_retry_after_a_failed_tag_push_resumes_from_the_local_tag() {
+    let fixture = Fixture::workspace();
+    fs::write(fixture.repo.join("Cargo.toml"), workspace_manifest(VERSION)).unwrap();
+    fs::write(
+        fixture.repo.join("docs/RELEASE_NOTES.md"),
+        "# Release notes\n\n## 0.2.2\n\n- Add a thing (#12)\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "--quiet", "-m", "chore: release v0.2.2"]);
+    fixture.git(&["push", "--quiet", "-u", "origin", "main"]);
+    fixture.git(&["tag", "v0.2.2", "-m", "release v0.2.2"]);
+    let out = fixture.run(
+        &fixture.path_with_tool,
+        &[
+            "--retry",
+            "--workspace",
+            "--notes",
+            "docs/RELEASE_NOTES.md",
+            VERSION,
+        ],
+        0,
+    );
+    let log = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{log}");
+    assert!(log.contains("Skipping local tag (v0.2.2 exists)"), "{log}");
+    assert!(log.contains("Done: released v0.2.2"), "{log}");
+    assert_eq!(fixture.tags(&fixture.remote), "v0.2.1\nv0.2.2", "{log}");
+}
+
+#[test]
+fn a_plain_run_refuses_a_tag_only_this_clone_has() {
+    let plain = ["--workspace", "--notes", "docs/RELEASE_NOTES.md", VERSION];
+
+    // an annotated tag at HEAD: the line names the commit, not the tag object
+    let fixture = Fixture::workspace();
+    fixture.git(&["tag", "v0.2.2", "-m", "stale"]);
+    let head = fixture.head();
+    assert_ne!(
+        fixture.rev_parse("v0.2.2"),
+        head,
+        "the tag must be annotated"
+    );
+    assert_refused_before_any_change(
+        &fixture,
+        "local annotated tag at HEAD",
+        &plain,
+        &tag_exists_line("in this clone", &head),
+    );
+
+    // a lightweight tag on a commit no branch holds
+    let fixture = Fixture::workspace();
+    fixture.git(&["commit", "--quiet", "--allow-empty", "-m", "abandoned"]);
+    let abandoned = fixture.head();
+    fixture.git(&["tag", "v0.2.2"]);
+    fixture.git(&["reset", "--quiet", "--hard", "HEAD~1"]);
+    assert_ne!(fixture.head(), abandoned);
+    assert_refused_before_any_change(
+        &fixture,
+        "local lightweight tag on another commit",
+        &plain,
+        &tag_exists_line("in this clone", &abandoned),
+    );
+
+    // an annotated tag on a tree peels to no commit: it still blocks `git
+    // tag`, so it refuses too, naming the object it peels to, with nothing of
+    // git's own on stderr
+    let fixture = Fixture::workspace();
+    let tree = fixture.rev_parse("HEAD^{tree}");
+    fixture.git(&["tag", "v0.2.2", "-m", "stale", &tree]);
+    assert_refused_before_any_change(
+        &fixture,
+        "local annotated tag on a tree",
+        &plain,
+        &tag_exists_line("in this clone", &tree),
+    );
+}
+
+#[test]
+fn a_retry_refuses_a_tag_at_head_whose_version_was_never_bumped() {
+    let retry = [
+        "--retry",
+        "--workspace",
+        "--notes",
+        "docs/RELEASE_NOTES.md",
+        VERSION,
+    ];
+    let line = |place: &str| {
+        format!(
+            "Error: tag v0.2.2 {place} names HEAD, but HEAD's version is still 0.2.1, so no release run made it; --retry did not start and nothing was pushed: release the next version"
+        )
+    };
+
+    let fixture = Fixture::with_remote_tag_on_known_commit("v0.2.2");
+    assert_refused_before_any_change(&fixture, "origin tag at HEAD", &retry, &line("on origin"));
+
+    fixture.git(&["fetch", "--quiet", "origin", "tag", "v0.2.2"]);
+    assert_refused_before_any_change(
+        &fixture,
+        "tag at HEAD on origin and in this clone",
+        &retry,
+        &line("on origin"),
+    );
+
+    let fixture = Fixture::workspace();
+    fixture.git(&["tag", "v0.2.2", "-m", "stale"]);
+    assert_refused_before_any_change(
+        &fixture,
+        "local tag at HEAD",
+        &retry,
+        &line("in this clone"),
     );
 }
 

@@ -478,23 +478,48 @@ elif [ -n "$CUR_VERSION" ] && ! version_lt "$CUR_VERSION" "$VERSION"; then
   exit 1
 fi
 
+# A v<VERSION> tag no GitHub release owns is never reused. Both the local tag
+# and origin's (one listing, no fetch: a fetch would move refs) are judged by
+# the object they peel to, before the plan and any change: a commit, unless the
+# tag was made by hand on a tree or blob, which still blocks `git tag`.
+# A plain run over such a tag would push its bump commit to main and only then
+# fail on the tag, so it refuses and names the tag; origin's when both exist.
 # --retry resumes a release at the commit its tag names: with HEAD anywhere
-# else, the resume would push that HEAD and report the old tag released. Both
-# the local tag and origin's are judged, before the plan and any change.
+# else, the resume would push that HEAD and report the old tag released. A
+# release run tags only after its bump commit, so a tag at a HEAD whose version
+# is still below VERSION was never made by one and is never a resume: resuming
+# would bump past it and release the unbumped commit under that tag.
+if ! origin_tags="$(origin_release_tags)"; then
+  if [ "$RETRY" -eq 1 ]; then
+    echo "Error: git ls-remote --tags origin failed; cannot tell whether v${VERSION} names HEAD, so --retry did not start; nothing was pushed" >&2
+  else
+    echo "Error: git ls-remote --tags origin failed; cannot tell whether v${VERSION} is already tagged, so the release did not start; nothing was pushed" >&2
+  fi
+  exit 1
+fi
+origin_tag_commit="$(awk -v ver="$VERSION" '$1 == ver { print $2 }' <<<"$origin_tags")"
+local_tag_commit="$(git rev-parse --verify --quiet "refs/tags/v${VERSION}^{}" || true)"
+if [ -n "$origin_tag_commit" ]; then
+  tag_where="on origin" tag_commit="$origin_tag_commit"
+else
+  tag_where="in this clone" tag_commit="$local_tag_commit"
+fi
 if [ "$RETRY" -eq 1 ]; then
   head_commit="$(git rev-parse HEAD)"
-  if ! origin_tags="$(origin_release_tags)"; then
-    echo "Error: git ls-remote --tags origin failed; cannot tell whether v${VERSION} names HEAD, so --retry did not start; nothing was pushed" >&2
-    exit 1
-  fi
-  tagged_commits=$'local\t'"$(git rev-parse --verify --quiet "refs/tags/v${VERSION}^{commit}" || true)"
-  tagged_commits+=$'\norigin\t'"$(awk -v ver="$VERSION" '$1 == ver { print $2 }' <<<"$origin_tags")"
-  while IFS=$'\t' read -r tag_where tag_commit; do
-    if [ -n "$tag_commit" ] && [ "$tag_commit" != "$head_commit" ]; then
-      echo "Error: tag v${VERSION} on ${tag_where} names commit ${tag_commit}, but HEAD is ${head_commit}; --retry did not start and nothing was pushed" >&2
+  tagged_commits=$'local\t'"$local_tag_commit"$'\norigin\t'"$origin_tag_commit"
+  while IFS=$'\t' read -r place commit; do
+    if [ -n "$commit" ] && [ "$commit" != "$head_commit" ]; then
+      echo "Error: tag v${VERSION} on ${place} names commit ${commit}, but HEAD is ${head_commit}; --retry did not start and nothing was pushed" >&2
       exit 1
     fi
   done <<<"$tagged_commits"
+  if [ -n "$tag_commit" ] && [ "$CUR_VERSION" != "$VERSION" ]; then
+    echo "Error: tag v${VERSION} ${tag_where} names HEAD, but HEAD's version is still ${CUR_VERSION}, so no release run made it; --retry did not start and nothing was pushed: release the next version" >&2
+    exit 1
+  fi
+elif [ -n "$tag_commit" ]; then
+  echo "Error: tag v${VERSION} already exists ${tag_where} (commit ${tag_commit}) but has no GitHub release; a tag is never reused, so release the next version; the release did not start" >&2
+  exit 1
 fi
 
 # The release body comes only from the curated section: refuse before any
