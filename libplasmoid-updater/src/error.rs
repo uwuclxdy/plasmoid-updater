@@ -13,9 +13,9 @@ use std::path::PathBuf;
 /// match with a wildcard arm. The struct-like variants that carry fields are
 /// `#[non_exhaustive]` as well, so a field added to one later ships in a minor
 /// release: an outside match names the fields it uses and ends with `..`. The
-/// tuple variants ([`Error::Network`], [`Error::Config`]) stay exhaustive:
-/// their payload never grows, and a new payload shape arrives as a new
-/// variant, which the enum's own `#[non_exhaustive]` already allows.
+/// tuple variants ([`Error::Network`], [`Error::Config`], [`Error::Restart`])
+/// stay exhaustive: their payload never grows, and a new payload shape arrives
+/// as a new variant, which the enum's own `#[non_exhaustive]` already allows.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -42,13 +42,15 @@ pub enum Error {
     },
 
     /// A command the library ran exited nonzero.
-    #[error("{}", command_failure(.command, .status))]
+    #[error("{}", command_error_line(.command, .status, .stderr))]
     #[non_exhaustive]
     Command {
         /// The command that failed (e.g. `systemctl`).
         command: &'static str,
         /// The exit status the command reported.
         status: std::process::ExitStatus,
+        /// What the command printed on stderr, decoded lossily as UTF-8.
+        stderr: String,
     },
 
     /// A network request to the KDE Store or a download server failed.
@@ -92,6 +94,11 @@ pub enum Error {
     /// A configuration or environment problem the caller can fix.
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// plasmashell could not be restarted safely, or no new plasmashell came up
+    /// after the restart.
+    #[error("{0}")]
+    Restart(String),
 }
 
 /// Renders a failed command's exit status the way an error line names it: the
@@ -110,6 +117,25 @@ pub(crate) fn command_failure(command: &str, status: &std::process::ExitStatus) 
     }
 }
 
+/// [`command_failure`], followed by the reason the command printed on stderr
+/// rendered as one line: each line trimmed, blank lines dropped, the rest
+/// joined by one space. A command that printed no reason keeps the bare line.
+fn command_error_line(command: &str, status: &std::process::ExitStatus, stderr: &str) -> String {
+    let failure = command_failure(command, status);
+    let reason = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if reason.is_empty() {
+        failure
+    } else {
+        format!("{failure}: {reason}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt as _;
@@ -122,6 +148,7 @@ mod tests {
         let error = Error::Command {
             command: "systemctl",
             status: ExitStatus::from_raw(1 << 8),
+            stderr: String::new(),
         };
 
         assert_eq!(error.to_string(), "systemctl exited with status 1");
@@ -132,6 +159,7 @@ mod tests {
         let error = Error::Command {
             command: "systemctl",
             status: ExitStatus::from_raw(9),
+            stderr: String::new(),
         };
 
         assert_eq!(
@@ -141,10 +169,57 @@ mod tests {
     }
 
     #[test]
+    fn a_command_error_ends_with_the_reason_the_command_printed() {
+        let error = Error::Command {
+            command: "busctl",
+            status: ExitStatus::from_raw(1 << 8),
+            stderr: "Call failed: Access denied\n".to_owned(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "busctl exited with status 1: Call failed: Access denied"
+        );
+    }
+
+    #[test]
+    fn a_command_error_names_a_signal_death_and_its_reason() {
+        let error = Error::Command {
+            command: "systemctl",
+            status: ExitStatus::from_raw(9),
+            stderr: "Terminated by the watchdog.\n".to_owned(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "systemctl was killed by signal 9 (SIGKILL): Terminated by the watchdog."
+        );
+    }
+
+    #[test]
+    fn a_command_error_with_blank_stderr_keeps_the_bare_status_line() {
+        let error = Error::Command {
+            command: "systemctl",
+            status: ExitStatus::from_raw(1 << 8),
+            stderr: " \n\t\n  ".to_owned(),
+        };
+
+        assert_eq!(error.to_string(), "systemctl exited with status 1");
+    }
+
+    #[test]
+    fn a_restart_error_renders_its_message() {
+        let error = Error::Restart("no new plasmashell came up".to_owned());
+
+        assert_eq!(error.to_string(), "no new plasmashell came up");
+    }
+
+    #[test]
     fn a_command_error_names_a_missing_status() {
         let error = Error::Command {
             command: "systemctl",
             status: ExitStatus::from_raw(0x7f),
+            stderr: String::new(),
         };
 
         assert_eq!(error.to_string(), "systemctl exited without a status code");

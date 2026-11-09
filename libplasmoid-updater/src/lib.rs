@@ -494,15 +494,24 @@ pub fn needs_repair(config: &Config) -> Result<bool> {
     Ok(!installer::run_lock_held() && installer::has_interrupted_installs(config.system))
 }
 
-/// Restarts the plasmashell service via systemd. The core never calls this;
-/// the caller decides when (and whether) to, typically when
-/// [`UpdateResult::needs_restart`] returns `true`.
+/// Restarts the systemd user unit whose main process owns
+/// `org.kde.plasmashell` on the session bus, then waits for a new plasmashell
+/// to take that name. With no plasmashell running it starts
+/// `plasma-plasmashell.service`. The core never calls this; the caller decides
+/// when (and whether) to, typically when [`UpdateResult::needs_restart`]
+/// returns `true`.
 ///
 /// # Errors
 ///
-/// Returns [`Error::MissingTool`] when `systemctl` is not on `PATH`,
-/// [`Error::Config`] naming the command when it cannot be spawned, and
-/// [`Error::Command`] naming `systemctl` and its status when it exits nonzero.
+/// Returns [`Error::Restart`] when plasmashell runs in a unit that is not a
+/// service whose main process it is, when it belongs to no systemd user unit
+/// or no systemd user manager is on the session bus, when the old plasmashell
+/// still owns the bus name after the restart, or when no new plasmashell owns
+/// it within ten seconds of the restart. Returns [`Error::MissingTool`] when
+/// `busctl` or `systemctl` is not on `PATH`, [`Error::Config`] naming the
+/// command when it cannot be spawned, [`Error::Command`] naming the command,
+/// its status and the reason it printed when it exits nonzero, and
+/// [`Error::Parse`] when `busctl` prints output this library cannot parse.
 pub fn restart_plasmashell() -> Result<()> {
     installer::restart_plasmashell()
 }
