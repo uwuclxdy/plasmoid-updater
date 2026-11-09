@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::collections::HashSet;
 use std::process::{Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -24,7 +25,9 @@ fn get_user_id() -> String {
 /// `org.kde.plasmashell` on the session bus, then waits for a new plasmashell
 /// to take that name. With no plasmashell running it starts
 /// `plasma-plasmashell.service`. The core never calls this; the caller decides
-/// when (and whether) to.
+/// when (and whether) to. A tool that succeeds but prints a non-blank line on
+/// stderr has that text logged as a `log` warning (`<tool>: <text>`), joined
+/// into one line, and an identical line logs once per call.
 ///
 /// # Errors
 ///
@@ -38,100 +41,232 @@ fn get_user_id() -> String {
 /// its status and the reason it printed when it exits nonzero, and
 /// [`Error::Parse`] when `busctl` prints output this library cannot parse.
 pub fn restart_plasmashell() -> Result<()> {
-    let (unit, old_pid) = target_unit()?;
+    let mut call = RestartCall::default();
+    let (unit, old_pid) = call.target_unit()?;
 
-    run("systemctl", &["--user", "restart", &unit])?;
+    // The unit name comes from systemd, and systemctl reads a unit name that
+    // starts with `-` (`-.slice`) as options unless `--` precedes it
+    // (measured 2026-11-09 on systemd 262).
+    call.run("systemctl", &["--user", "restart", "--", &unit])?;
 
-    await_new_owner(&unit, old_pid)
+    call.await_new_owner(&unit, old_pid)
 }
 
-/// The unit to restart and the pid of the plasmashell it runs. With no
-/// plasmashell running the answer is the vendor unit and no pid, so the
-/// restart starts plasmashell from its packaged unit.
-fn target_unit() -> Result<(String, Option<u32>)> {
-    if !bus_name_has_owner(PLASMASHELL_BUS_NAME)? {
-        return Ok((VENDOR_UNIT.to_owned(), None));
-    }
-
-    let pid = bus_owner_pid()?;
-    if !bus_name_has_owner(SYSTEMD_DESTINATION)? {
-        return Err(no_unit_error(pid));
-    }
-    let Some(object_path) = unit_object_path_for_pid(pid)? else {
-        return Err(no_unit_error(pid));
-    };
-
-    let unit = unit_id(&object_path)?;
-    if !unit.ends_with(".service") || service_main_pid(&object_path)? != pid {
-        return Err(Error::Restart(format!(
-            "plasmashell (pid {pid}) runs in {unit}, not in a service plasmoid-updater could restart"
-        )));
-    }
-
-    Ok((unit, Some(pid)))
+/// One [`restart_plasmashell`] call: its steps, and every warning line its
+/// tools already logged, so an identical line logs once per call.
+#[derive(Default)]
+struct RestartCall {
+    logged: HashSet<String>,
 }
 
-/// Waits until a plasmashell other than `old_pid` owns the bus name. A pid
-/// that still equals `old_pid` is the old process, so waiting cannot help.
-fn await_new_owner(unit: &str, old_pid: Option<u32>) -> Result<()> {
-    let deadline = Instant::now() + RESTART_WAIT;
-
-    loop {
-        match current_owner()? {
-            Some(pid) if old_pid == Some(pid) => {
-                return Err(Error::Restart(format!(
-                    "{unit} restarted, but plasmashell (pid {pid}) still owns {PLASMASHELL_BUS_NAME}"
-                )));
-            }
-            Some(_) => return Ok(()),
-            None => {}
+impl RestartCall {
+    /// The unit to restart and the pid of the plasmashell it runs. With no
+    /// plasmashell running the answer is the vendor unit and no pid, so the
+    /// restart starts plasmashell from its packaged unit.
+    fn target_unit(&mut self) -> Result<(String, Option<u32>)> {
+        if !self.bus_name_has_owner(PLASMASHELL_BUS_NAME)? {
+            return Ok((VENDOR_UNIT.to_owned(), None));
         }
 
-        if Instant::now() >= deadline {
+        let pid = self.bus_owner_pid()?;
+        if !self.bus_name_has_owner(SYSTEMD_DESTINATION)? {
+            return Err(no_unit_error(pid));
+        }
+        let Some(object_path) = self.unit_object_path_for_pid(pid)? else {
+            return Err(no_unit_error(pid));
+        };
+
+        let unit = self.unit_id(&object_path)?;
+        if !unit.ends_with(".service") || self.service_main_pid(&object_path)? != pid {
             return Err(Error::Restart(format!(
-                "{unit} restarted, but no new plasmashell took {PLASMASHELL_BUS_NAME} within {} s",
-                RESTART_WAIT.as_secs()
+                "plasmashell (pid {pid}) runs in {unit}, not in a service plasmoid-updater could restart"
             )));
         }
 
-        sleep(POLL_INTERVAL);
-    }
-}
-
-/// The pid that owns `org.kde.plasmashell` now, or `None` while nothing does.
-///
-/// A failed `GetConnectionUnixProcessID` counts as `None`: the name was owned
-/// a moment before, so the call fails when its owner exits in between, and
-/// the next poll re-checks the name.
-fn current_owner() -> Result<Option<u32>> {
-    if !bus_name_has_owner(PLASMASHELL_BUS_NAME)? {
-        return Ok(None);
+        Ok((unit, Some(pid)))
     }
 
-    match bus_owner_pid() {
-        Ok(pid) => Ok(Some(pid)),
-        Err(Error::Command { .. }) => Ok(None),
-        Err(error) => Err(error),
+    /// Waits until a plasmashell other than `old_pid` owns the bus name. A pid
+    /// that still equals `old_pid` is the old process, so waiting cannot help.
+    fn await_new_owner(&mut self, unit: &str, old_pid: Option<u32>) -> Result<()> {
+        let deadline = Instant::now() + RESTART_WAIT;
+
+        loop {
+            match self.current_owner()? {
+                Some(pid) if old_pid == Some(pid) => {
+                    return Err(Error::Restart(format!(
+                        "{unit} restarted, but plasmashell (pid {pid}) still owns {PLASMASHELL_BUS_NAME}"
+                    )));
+                }
+                Some(_) => return Ok(()),
+                None => {}
+            }
+
+            if Instant::now() >= deadline {
+                return Err(Error::Restart(format!(
+                    "{unit} restarted, but no new plasmashell took {PLASMASHELL_BUS_NAME} within {} s",
+                    RESTART_WAIT.as_secs()
+                )));
+            }
+
+            sleep(POLL_INTERVAL);
+        }
     }
-}
 
-/// Asks the session bus whether any process owns `name`.
-fn bus_name_has_owner(name: &str) -> Result<bool> {
-    let output = run(
-        "busctl",
-        &[
-            "--user",
-            "call",
-            DBUS_DESTINATION,
-            DBUS_PATH,
-            DBUS_DESTINATION,
-            "NameHasOwner",
-            "s",
-            name,
-        ],
-    )?;
+    /// The pid that owns `org.kde.plasmashell` now, or `None` while nothing
+    /// does.
+    ///
+    /// A failed `GetConnectionUnixProcessID` counts as `None`: the name was
+    /// owned a moment before, so the call fails when its owner exits in
+    /// between, and the next poll re-checks the name.
+    fn current_owner(&mut self) -> Result<Option<u32>> {
+        if !self.bus_name_has_owner(PLASMASHELL_BUS_NAME)? {
+            return Ok(None);
+        }
 
-    parse_bool("NameHasOwner", &output.stdout)
+        match self.bus_owner_pid() {
+            Ok(pid) => Ok(Some(pid)),
+            Err(Error::Command { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Asks the session bus whether any process owns `name`.
+    fn bus_name_has_owner(&mut self, name: &str) -> Result<bool> {
+        let output = self.run(
+            "busctl",
+            &[
+                "--user",
+                "call",
+                DBUS_DESTINATION,
+                DBUS_PATH,
+                DBUS_DESTINATION,
+                "NameHasOwner",
+                "s",
+                name,
+            ],
+        )?;
+
+        parse_bool("NameHasOwner", &output.stdout)
+    }
+
+    fn bus_owner_pid(&mut self) -> Result<u32> {
+        let output = self.run(
+            "busctl",
+            &[
+                "--user",
+                "call",
+                DBUS_DESTINATION,
+                DBUS_PATH,
+                DBUS_DESTINATION,
+                "GetConnectionUnixProcessID",
+                "s",
+                PLASMASHELL_BUS_NAME,
+            ],
+        )?;
+
+        parse_u32("GetConnectionUnixProcessID", &output.stdout)
+    }
+
+    /// The systemd object path of the unit that owns `pid`, or `None` when
+    /// systemd answers that the pid belongs to no loaded unit.
+    fn unit_object_path_for_pid(&mut self, pid: u32) -> Result<Option<String>> {
+        let pid = pid.to_string();
+        let output = self.command_output(
+            "busctl",
+            &[
+                "--user",
+                "call",
+                SYSTEMD_DESTINATION,
+                SYSTEMD_MANAGER_PATH,
+                "org.freedesktop.systemd1.Manager",
+                "GetUnitByPID",
+                "u",
+                &pid,
+            ],
+        )?;
+
+        if !output.status.success() {
+            if String::from_utf8_lossy(&output.stderr).contains(UNIT_NOT_LOADED) {
+                return Ok(None);
+            }
+            return Err(command_error("busctl", &output));
+        }
+
+        parse_quoted("GetUnitByPID", "o", &output.stdout).map(Some)
+    }
+
+    fn unit_id(&mut self, object_path: &str) -> Result<String> {
+        let output = self.run(
+            "busctl",
+            &[
+                "--user",
+                "get-property",
+                SYSTEMD_DESTINATION,
+                object_path,
+                "org.freedesktop.systemd1.Unit",
+                "Id",
+            ],
+        )?;
+
+        parse_quoted("Unit.Id", "s", &output.stdout)
+    }
+
+    fn service_main_pid(&mut self, object_path: &str) -> Result<u32> {
+        let output = self.run(
+            "busctl",
+            &[
+                "--user",
+                "get-property",
+                SYSTEMD_DESTINATION,
+                object_path,
+                "org.freedesktop.systemd1.Service",
+                "MainPID",
+            ],
+        )?;
+
+        parse_u32("Service.MainPID", &output.stdout)
+    }
+
+    /// Runs `tool` to completion and returns its output, leaving the exit
+    /// status to the caller. stderr is always captured, never inherited, so
+    /// the library prints nothing itself. A failed call's reason travels
+    /// inside [`Error::Command`], and a caller whose answer arrives as a
+    /// failure message reads it off the captured stderr. A successful call's
+    /// non-blank stderr is logged as one warning, rendered by
+    /// [`stderr_line`](crate::error::stderr_line), and an identical line logs
+    /// once per [`restart_plasmashell`] call.
+    fn command_output(&mut self, tool: &'static str, args: &[&str]) -> Result<Output> {
+        let output = user_command(tool)
+            .args(args)
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => Error::MissingTool { tool },
+                _ => Error::Config(format!("failed to run {tool}: {error}")),
+            })?;
+
+        if output.status.success() {
+            let warning = crate::error::stderr_line(&String::from_utf8_lossy(&output.stderr));
+            if !warning.is_empty() && self.logged.insert(format!("{tool}: {warning}")) {
+                log::warn!(target: "restart", "{tool}: {warning}");
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// [`Self::command_output`], with a nonzero exit status turned into
+    /// [`Error::Command`].
+    fn run(&mut self, tool: &'static str, args: &[&str]) -> Result<Output> {
+        let output = self.command_output(tool, args)?;
+
+        if output.status.success() {
+            Ok(output)
+        } else {
+            Err(command_error(tool, &output))
+        }
+    }
 }
 
 /// The error for a plasmashell whose pid no restartable systemd user unit
@@ -141,84 +276,6 @@ fn no_unit_error(pid: u32) -> Error {
     Error::Restart(format!(
         "plasmashell (pid {pid}) belongs to no systemd user unit plasmoid-updater could restart"
     ))
-}
-
-fn bus_owner_pid() -> Result<u32> {
-    let output = run(
-        "busctl",
-        &[
-            "--user",
-            "call",
-            DBUS_DESTINATION,
-            DBUS_PATH,
-            DBUS_DESTINATION,
-            "GetConnectionUnixProcessID",
-            "s",
-            PLASMASHELL_BUS_NAME,
-        ],
-    )?;
-
-    parse_u32("GetConnectionUnixProcessID", &output.stdout)
-}
-
-/// The systemd object path of the unit that owns `pid`, or `None` when
-/// systemd answers that the pid belongs to no loaded unit.
-fn unit_object_path_for_pid(pid: u32) -> Result<Option<String>> {
-    let pid = pid.to_string();
-    let output = command_output(
-        "busctl",
-        &[
-            "--user",
-            "call",
-            SYSTEMD_DESTINATION,
-            SYSTEMD_MANAGER_PATH,
-            "org.freedesktop.systemd1.Manager",
-            "GetUnitByPID",
-            "u",
-            &pid,
-        ],
-    )?;
-
-    if !output.status.success() {
-        if String::from_utf8_lossy(&output.stderr).contains(UNIT_NOT_LOADED) {
-            return Ok(None);
-        }
-        return Err(command_error("busctl", &output));
-    }
-
-    parse_quoted("GetUnitByPID", "o", &output.stdout).map(Some)
-}
-
-fn unit_id(object_path: &str) -> Result<String> {
-    let output = run(
-        "busctl",
-        &[
-            "--user",
-            "get-property",
-            SYSTEMD_DESTINATION,
-            object_path,
-            "org.freedesktop.systemd1.Unit",
-            "Id",
-        ],
-    )?;
-
-    parse_quoted("Unit.Id", "s", &output.stdout)
-}
-
-fn service_main_pid(object_path: &str) -> Result<u32> {
-    let output = run(
-        "busctl",
-        &[
-            "--user",
-            "get-property",
-            SYSTEMD_DESTINATION,
-            object_path,
-            "org.freedesktop.systemd1.Service",
-            "MainPID",
-        ],
-    )?;
-
-    parse_u32("Service.MainPID", &output.stdout)
 }
 
 /// Builds a command that can reach the user's session bus even when the
@@ -240,34 +297,6 @@ fn user_command(tool: &'static str) -> Command {
     }
 
     cmd
-}
-
-/// Runs `tool` to completion and returns its output, leaving the exit status
-/// to the caller. stderr is always captured, never inherited, so the library
-/// prints nothing: a failed call's reason travels inside [`Error::Command`],
-/// and a caller whose answer arrives as a failure message reads it off the
-/// captured stderr.
-fn command_output(tool: &'static str, args: &[&str]) -> Result<Output> {
-    user_command(tool)
-        .args(args)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => Error::MissingTool { tool },
-            _ => Error::Config(format!("failed to run {tool}: {error}")),
-        })
-}
-
-/// [`command_output`], with a nonzero exit status turned into
-/// [`Error::Command`].
-fn run(tool: &'static str, args: &[&str]) -> Result<Output> {
-    let output = command_output(tool, args)?;
-
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(command_error(tool, &output))
-    }
 }
 
 fn command_error(tool: &'static str, output: &Output) -> Error {

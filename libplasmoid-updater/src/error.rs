@@ -117,17 +117,24 @@ pub(crate) fn command_failure(command: &str, status: &std::process::ExitStatus) 
     }
 }
 
-/// [`command_failure`], followed by the reason the command printed on stderr
-/// rendered as one line: each line trimmed, blank lines dropped, the rest
-/// joined by one space. A command that printed no reason keeps the bare line.
-fn command_error_line(command: &str, status: &std::process::ExitStatus, stderr: &str) -> String {
-    let failure = command_failure(command, status);
-    let reason = stderr
+/// Renders what a command printed on stderr as one line: each line trimmed,
+/// blank lines dropped, the rest joined by one space. All-blank output renders
+/// empty.
+pub(crate) fn stderr_line(stderr: &str) -> String {
+    stderr
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+/// [`command_failure`], followed by the reason the command printed on stderr
+/// rendered by [`stderr_line`]. A command that printed no reason keeps the
+/// bare line.
+fn command_error_line(command: &str, status: &std::process::ExitStatus, stderr: &str) -> String {
+    let failure = command_failure(command, status);
+    let reason = stderr_line(stderr);
 
     if reason.is_empty() {
         failure
@@ -141,7 +148,20 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::ExitStatus;
 
-    use super::Error;
+    use super::{Error, stderr_line};
+
+    #[test]
+    fn stderr_renders_as_one_line_of_its_trimmed_non_blank_lines() {
+        assert_eq!(
+            stderr_line("  Job failed.  \n\n\t See the journal.\n \nfor details\n"),
+            "Job failed. See the journal. for details"
+        );
+    }
+
+    #[test]
+    fn all_blank_stderr_renders_empty() {
+        assert_eq!(stderr_line(" \n\t\n  \n"), "");
+    }
 
     #[test]
     fn a_command_error_names_an_exit_status_code() {

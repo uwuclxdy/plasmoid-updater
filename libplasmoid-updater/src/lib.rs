@@ -499,7 +499,9 @@ pub fn needs_repair(config: &Config) -> Result<bool> {
 /// to take that name. With no plasmashell running it starts
 /// `plasma-plasmashell.service`. The core never calls this; the caller decides
 /// when (and whether) to, typically when [`UpdateResult::needs_restart`]
-/// returns `true`.
+/// returns `true`. A tool that succeeds but prints a non-blank line on stderr
+/// has that text logged as a `log` warning (`<tool>: <text>`), joined into one
+/// line, and an identical line logs once per call.
 ///
 /// # Errors
 ///

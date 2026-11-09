@@ -14,12 +14,14 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use common::Sandbox;
 
 const CHILD_VAR: &str = "PLASMOID_UPDATER_TEST_RESTART_CHILD";
 const OUTCOME_VAR: &str = "PLASMOID_UPDATER_TEST_RESTART_OUTCOME";
+const RESTARTS_VAR: &str = "PLASMOID_UPDATER_TEST_RESTART_COUNT";
 
 const TRANSIENT_UNIT: &str = "app-org.kde.plasmashell@3f9c0a7d1e2b4c5d8e9f0a1b2c3d4e5f.service";
 const VENDOR_UNIT: &str = "plasma-plasmashell.service";
@@ -110,6 +112,7 @@ if [ -n "$calls" ]; then
 fi
 manager=true
 [ -f "$state/no-manager" ] && manager=false
+if [ -f "$state/busctl-warning" ]; then while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line" >&2; done < "$state/busctl-warning"; fi
 args=$(printf '%s|' "$@")
 case "$args" in
   '--user|call|org.freedesktop.DBus|/org/freedesktop/DBus|org.freedesktop.DBus|NameHasOwner|s|org.kde.plasmashell|')
@@ -127,6 +130,7 @@ case "$args" in
   "--user|call|org.freedesktop.systemd1|/org/freedesktop/systemd1|org.freedesktop.systemd1.Manager|GetUnitByPID|u|$owner|")
     if [ "$manager" = false ]; then echo 'Call failed: The name is not activatable' >&2; exit 1; fi
     if [ -f "$state/GetUnitByPID-error" ]; then read -r line < "$state/GetUnitByPID-error"; printf '%s\n' "$line" >&2; exit 1; fi
+    if [ -f "$state/GetUnitByPID-warning" ]; then while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line" >&2; done < "$state/GetUnitByPID-warning"; fi
     {unit_by_pid} ;;
   '--user|get-property|org.freedesktop.systemd1|/org/freedesktop/systemd1/unit/fake|org.freedesktop.systemd1.Service|MainPID|')
     if [ -f "$state/MainPID-error" ]; then read -r line < "$state/MainPID-error"; printf '%s\n' "$line" >&2; exit 1; fi
@@ -167,6 +171,29 @@ esac
         self
     }
 
+    /// Makes `busctl` answer `GetUnitByPID` as usual and exit 0, after
+    /// printing `warning` on stderr, every line of it verbatim.
+    fn unit_lookup_warns(&self, warning: &str) -> &Self {
+        std::fs::write(self.state.join("GetUnitByPID-warning"), warning).unwrap();
+        self
+    }
+
+    /// Makes every `busctl` call print `warning` on stderr, every line of it
+    /// verbatim, before it answers as usual.
+    fn busctl_always_warns(&self, warning: &str) -> &Self {
+        std::fs::write(self.state.join("busctl-warning"), warning).unwrap();
+        self
+    }
+
+    /// Makes `systemctl restart` print `warning` on stderr, every line of it
+    /// verbatim, before it acts as the session's [`After`] says. Replayed
+    /// from a file, so the warning may hold any character a shell literal
+    /// could not.
+    fn systemctl_warns(&self, warning: &str) -> &Self {
+        std::fs::write(self.state.join("restart-warning"), warning).unwrap();
+        self
+    }
+
     /// Makes the first pid query fail as if the owner had just exited.
     fn pid_query_fails_once(&self) -> &Self {
         std::fs::write(self.state.join("vanish"), "once\n").unwrap();
@@ -201,6 +228,7 @@ args=$(printf '%s|' "$@")
 printf '%s\n' "$args" >> "$state/systemctl.log"
 case "$args" in
   '--user|restart|'*)
+    if [ -f "$state/restart-warning" ]; then while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line" >&2; done < "$state/restart-warning"; fi
     {after} ;;
   *)
     echo "unexpected systemctl call: $*" >&2; exit 99 ;;
@@ -217,12 +245,33 @@ esac
     ///
     /// The library prints nothing, so every run fails when the child or a
     /// tool it ran wrote to stderr, or wrote to stdout beside libtest's own
-    /// lines: a failed tool's reason travels inside the error instead.
+    /// lines: a failed tool's reason travels inside the error instead. A run
+    /// that logged a warning fails too; [`Fakes::run_logging`] is for a test
+    /// that pins one.
     ///
     /// The child gets dead bus addresses, so a call that slips past the fakes
     /// fails instead of reaching the live user or system bus; as root a slip
     /// would reach root's managers, so the suite refuses to run there.
     fn run(&self, test: &str) -> (String, String) {
+        let outcome = self.run_logging(test);
+        assert_eq!(
+            self.warnings(),
+            Vec::<String>::new(),
+            "the restart logged a warning"
+        );
+        outcome
+    }
+
+    /// [`Fakes::run`] for a test that pins what the restart logged: it leaves
+    /// the warnings to [`Fakes::warnings`].
+    fn run_logging(&self, test: &str) -> (String, String) {
+        self.run_restarts(test, 1)
+    }
+
+    /// [`Fakes::run_logging`], with the child calling `restart_plasmashell`
+    /// `restarts` times in one process. The outcome is the last call's; the
+    /// warnings are every call's.
+    fn run_restarts(&self, test: &str, restarts: u32) -> (String, String) {
         assert!(
             !nix::unistd::Uid::effective().is_root(),
             "the restart tests refuse to run as root"
@@ -235,6 +284,7 @@ esac
             .args([test, "--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_VAR, "1")
             .env(OUTCOME_VAR, &outcome)
+            .env(RESTARTS_VAR, restarts.to_string())
             .env("DBUS_SESSION_BUS_ADDRESS", &dead_bus)
             .env("DBUS_SYSTEM_BUS_ADDRESS", &dead_bus)
             .env("PATH", self.sandbox.bin_dir())
@@ -278,6 +328,14 @@ esac
             .collect()
     }
 
+    /// Every record the library logged at warn level or above during the last
+    /// [`Fakes::run`], one `LEVEL: text` line each, in order.
+    fn warnings(&self) -> Vec<String> {
+        let path = self.state.join("warnings");
+        assert!(path.exists(), "the child wrote no warnings file");
+        read_log(&path)
+    }
+
     /// How many times `busctl` was called.
     fn busctl_calls(&self) -> usize {
         read_log(&self.state.join("busctl.log")).len()
@@ -298,18 +356,50 @@ fn child_restart() -> bool {
     if std::env::var_os(CHILD_VAR).is_none() {
         return false;
     }
-    let outcome = std::env::var_os(OUTCOME_VAR).unwrap();
-    let result = libplasmoid_updater::restart_plasmashell();
+    let outcome = PathBuf::from(std::env::var_os(OUTCOME_VAR).unwrap());
+    log::set_logger(&WarningLog).unwrap();
+    log::set_max_level(log::LevelFilter::Warn);
+    let restarts: u32 = std::env::var(RESTARTS_VAR).unwrap().parse().unwrap();
+    let mut result = libplasmoid_updater::restart_plasmashell();
+    for _ in 1..restarts {
+        result = libplasmoid_updater::restart_plasmashell();
+    }
     let display = match &result {
         Ok(()) => String::new(),
         Err(error) => error.to_string(),
     };
+    let warnings = WARNINGS.lock().unwrap().join("\n");
+    std::fs::write(outcome.with_file_name("warnings"), warnings).unwrap();
     std::fs::write(outcome, format!("{result:?}\n{display}")).unwrap();
     true
 }
 
+/// Every warning or error the library logged in the child, as `LEVEL: text`.
+static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The child's logger: keeps each record at warn level or above in
+/// [`WARNINGS`] and prints nothing, so the parent can pin the record exactly.
+struct WarningLog;
+
+impl log::Log for WarningLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            WARNINGS
+                .lock()
+                .unwrap()
+                .push(format!("{}: {}", record.level(), record.args()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 fn restart_line(unit: &str) -> String {
-    format!("--user|restart|{unit}|")
+    format!("--user|restart|--|{unit}|")
 }
 
 #[test]
@@ -912,5 +1002,207 @@ fn a_reason_over_several_lines_renders_as_one_line() {
     assert_eq!(
         display,
         "systemctl exited with status 1: Job for plasma-plasmashell.service failed. See the journal for details."
+    );
+}
+
+#[test]
+fn a_restart_that_succeeds_with_a_warning_logs_it_as_one_line() {
+    if child_restart() {
+        return;
+    }
+    // systemctl's own text (measured 2026-11-09 in systemd 262's systemctl
+    // binary), printed on a restart that still succeeds when the unit file
+    // changed on disk since the last daemon-reload.
+    let session = Session {
+        owner: Some(4242),
+        unit: Some((VENDOR_UNIT, 4242)),
+        after: After::Owner(4343),
+    };
+    let fakes = Fakes::new();
+    fakes
+        .busctl(&session)
+        .systemctl(&session)
+        .systemctl_warns("Warning: The unit file, source configuration file or drop-ins of plasma-plasmashell.service changed on disk. Run 'systemctl --user daemon-reload' to reload units.\n");
+
+    let (debug, _) =
+        fakes.run_logging("a_restart_that_succeeds_with_a_warning_logs_it_as_one_line");
+
+    assert_eq!(debug, "Ok(())");
+    assert_eq!(fakes.restarts(), [restart_line(VENDOR_UNIT)]);
+    assert_eq!(
+        fakes.warnings(),
+        [
+            "WARN: systemctl: Warning: The unit file, source configuration file or drop-ins of plasma-plasmashell.service changed on disk. Run 'systemctl --user daemon-reload' to reload units."
+        ]
+    );
+}
+
+#[test]
+fn a_unit_lookup_that_succeeds_with_a_warning_logs_it_as_one_line() {
+    if child_restart() {
+        return;
+    }
+    let session = Session {
+        owner: Some(4242),
+        unit: Some((TRANSIENT_UNIT, 4242)),
+        after: After::Owner(4343),
+    };
+    let fakes = Fakes::new();
+    fakes
+        .busctl(&session)
+        // No newline after the last line: a tool's stderr need not end in one.
+        .unit_lookup_warns("  Some notice from busctl.\n\n\tA second line of it.  ")
+        .systemctl(&session);
+
+    let (debug, _) =
+        fakes.run_logging("a_unit_lookup_that_succeeds_with_a_warning_logs_it_as_one_line");
+
+    assert_eq!(debug, "Ok(())");
+    assert_eq!(fakes.restarts(), [restart_line(TRANSIENT_UNIT)]);
+    // Joined like a failed call's reason: each line trimmed, blank lines
+    // dropped, the rest joined by one space.
+    assert_eq!(
+        fakes.warnings(),
+        ["WARN: busctl: Some notice from busctl. A second line of it."]
+    );
+}
+
+#[test]
+fn a_unit_lookup_that_succeeds_with_blank_stderr_logs_nothing() {
+    if child_restart() {
+        return;
+    }
+    let session = Session {
+        owner: Some(4242),
+        unit: Some((TRANSIENT_UNIT, 4242)),
+        after: After::Owner(4343),
+    };
+    let fakes = Fakes::new();
+    fakes
+        .busctl(&session)
+        .unit_lookup_warns(" \n\t\n")
+        .systemctl(&session);
+
+    // `Fakes::run` fails on any logged warning.
+    let (debug, _) = fakes.run("a_unit_lookup_that_succeeds_with_blank_stderr_logs_nothing");
+
+    assert_eq!(debug, "Ok(())");
+    assert_eq!(fakes.restarts(), [restart_line(TRANSIENT_UNIT)]);
+}
+
+#[test]
+fn a_warning_repeated_within_one_restart_logs_once() {
+    if child_restart() {
+        return;
+    }
+    // Nothing owns the name for a few polls after the restart, so the same
+    // busctl notice arrives on many calls.
+    let session = Session {
+        owner: Some(4242),
+        unit: Some((TRANSIENT_UNIT, 4242)),
+        after: After::OwnerAfterCalls {
+            calls: 3,
+            pid: 4343,
+        },
+    };
+    let fakes = Fakes::new();
+    fakes
+        .busctl(&session)
+        .busctl_always_warns("Notice: every call.\n")
+        .unit_lookup_warns("Lookup notice.\n")
+        .systemctl(&session)
+        .systemctl_warns("Notice: every call.\n");
+
+    let (debug, _) = fakes.run_logging("a_warning_repeated_within_one_restart_logs_once");
+
+    assert_eq!(debug, "Ok(())");
+    // 6 calls find and check the unit and the poll that finds the new owner
+    // makes 2, so a 9th call is a poll that found nothing: the notice
+    // repeated inside the wait too.
+    assert!(
+        fakes.busctl_calls() >= 9,
+        "{} busctl calls",
+        fakes.busctl_calls()
+    );
+    // One record per distinct line: the unit lookup's stderr renders as a
+    // different line, and the same text from systemctl is another tool's.
+    assert_eq!(
+        fakes.warnings(),
+        [
+            "WARN: busctl: Notice: every call.",
+            "WARN: busctl: Notice: every call. Lookup notice.",
+            "WARN: systemctl: Notice: every call.",
+        ]
+    );
+}
+
+#[test]
+fn each_restart_logs_its_own_warnings() {
+    if child_restart() {
+        return;
+    }
+    let session = Session {
+        owner: Some(4242),
+        unit: Some((TRANSIENT_UNIT, 4242)),
+        after: After::Owner(4343),
+    };
+    let fakes = Fakes::new();
+    fakes
+        .busctl(&session)
+        .busctl_always_warns("Notice: every call.\n")
+        .systemctl(&session);
+
+    let (debug, _) = fakes.run_restarts("each_restart_logs_its_own_warnings", 2);
+
+    // The second call finds the new plasmashell outside the unit's main
+    // process and refuses; it still logs the notice its own calls printed.
+    assert_eq!(
+        debug,
+        format!(
+            r#"Err(Restart("plasmashell (pid 4343) runs in {TRANSIENT_UNIT}, not in a service plasmoid-updater could restart"))"#
+        )
+    );
+    assert_eq!(fakes.restarts(), [restart_line(TRANSIENT_UNIT)]);
+    assert_eq!(
+        fakes.warnings(),
+        [
+            "WARN: busctl: Notice: every call.",
+            "WARN: busctl: Notice: every call.",
+        ]
+    );
+}
+
+#[test]
+fn a_restart_after_a_refused_one_logs_its_own_warnings() {
+    if child_restart() {
+        return;
+    }
+    // Both calls refuse a plasmashell inside a terminal's scope, so neither
+    // reaches the restart: a fresh start must not depend on the earlier
+    // call's outcome.
+    let session = Session {
+        owner: Some(4242),
+        unit: Some(("app-org.kde.konsole-4242.scope", 0)),
+        after: After::Owner(4343),
+    };
+    let fakes = Fakes::new();
+    fakes
+        .busctl(&session)
+        .busctl_always_warns("Notice: every call.\n")
+        .systemctl(&session);
+
+    let (debug, _) = fakes.run_restarts("a_restart_after_a_refused_one_logs_its_own_warnings", 2);
+
+    assert_eq!(
+        debug,
+        r#"Err(Restart("plasmashell (pid 4242) runs in app-org.kde.konsole-4242.scope, not in a service plasmoid-updater could restart"))"#
+    );
+    assert_eq!(fakes.restarts(), Vec::<String>::new());
+    assert_eq!(
+        fakes.warnings(),
+        [
+            "WARN: busctl: Notice: every call.",
+            "WARN: busctl: Notice: every call.",
+        ]
     );
 }
