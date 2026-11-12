@@ -2,15 +2,15 @@
 # sha256sums.txt over it to the GitHub Release. The sums file is what a
 # self-updater or installer verifies downloads against.
 #
-# The GitHub release is NOT created here — the repo's release.sh creates it
-# right after the tag push with the full changelog already in the body, so the
-# notes ride along in GitHub's release email. This workflow builds the binary
-# and uploads it (plus sums) to that release, and the crates job publishes the
-# library, then the binary, to crates.io through trusted publishing, so no
-# crates.io token is stored in the repo. One upload point (the publish job), so
-# no concurrent release-create can duplicate the release and orphan the notes.
-# If the release does not exist when publish runs (the script never ran for
-# this tag), the publish job fails rather than minting a notes-less release.
+# The GitHub release is NOT created here — the release is created with its
+# notes before this workflow runs, so the notes ride along in GitHub's release
+# email. This workflow builds the binary and uploads it (plus sums) to that
+# release, and the crates job publishes the library, then the binary, to
+# crates.io through trusted publishing, so no crates.io token is stored in the
+# repo. One upload point (the publish job), so no concurrent release-create can
+# duplicate the release and orphan the notes. If the release does not exist
+# when publish runs, the publish job fails rather than minting a notes-less
+# release.
 #
 # The build matrix runs the one target on its NATIVE runner (linux → ubuntu).
 # Linux-only binary today: add rows (macos / windows / musl) to extend the
@@ -25,8 +25,11 @@ on:
   push:
     tags: ["v*"]
 
-# Each job takes only what it uses: validate and build compile every
-# dependency, so neither holds the token that can change the release.
+# Each job takes only what it uses: build compiles every dependency and
+# package builds both crates from their packages, so each holds
+# `contents: read` alone and no token that can change the release or buy a
+# registry token; validate reads the tree; publish uploads the assets and
+# attests the downloaded binaries.
 permissions:
   contents: read
 
@@ -39,84 +42,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate tag is semver
-        # Tightens the `v*` trigger to strict vX.Y.Z before any build minutes burn —
-        # a malformed tag otherwise reds publish on the missing artifact. Pre-release
-        # suffixes (`v1.2.3-rc1`) need the regex relaxed.
+        # Tightens the `v*` trigger to vX.Y.Z or a vX.Y.Z-PRE prerelease (semver
+        # 2.0.0's pre-release grammar, no build metadata) before any build
+        # minutes burn — a malformed tag otherwise reds publish on the missing
+        # artifact. LC_ALL=C: under a UTF-8 locale bash's [A-Za-z0-9] also
+        # matches é and ٣ (measured 2026-11-10, bash 5.3 on en_US.UTF-8).
         run: |
           ver="${GITHUB_REF_NAME#v}"
-          if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::tag '${GITHUB_REF_NAME}' is not vX.Y.Z"; exit 1
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          LC_ALL=C
+          if [[ ! "$ver" =~ $semver ]]; then
+            echo "::error::tag '${GITHUB_REF_NAME}' is not vX.Y.Z or vX.Y.Z-PRERELEASE"; exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # the baseline is the newest origin tag HEAD contains, which needs the
-          # history and the tags, not the triggering tag alone
-          fetch-depth: 0
-          # the guard below only runs git ls-remote against the public repo, so
-          # the token need not sit in .git/config while code is compiled
+          # no step here talks to the repo, so the checkout keeps no token
           persist-credentials: false
-      - name: Refuse a version crates.io holds from another commit
-        # crates.io versions are immutable: a tag re-pushed at another commit
-        # after its crates went up would build and upload binaries that never
-        # match crates.io's copy, so refuse it before any build or upload.
-        # Only `other` fails; absent/same/unknown pass and are logged: a CDN
-        # blip must not block a tag release.sh already cleared, and the crates
-        # job asks again, where crates.io refuses a real duplicate.
-        # scripts/crates-io-copy.sh is the one check release.sh and the crates
-        # job share.
-        run: |
-          set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
-          commit="$(git rev-parse HEAD)"
-          for crate in libplasmoid-updater plasmoid-updater; do
-            answer="$(bash scripts/crates-io-copy.sh "$crate" "$ver")"
-            echo "crates.io's ${crate} ${ver}: ${answer}"
-            case "$answer" in
-              "other "*)
-                echo "::error::${crate} ${ver} is already on crates.io but was packed from ${answer#other }, not from this tag's ${commit}; crates.io versions are immutable, so this tag can never publish it: bump to a new version (delete the GitHub release, if release.sh made one, and the tag, then release the next version)" >&2
-                exit 1
-                ;;
-            esac
-          done
-      # The toolchain builds the rustdoc JSON the tool reads, and the tool
-      # reads only the formats of the toolchains it was released against, so
-      # the two pins move together (ci.yml's semver job carries the same pair,
-      # and scripts/semver-guard.sh's SEMVER_TOOLCHAIN, which release.sh's
-      # local check runs on, must equal this toolchain).
+      # cargo metadata below reads the workspace manifest
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: "1.99.1"
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
-        with:
-          tool: cargo-semver-checks@0.51.0
-      - name: Check the library's API against its previous release tag
-        # Release time, not per push: main carries the next version's
-        # (possibly breaking) API before the bump that announces it. The
-        # baseline, the release type and the check all come from
-        # scripts/semver-guard.sh, the one implementation release.sh shares:
-        # the baseline is the newest origin v* tag below this one that the tag's
-        # commit contains (never crates.io, which gets a version only after its
-        # tag, so a failed crates job leaves it behind origin), and
-        # the release type follows from that baseline version to the tag's.
+      - name: Refuse a tag the workspace version does not match
+        # The crates job publishes the manifest's version, so a tag naming any
+        # other version would release binaries and crates that disagree.
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          manifest_ver="$(bash scripts/semver-guard.sh manifest-version)"
-          if [ "$manifest_ver" != "$tag" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match the workspace version '${manifest_ver}'; release.sh bumps and tags together, so a hand-pushed tag must not skip the bump"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | join(" ")')"
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the workspace version '${version}'; a release bumps the version and tags it together, so a hand-pushed tag must not skip the bump"
             exit 1
           fi
-          prev_tag="$(bash scripts/semver-guard.sh baseline "$tag")"
-          kind="$(bash scripts/semver-guard.sh release-type "${prev_tag#v}" "$tag")"
-          bash scripts/semver-guard.sh check "$prev_tag" "$kind"
 
   build:
     name: Build ${{ matrix.asset_name }}
     needs: validate
     permissions:
       contents: read
-      id-token: write      # GitHub OIDC — keyless build-provenance attestation
-      attestations: write  # actions/attest-build-provenance
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.os }}
     defaults:
@@ -143,10 +102,6 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Prepare asset
         run: cp "target/${{ matrix.target }}/release/plasmoid-updater${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
-      - name: Attest build provenance   # keyless SLSA provenance for the asset
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
-        with:
-          subject-path: ${{ matrix.asset_name }}${{ matrix.ext }}
       - name: Upload artifact for the publish job
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -154,17 +109,49 @@ jobs:
           path: ${{ matrix.asset_name }}${{ matrix.ext }}
           if-no-files-found: error
 
+  package:
+    name: Build both crates from their packages
+    needs: validate
+    permissions:
+      contents: read
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    # Same registry-download workaround as ci.yml: curl's HTTP/2 multiplexing
+    # against the crates.io CDN intermittently dies with "[16] Error in the
+    # HTTP2 framing layer" on the hosted runners, and the extra retries cover
+    # the remaining transient blips. `cargo package` verifies each package by
+    # building it, the binary's against the library's package, which downloads
+    # the whole dependency tree from that CDN.
+    env:
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # the package build runs every dependency's build script and needs
+          # no git credential
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # The verify build runs inside `cargo package`, so it runs here, in a
+      # job that holds no registry token and cannot ask for an OIDC one.
+      - name: Build both crates from their packages
+        run: cargo package --locked --workspace
+
   publish:
     name: Publish assets
     needs: [validate, build]
     permissions:
       contents: write      # gh release upload attaches assets to the release
+      id-token: write      # GitHub OIDC — keyless build-provenance attestation
+      attestations: write  # actions/attest-build-provenance
     # Run even when a build leg fails so the binaries that DID ship still get
     # attached with a matching sums file covering exactly what was published.
     # A failed validate skips every build leg, so there is nothing to attach:
     # publish then stays out and leaves the validate failure as the one red.
-    # The tag guard still holds under always().
-    if: always() && needs.validate.result == 'success' && startsWith(github.ref, 'refs/tags/')
+    # `!cancelled()`, not `always()`: always() also runs on a cancelled run,
+    # which must upload nothing. The tag guard still holds. The `${{ }}` is
+    # needed: a YAML value cannot start with a bare `!`.
+    if: ${{ !cancelled() && needs.validate.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -172,6 +159,10 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Attest build provenance   # keyless SLSA provenance over the downloaded binaries
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: artifacts/plasmoid-updater-*
       - name: Generate sha256sums.txt
         # Glob whatever was actually built so a partial release still matches.
         run: |
@@ -180,44 +171,47 @@ jobs:
       - name: Upload assets to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        # release.sh creates the release (with the full notes) right after the
-        # tag push; a missing release here means that step never ran, so this
-        # job refuses instead of minting a notes-less release. --clobber keeps
-        # re-runs idempotent.
+        # The release is created with its notes before this workflow runs. A
+        # missing release here means that never happened for this tag, so this
+        # job refuses instead of minting a notes-less release. Any other gh
+        # failure refuses too: without the missing-release answer it cannot
+        # tell whether the release exists. --clobber keeps re-runs idempotent.
         run: |
           cd artifacts
-          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "::error::release ${GITHUB_REF_NAME} does not exist; if release.sh's create step failed, run from the repo root: echo y | ./release.sh --retry --workspace --notes CHANGELOG_FILE ${GITHUB_REF_NAME#v}, then re-run this job so the assets attach: gh run rerun ${GITHUB_RUN_ID} --failed — if the tag was hand-pushed, release the next version with release.sh"
+          if view_err="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" 2>&1 >/dev/null)"; then
+            gh release upload "${GITHUB_REF_NAME}" plasmoid-updater-* sha256sums.txt --clobber --repo "${GITHUB_REPOSITORY}"
+          elif [ "$view_err" = "release not found" ]; then
+            echo "::error::release ${GITHUB_REF_NAME} does not exist; if the release run that pushed this tag failed before creating it, resume that run with --retry, then re-run this job so the assets attach: gh run rerun ${GITHUB_RUN_ID} --failed — if the tag was pushed by hand, release the next version"
+            exit 1
+          else
+            echo "::error::cannot tell whether release ${GITHUB_REF_NAME} exists (gh release view: ${view_err%%$'\n'*}); re-run this job once gh answers: gh run rerun ${GITHUB_RUN_ID} --failed"
             exit 1
           fi
-          gh release upload "${GITHUB_REF_NAME}" plasmoid-updater-* sha256sums.txt --clobber --repo "${GITHUB_REPOSITORY}"
 
   crates:
     name: Publish to crates.io
-    needs: [validate, build, publish]
+    needs: [validate, build, publish, package]
     permissions:
       contents: read
       id-token: write      # GitHub OIDC — crates.io trusted publishing, no stored token
     # Same registry-download workaround as ci.yml: curl's HTTP/2 multiplexing
     # against the crates.io CDN intermittently dies with "[16] Error in the
     # HTTP2 framing layer" on the hosted runners, and the extra retries cover
-    # the remaining transient blips. The publish verify build downloads the
-    # whole dependency tree from that CDN.
+    # the remaining transient blips. This job builds nothing, but its index
+    # reads and its uploads still reach crates.io.
     env:
       CARGO_NET_RETRY: "10"
       CARGO_HTTP_MULTIPLEXING: "false"
     # No always(): unlike an asset, a published crate version cannot be
-    # replaced, so this job runs only when validate, every build leg and the
-    # release upload all succeeded (a failed needed job skips it).
+    # replaced, so this job runs only when validate, every build leg, the
+    # release upload and the package build all succeeded (a failed needed job
+    # skips it).
     if: startsWith(github.ref, 'refs/tags/')
     # A second run for the same tag waits instead of racing the first to
-    # crates.io's duplicate refusal, then skips what the first published from
-    # the same commit. A tag deleted and re-pushed at another commit while the
-    # first run was still on its way passes validate (crates.io had nothing
-    # yet), so the publish step's `other` arm is the last stop for a version
-    # another commit published. GitHub keeps only one pending run per group:
-    # a third arrival cancels the second while it still waits, so the queue
-    # never holds more than one.
+    # crates.io's duplicate refusal, then counts what the first published as
+    # done. GitHub keeps only one pending run per group: a third arrival
+    # cancels the second while it still waits, so the queue never holds more
+    # than one.
     concurrency:
       group: crates-${{ github.ref }}
       cancel-in-progress: false
@@ -235,41 +229,26 @@ jobs:
       - name: Publish the crates to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        # The binary depends on the library by version, so the library goes
-        # first, and -e keeps the binary back when the library fails.
-        #
-        # A version crates.io already has is skipped only when its published
-        # .crate proves it was packed from this tag's commit: the version
-        # number alone cannot tell a deleted-and-re-pushed tag from the
-        # original, so scripts/crates-io-copy.sh (the one check release.sh and
-        # validate share) compares the .crate's .cargo_vcs_info.json git.sha1
-        # with this checkout's HEAD. A .crate packed from another commit fails
-        # the job: crates.io versions are immutable, so this tag can never
-        # publish it. Validate refuses it only when the other commit's crates
-        # were up before validate ran; a tag deleted and re-pushed while the
-        # first run was still publishing gets past validate, so this arm is
-        # the last stop. A missing .crate (an HTTP 403 or 404, the normal
-        # not-yet-published case) or an answer the script cannot read falls
-        # through to cargo publish, whose duplicate refusal decides loudly.
+        # --no-verify uploads the packed crate without building it: that build
+        # runs every dependency's build script, and this step holds the
+        # registry token. The binary depends on the library by version, so the
+        # library goes first, and a failed library publish stops the step
+        # before the binary. A version crates.io already has counts as done:
+        # cargo refuses it with "already exists on crates.io index", or the
+        # registry with "is already uploaded". Any other failure fails the
+        # step.
         run: |
           set -euo pipefail
           ver="${GITHUB_REF_NAME#v}"
-          commit="$(git rev-parse HEAD)"
+          log="$(mktemp)"
+          trap 'rm -f -- "$log"' EXIT
           for crate in libplasmoid-updater plasmoid-updater; do
-            answer="$(bash scripts/crates-io-copy.sh "$crate" "$ver")"
-            case "$answer" in
-              same)
-                echo "${crate} ${ver} is already on crates.io from this commit (${commit}), skipping"
-                ;;
-              "other "*)
-                echo "::error::${crate} ${ver} is already on crates.io but was packed from ${answer#other }, not from this tag's ${commit}; crates.io versions are immutable, so this tag cannot publish it: bump to a new version (delete the GitHub release and the tag, then release the next version)" >&2
-                exit 1
-                ;;
-              *)
-                if [[ "$answer" == unknown* ]]; then
-                  echo "${crate} ${ver}: ${answer}; the publish's duplicate refusal decides"
-                fi
-                cargo publish --locked -p "$crate"
-                ;;
-            esac
+            if cargo publish --locked --no-verify -p "$crate" 2>&1 | tee "$log"; then
+              continue
+            fi
+            if grep -Fq -e 'already exists on crates.io index' -e 'is already uploaded' -- "$log"; then
+              echo "${crate} ${ver} is already on crates.io; counting it as published"
+            else
+              exit 1
+            fi
           done

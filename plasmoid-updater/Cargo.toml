@@ -10,6 +10,7 @@ keywords = ["kde", "plasma", "widgets", "updater", "cli"]
 categories = ["command-line-utilities"]
 homepage = "https://github.com/uwuclxdy/plasmoid-updater"
 readme = "../README.md"
+publish = true
 
 [[bin]]
 name = "plasmoid-updater"

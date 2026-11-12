@@ -11,6 +11,7 @@ categories = ["development-tools"]
 readme = "README.md"
 homepage = "https://github.com/uwuclxdy/plasmoid-updater"
 documentation = "https://docs.rs/libplasmoid-updater"
+publish = true
 
 [features]
 default = ["cli", "inhibit"]
