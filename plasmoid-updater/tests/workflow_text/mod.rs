@@ -19,6 +19,22 @@ pub fn workflow(name: &str) -> String {
     fs::read_to_string(repo_root().join(".github/workflows").join(name)).unwrap()
 }
 
+/// The lines of the job named `job` in a workflow's text: from its `  <job>:`
+/// header to the next two-space-indented key.
+pub(crate) fn job_lines<'a>(yaml: &'a str, job: &str) -> Vec<&'a str> {
+    let header = format!("  {job}:");
+    let mut lines = yaml.lines().skip_while(|line| *line != header);
+    assert!(lines.next().is_some(), "no job named {job:?}");
+    lines
+        .take_while(|line| {
+            let key = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && !line.trim_start().starts_with('#');
+            !key
+        })
+        .collect()
+}
+
 /// What follows the `-` of a line that opens a sequence entry, the line's
 /// indentation already cut: the dash stands alone or before a blank, so a
 /// script's `--flag` opens none.

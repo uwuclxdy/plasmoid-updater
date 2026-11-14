@@ -5,53 +5,17 @@
 
 mod workflow_text;
 
-use workflow_text::{CRATES_STEP, UPLOAD_STEP, entry, step_script, workflow};
+use std::fs;
+
+use workflow_text::{CRATES_STEP, UPLOAD_STEP, entry, job_lines, repo_root, step_script, workflow};
 
 const CRATES_JOB: &str = "crates";
-
-/// The lines of the job named `job` in a workflow's text: from its `  <job>:`
-/// header to the next two-space-indented key.
-fn job_lines<'a>(yaml: &'a str, job: &str) -> Vec<&'a str> {
-    let header = format!("  {job}:");
-    let mut lines = yaml.lines().skip_while(|line| *line != header);
-    assert!(lines.next().is_some(), "no job named {job:?}");
-    lines
-        .take_while(|line| {
-            let key = line.starts_with("  ")
-                && !line.starts_with("   ")
-                && !line.trim_start().starts_with('#');
-            !key
-        })
-        .collect()
-}
 
 /// The value of a job-level `key:` line.
 fn job_key(job: &[&str], key: &str) -> Option<String> {
     let prefix = format!("    {key}: ");
     job.iter()
         .find_map(|line| line.strip_prefix(prefix.as_str()).map(str::to_string))
-}
-
-/// The toolchain the job's `dtolnay/rust-toolchain` step is pinned to (None
-/// when it floats on the channel) and the version its
-/// `cargo-semver-checks@<version>` install is pinned to.
-fn semver_pins(job: &[&str]) -> (Option<String>, Option<String>) {
-    let toolchain = job
-        .iter()
-        .position(|line| line.trim().starts_with("- uses: dtolnay/rust-toolchain@"))
-        .and_then(|start| {
-            job[start + 1..]
-                .iter()
-                .take_while(|line| entry(line.trim_start()).is_none())
-                .find_map(|line| line.trim().strip_prefix("toolchain: "))
-                .map(|value| value.trim_matches('"').to_string())
-        });
-    let tool = job.iter().find_map(|line| {
-        line.trim()
-            .strip_prefix("tool: cargo-semver-checks@")
-            .map(str::to_string)
-    });
-    (toolchain, tool)
 }
 
 /// The `cargo publish` lines of a script that skip the committed lockfile
@@ -324,27 +288,16 @@ fn the_step_extractor_reads_the_run_block_of_the_named_step() {
 }
 
 #[test]
-fn the_job_readers_find_the_pins_and_keys_they_are_given() {
-    let yaml = "jobs:\n  a:\n    if: x\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: \"1.2.3\"\n      - uses: taiki-e/install-action@v2\n        with:\n          tool: cargo-semver-checks@4.5.6\n  # note\n  b:\n    if: y\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n      - uses: other\n        with:\n          toolchain: \"9.9.9\"\n";
+fn the_job_readers_find_the_keys_they_are_given() {
+    let yaml = "jobs:\n  a:\n  # note\n    if: x\n  b:\n    if: y\n";
     let a = job_lines(yaml, "a");
-    assert_eq!(job_key(&a, "if").as_deref(), Some("x"));
     assert_eq!(
-        semver_pins(&a),
-        (Some("1.2.3".to_string()), Some("4.5.6".to_string()))
+        job_key(&a, "if").as_deref(),
+        Some("x"),
+        "a comment line inside a job does not end it"
     );
     let b = job_lines(yaml, "b");
     assert_eq!(job_key(&b, "if").as_deref(), Some("y"));
-    assert_eq!(
-        semver_pins(&b),
-        (None, None),
-        "a floating toolchain step must not borrow the next step's pin"
-    );
-    let bare = "jobs:\n  a:\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n      -\n        uses: other\n        with:\n          toolchain: \"9.9.9\"\n";
-    assert_eq!(
-        semver_pins(&job_lines(bare, "a")).0,
-        None,
-        "a dash alone on its line opens the next step too"
-    );
 }
 
 #[test]
@@ -519,18 +472,39 @@ fn the_write_grant_count_sees_a_grant_however_it_is_quoted() {
 }
 
 #[test]
-fn the_ci_semver_job_pins_the_toolchain_beside_the_tool() {
+fn the_ci_workflow_runs_the_gate_jobs() {
     let ci = workflow("ci.yml");
-    let (toolchain, tool) = semver_pins(&job_lines(&ci, "semver"));
-    let toolchain = toolchain.expect("the semver job builds rustdoc on a floating toolchain");
-    assert!(
-        toolchain.split('.').count() == 3
-            && toolchain
-                .split('.')
-                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
-        "the toolchain must be one explicit X.Y.Z, got {toolchain:?}"
+    assert_eq!(
+        job_names(&ci),
+        ["fmt", "check", "msrv", "deny", "audit", "coverage"],
+        "the CI job list is pinned: a job added or removed in ci.yml is added or removed here"
     );
-    assert!(tool.is_some(), "the semver job lost its tool pin");
+}
+
+/// Every file in the workflows directory is read, so the tool cannot return
+/// through another workflow or another job of one.
+#[test]
+fn no_workflow_names_semver_checks() {
+    let dir = repo_root().join(".github/workflows");
+    let mut names = Vec::new();
+    for path in fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+    {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("semver-checks"),
+            "{name} still names semver-checks"
+        );
+        names.push(name);
+    }
+    for pinned in ["ci.yml", "release.yml"] {
+        assert!(
+            names.iter().any(|name| name.as_str() == pinned),
+            "the workflows directory holds {pinned}: {names:?}"
+        );
+    }
 }
 
 /// The `with:` options of the job's `actions/checkout` step.
@@ -549,7 +523,13 @@ fn checkout_options<'a>(job: &[&'a str]) -> Vec<&'a str> {
 }
 
 #[test]
-fn the_ci_semver_job_fetches_the_whole_history_and_its_tags() {
+fn the_checkout_reader_keeps_to_its_own_step() {
+    let own = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v1\n        with:\n          fetch-depth: 0\n      - uses: other\n";
+    assert_eq!(
+        checkout_options(&job_lines(own, "a")),
+        ["with:", "fetch-depth: 0"],
+        "a checkout's own options are read"
+    );
     for next in ["- uses: other", "-\n        uses: other"] {
         let borrowed = format!(
             "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v1\n      {next}\n        with:\n          fetch-depth: 0\n"
@@ -559,12 +539,6 @@ fn the_ci_semver_job_fetches_the_whole_history_and_its_tags() {
             "a checkout must not borrow the next step's options: {next:?}"
         );
     }
-    let ci = workflow("ci.yml");
-    let options = checkout_options(&job_lines(&ci, "semver"));
-    assert!(
-        options.contains(&"fetch-depth: 0"),
-        "a shallow checkout holds no tag, so the job would warn and pass on every run: {options:?}"
-    );
 }
 
 /// The lines nested under the job's own `permissions:` key, blank and
