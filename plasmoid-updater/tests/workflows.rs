@@ -323,22 +323,25 @@ fn validate_refuses_a_tag_that_differs_only_in_its_prerelease_part() {
 
 #[test]
 fn validate_runs_only_the_tag_format_and_the_tag_version_checks() {
-    let validate = job_lines(&workflow("release.yml"), "validate").join("\n");
-    assert!(
-        !validate.contains("curl"),
-        "validate still names \"curl\":\n{validate}"
-    );
-    let lines: Vec<&str> = validate.lines().map(str::trim).collect();
+    let yaml = workflow("release.yml");
+    let validate = job_lines(&yaml, "validate");
+    let curl: Vec<&str> = validate
+        .iter()
+        .filter(|line| line.contains("curl"))
+        .copied()
+        .collect();
+    assert!(curl.is_empty(), "validate names curl: {curl:?}");
+    let lines: Vec<&str> = validate.iter().copied().map(str::trim).collect();
     let names: Vec<&str> = lines
         .iter()
         .filter_map(|line| line.strip_prefix("- name: "))
         .collect();
-    assert_eq!(names, [TAG_FORMAT_STEP, TAG_MANIFEST_STEP], "{validate}");
+    assert_eq!(names, [TAG_FORMAT_STEP, TAG_MANIFEST_STEP], "{validate:?}");
     let scripts = lines
         .iter()
         .filter(|line| line.starts_with("run:") || line.starts_with("- run:"))
         .count();
-    assert_eq!(scripts, 2, "a script beside the two checks:\n{validate}");
+    assert_eq!(scripts, 2, "a script beside the two checks:\n{validate:?}");
     let actions: Vec<&str> = lines
         .iter()
         .filter(|line| line.starts_with("uses:") || line.starts_with("- uses:"))
@@ -348,7 +351,7 @@ fn validate_runs_only_the_tag_format_and_the_tag_version_checks() {
     assert_eq!(
         actions,
         ["actions/checkout", "dtolnay/rust-toolchain"],
-        "{validate}"
+        "{validate:?}"
     );
 }
 

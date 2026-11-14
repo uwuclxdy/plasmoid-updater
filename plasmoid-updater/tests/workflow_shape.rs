@@ -477,25 +477,26 @@ fn the_ci_workflow_runs_the_gate_jobs() {
     assert_eq!(
         job_names(&ci),
         ["fmt", "check", "msrv", "deny", "audit", "coverage"],
-        "the CI job list is pinned: a job added or removed in ci.yml is added or removed here"
+        "ci.yml runs exactly these gate jobs: a removed one drops its check, and a new one is read for what it runs before it is listed here"
     );
 }
 
-/// Every file in the workflows directory is read, so the tool cannot return
-/// through another workflow or another job of one.
+/// Walks the workflows directory instead of naming files, so a workflow added
+/// later is read too; the two pinned names prove the walk found the directory.
 #[test]
 fn no_workflow_names_semver_checks() {
     let dir = repo_root().join(".github/workflows");
     let mut names = Vec::new();
     for path in fs::read_dir(&dir)
         .unwrap()
-        .map(|entry| entry.unwrap().path())
+        .map(|file| file.unwrap().path())
+        .filter(|path| path.is_file())
     {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let text = fs::read_to_string(&path).unwrap();
         assert!(
             !text.contains("semver-checks"),
-            "{name} still names semver-checks"
+            "{name} names semver-checks"
         );
         names.push(name);
     }
