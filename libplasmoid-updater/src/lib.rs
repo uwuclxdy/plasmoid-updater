@@ -237,7 +237,7 @@ impl CheckResult {
 ///
 /// Runs the full pipeline: scan installed components, check the store, apply
 /// [`Config`]'s exclusions (the same single filtering [`check`] does), then
-/// download and install the rest on a thread pool. The names of excluded
+/// download the rest on a thread pool and install them one at a time. The names of excluded
 /// components and of components the check could not resolve land in
 /// [`UpdateResult::skipped`]; a component whose entry offers no download link
 /// for its version is a [`FailureKind::NoMatchingDownload`] row in

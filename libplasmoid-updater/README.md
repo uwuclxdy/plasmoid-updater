@@ -17,7 +17,7 @@ Runtime dependencies:
 ## Features
 
 - **Component Discovery** – Detects installed Plasmoids and other Plasma components
-- **Multithreaded** update checking and installation via Rayon
+- **Parallel** update checks and downloads; installs run one at a time
 - **Automatic Backups** with rollback on failure, kept under `$XDG_CACHE_HOME/plasmoid-updater/backups/` for user components and `/var/lib/plasmoid-updater/backups/` (root-owned) for `--system` ones (the 5 most recent per component type are kept)
 - **Registry Integration** – Maintains KNewStuff registry compatibility
 - **Sleep Inhibition** – Prevents system sleep during installs (logind DBus or systemd-inhibit)
@@ -59,7 +59,7 @@ Built with a builder table via `Config::new()`:
 | `with_excluded_patterns(Vec<String>)` | skip packages whose name or dir matches these regexes (invalid ones are dropped with a warning) |
 | `with_widgets_id_table(HashMap<String, u64>)` | override fallback dir-to-content-ID mapping |
 | `with_api_url(impl Into<String>)` | OCS base URL every store request targets (default `https://api.kde-look.org/ocs/v1`) |
-| `with_threads(usize)` | max parallel install threads (default: logical CPU count) |
+| `with_threads(usize)` | max components in flight at once (default: logical CPU count); installs run one at a time |
 | `with_skip_plasma_detection(bool)` | skip KDE environment check (for CI/testing) |
 | `with_inhibit_idle(bool)` | inhibit system sleep during installs (default: `true`) |
 | `excludes(&InstalledComponent) -> bool` | whether the exclusion rules above exclude a component, by the same rules `check()` and `update()` apply; an invalid pattern matches nothing and logs no warning |

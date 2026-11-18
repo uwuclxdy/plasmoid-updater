@@ -115,7 +115,8 @@ pub enum Event {
 /// impl Reporter for Quiet {}
 /// ```
 ///
-/// `Sync` because installs run on a rayon pool.
+/// `Sync` because components download in parallel on a rayon pool and report
+/// from its workers.
 pub trait Reporter: Sync {
     /// Called once per progress event, in emission order. Never blocks the
     /// run beyond the implementation itself.

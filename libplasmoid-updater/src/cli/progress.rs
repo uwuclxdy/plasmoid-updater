@@ -480,8 +480,8 @@ impl Inner {
 ///
 /// The line goes above the reporter that is live, and the reporter redraws
 /// its rows below it. With no reporter live the line is written plainly on
-/// stderr. Safe to call from any thread, which matters because installs run on
-/// a thread pool.
+/// stderr. Safe to call from any thread, which matters because components
+/// download in parallel on a thread pool and log from its workers.
 ///
 /// # Examples
 ///

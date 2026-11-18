@@ -193,9 +193,14 @@ pub(crate) fn apply_exclusions(
     result
 }
 
-/// Installs `updates` (already exclusion-filtered) on a rayon pool, emitting
-/// progress through `reporter` and collecting per-component outcomes into an
-/// [`UpdateResult`].
+/// Installs `updates` (already exclusion-filtered) on a rayon pool of
+/// [`Config::threads`] workers, emitting progress through `reporter` and
+/// collecting per-component outcomes into an [`UpdateResult`].
+///
+/// The workers download in parallel; each install, with its backup, registry
+/// write, version check and the restore a failure needs, waits for the run's
+/// one install slot, so installs run one at a time, each starting once its
+/// download has finished and the slot is free.
 pub(crate) fn install_updates(
     updates: &[AvailableUpdate],
     api_client: &ApiClient,
@@ -209,15 +214,16 @@ pub(crate) fn install_updates(
         installer::InhibitGuard::None
     };
 
-    let mut pool_builder = rayon::ThreadPoolBuilder::new();
-    if let Some(thread_count) = config.threads {
-        pool_builder = pool_builder.num_threads(thread_count);
-    }
-    let pool = pool_builder
+    let pool = config
+        .threads
+        .map_or_else(rayon::ThreadPoolBuilder::new, |thread_count| {
+            rayon::ThreadPoolBuilder::new().num_threads(thread_count)
+        })
         .build()
         .map_err(|e| Error::Config(format!("failed to build install thread pool: {e}")))?;
 
     let backups = installer::BackupLedger::default();
+    let install_slot = installer::InstallSlot::new();
     let outcomes: Vec<(&AvailableUpdate, Result<InstallOutcome, ComponentFailure>)> =
         pool.install(|| {
             updates
@@ -228,6 +234,7 @@ pub(crate) fn install_updates(
                         api_client.http_client(),
                         reporter,
                         &backups,
+                        &install_slot,
                     );
                     report_outcome(&update.installed, &outcome, reporter);
                     (update, outcome)
@@ -270,7 +277,7 @@ pub(crate) fn install_updates(
 }
 
 /// Emits the per-component [`Event::Installed`] / [`Event::Failed`] for a
-/// finished component. Called inside the install pool, as each component
+/// finished component. Called on the update pool's worker, as each component
 /// finishes, so progress is not held back by slower siblings.
 fn report_outcome(
     component: &InstalledComponent,

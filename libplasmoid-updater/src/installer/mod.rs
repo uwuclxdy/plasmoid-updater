@@ -16,6 +16,7 @@ use std::{
     fs,
     io::Read as _,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 use crate::{
@@ -90,41 +91,99 @@ pub(crate) struct InstallOutcome {
     pub actual_version: Option<String>,
 }
 
+/// The run's one install slot.
+///
+/// The backup, install, registry write, version check and restore steps take
+/// a reference to the guard [`Self::acquire`] hands out, so calling one of
+/// them without a live guard does not compile; the functions they delegate to
+/// take none.
+pub(crate) struct InstallSlot {
+    held: Mutex<()>,
+}
+
+impl InstallSlot {
+    pub(crate) fn new() -> Self {
+        Self {
+            held: Mutex::new(()),
+        }
+    }
+
+    /// Takes the slot for as long as the returned guard lives.
+    ///
+    /// The slot guards no data, only the order of installs, so a panic in
+    /// another component's install leaves nothing for this one to distrust.
+    ///
+    /// No rayon call may run while the guard lives: the pool's worker that
+    /// holds it would steal another component's job while it waits, and that
+    /// job's `acquire` on the same thread never returns.
+    pub(crate) fn acquire(&self) -> InstallSlotGuard<'_> {
+        InstallSlotGuard {
+            _held: self.held.lock().unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+}
+
+/// Holds the run's install slot for as long as it lives.
+///
+/// The steps [`InstallSlot`] names take a reference to this guard, so calling
+/// one of them after the guard is dropped does not compile.
+pub(crate) struct InstallSlotGuard<'a> {
+    _held: MutexGuard<'a, ()>,
+}
+
 /// Updates a single component using the provided HTTP client.
 ///
-/// Emits [`Event::Downloading`](crate::Event::Downloading) through `reporter`
-/// as the download progresses. On failure the original component is restored
-/// from its backup unless the failed step left a process that may still write
-/// that tree; if the restore itself fails, the returned
-/// [`ComponentFailure`] carries kind
-/// [`FailureKind::RestoreFailed`] and both messages. `backups` records the
-/// backup's directory for the run's retention, which runs once the pool has
-/// finished every component.
+/// The download runs first, emitting
+/// [`Event::Downloading`](crate::Event::Downloading) through `reporter` as it
+/// progresses, and needs nothing from the other components. The backup, the
+/// install, the registry write and the version check then run while holding
+/// the [`InstallSlot`]'s guard, one component at a time across the run:
+/// components of one type share a `.knsregistry` file, and each install reads,
+/// edits and rewrites it. The backup and the install also write into
+/// directories other components share: the backup timestamp directory every
+/// type backed up in the same second writes into, and the `/usr/share/icons`
+/// tree that system-wide icon and cursor themes both install into. A failed
+/// download leaves the component untouched, so it takes no backup.
+///
+/// When the install fails, the original component is restored from its backup,
+/// still under the guard, unless the failed step left a process that may still
+/// write that tree; if the restore itself fails, the returned
+/// [`ComponentFailure`] carries kind [`FailureKind::RestoreFailed`] and both
+/// messages. `backups` records the backup's directory for the run's retention,
+/// which runs once the pool has finished every component.
 pub(crate) fn update_component(
     update: &AvailableUpdate,
     client: &reqwest::blocking::Client,
     reporter: &dyn Reporter,
     backups: &BackupLedger,
+    install_slot: &InstallSlot,
 ) -> Result<InstallOutcome, ComponentFailure> {
     validate_selected_update(update)?;
     let component = &update.installed;
     let temp = download::create_temp_dir()?;
+    let downloaded = download::download_package(update, client, temp.path(), reporter)?;
 
-    let backup_path = create_backup(component, backups)?;
+    let slot = install_slot.acquire();
+    let backup_path = backup_component(component, backups, &slot)?;
 
-    match perform_installation(update, client, temp.path(), reporter) {
+    match execute_installation(
+        &downloaded,
+        component,
+        &update.latest_version,
+        temp.path(),
+        &slot,
+    ) {
         Ok(()) => {
-            post_install_tasks(update)?;
-            Ok(verify_installed_version(update))
+            post_install_tasks(update, &slot)?;
+            Ok(verify_installed_version(update, &slot))
         }
         Err(e) => {
-            if let Some(ref backup) = backup_path {
-                handle_installation_failure(backup, component, &e)?;
+            if let Some(backup) = &backup_path {
+                handle_installation_failure(backup, component, &e, &slot)?;
             }
             Err(e)
         }
     }
-    // temp is dropped here, auto-cleanup
 }
 
 /// Refuses a selected update with no download URL before a backup or a
@@ -140,35 +199,12 @@ fn validate_selected_update(update: &AvailableUpdate) -> Result<(), ComponentFai
     Ok(())
 }
 
-fn create_backup(
-    component: &InstalledComponent,
-    backups: &BackupLedger,
-) -> Result<Option<PathBuf>, ComponentFailure> {
-    backup_component(component, backups)
-}
-
-fn perform_installation(
-    update: &AvailableUpdate,
-    client: &reqwest::blocking::Client,
-    temp_path: &Path,
-    reporter: &dyn Reporter,
-) -> Result<(), ComponentFailure> {
-    let component = &update.installed;
-    let downloaded_path = download::download_package(update, client, temp_path, reporter)?;
-
-    execute_installation(
-        &downloaded_path,
-        component,
-        &update.latest_version,
-        temp_path,
-    )
-}
-
 fn execute_installation(
     downloaded_path: &Path,
     component: &InstalledComponent,
     new_version: &str,
     temp_path: &Path,
+    _slot: &InstallSlotGuard<'_>,
 ) -> Result<(), ComponentFailure> {
     let is_single_file_type = matches!(
         component.component_type,
@@ -265,7 +301,10 @@ fn install_from_archive(
     result
 }
 
-fn post_install_tasks(update: &AvailableUpdate) -> Result<(), ComponentFailure> {
+fn post_install_tasks(
+    update: &AvailableUpdate,
+    _slot: &InstallSlotGuard<'_>,
+) -> Result<(), ComponentFailure> {
     let component = &update.installed;
 
     let installed_json = component.path.join("metadata.json");
@@ -293,7 +332,10 @@ fn post_install_tasks(update: &AvailableUpdate) -> Result<(), ComponentFailure> 
     })
 }
 
-fn verify_installed_version(update: &AvailableUpdate) -> InstallOutcome {
+fn verify_installed_version(
+    update: &AvailableUpdate,
+    _slot: &InstallSlotGuard<'_>,
+) -> InstallOutcome {
     verify_installed_version_trusting(
         update,
         crate::paths::system_data_dirs(update.installed.is_system),
@@ -406,6 +448,7 @@ fn handle_installation_failure(
     backup_path: &Path,
     component: &InstalledComponent,
     original_error: &ComponentFailure,
+    _slot: &InstallSlotGuard<'_>,
 ) -> Result<(), ComponentFailure> {
     if original_error.process_may_still_run {
         log::error!(
@@ -473,9 +516,11 @@ mod tests {
         std::fs::write(target.join("occupant"), b"new").unwrap();
         let component = color_scheme(&target);
         let install_failure = ComponentFailure::new(FailureKind::Install, "install broke");
+        let slot = InstallSlot::new();
 
         let lines = captured_logs_while(|| {
-            let outcome = handle_installation_failure(&backup, &component, &install_failure);
+            let outcome =
+                handle_installation_failure(&backup, &component, &install_failure, &slot.acquire());
             assert!(outcome.is_err(), "the restore was expected to fail");
         });
 
@@ -512,9 +557,12 @@ mod tests {
             "kpackagetool6 timed out after 300 s and is still running",
         );
         failure.process_may_still_run = true;
+        let slot = InstallSlot::new();
 
         let lines = captured_logs_while(|| {
-            let refusal = handle_installation_failure(&backup, &component, &failure).unwrap_err();
+            let refusal =
+                handle_installation_failure(&backup, &component, &failure, &slot.acquire())
+                    .unwrap_err();
             assert_eq!(refusal.kind, FailureKind::Install);
             assert!(
                 refusal.message.contains(&backup.display().to_string()),
@@ -578,7 +626,15 @@ mod tests {
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
-        execute_installation(&archive, &color_scheme(&dest), "2.0", &temp).unwrap();
+        let slot = InstallSlot::new();
+        execute_installation(
+            &archive,
+            &color_scheme(&dest),
+            "2.0",
+            &temp,
+            &slot.acquire(),
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&dest).unwrap(),
@@ -598,7 +654,14 @@ mod tests {
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
-        let result = execute_installation(&archive, &color_scheme(&dest), "2.0", &temp);
+        let slot = InstallSlot::new();
+        let result = execute_installation(
+            &archive,
+            &color_scheme(&dest),
+            "2.0",
+            &temp,
+            &slot.acquire(),
+        );
 
         let failure = result.expect_err("a corrupt archive installed");
         assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
@@ -707,7 +770,11 @@ mod tests {
             let user_path = root.join("installed/FakeScheme.colors");
             std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
             write_scheme_registry(&data.join("knewstuff3"), "2.0", &user_path);
-            let outcome = verify_installed_version(&user_scheme_update(user_path, "2.0", 42));
+            let slot = InstallSlot::new();
+            let outcome = verify_installed_version(
+                &user_scheme_update(user_path, "2.0", 42),
+                &slot.acquire(),
+            );
             assert!(
                 outcome.verified,
                 "the user registry under XDG_DATA_HOME was not read: {:?}",
@@ -715,7 +782,10 @@ mod tests {
             );
 
             let system_path = PathBuf::from("/usr/share/color-schemes/FakeScheme.colors");
-            let outcome = verify_installed_version(&system_scheme_update(system_path, "2.0", 42));
+            let outcome = verify_installed_version(
+                &system_scheme_update(system_path, "2.0", 42),
+                &slot.acquire(),
+            );
             assert!(!outcome.verified);
             let logs = crate::testutil::logs::captured_logs();
             assert!(

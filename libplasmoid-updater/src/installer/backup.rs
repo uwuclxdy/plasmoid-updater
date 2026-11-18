@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::ComponentFailure;
+use super::{ComponentFailure, InstallSlotGuard};
 use crate::{FailureKind, installer::privilege, types::InstalledComponent};
 
 const MAX_BACKUPS_PER_TYPE: usize = 5;
@@ -137,6 +137,7 @@ fn backup_time(name: &str) -> Option<jiff::civil::DateTime> {
 pub(crate) fn backup_component(
     component: &InstalledComponent,
     backups: &BackupLedger,
+    _slot: &InstallSlotGuard<'_>,
 ) -> Result<Option<PathBuf>, ComponentFailure> {
     backup_component_at(
         component,

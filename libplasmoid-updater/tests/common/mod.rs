@@ -7,7 +7,10 @@
 //! then re-runs its own test binary filtered to that one test with the sandbox
 //! environment set; the child calls the library and asserts on its results.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "test harness outside #[test] fns: a panic fails the test"
+)]
 // Every test crate compiles this module on its own and uses a different part.
 #![allow(dead_code)]
 
@@ -15,8 +18,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 pub const SCHEME_ID: u64 = 999_001;
 pub const SCHEME_NAME: &str = "Fake Scheme";
@@ -255,6 +259,10 @@ pub struct ExtraEntry {
 }
 
 /// What the fake store advertises for the fake color scheme.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent fake-store switch a test sets"
+)]
 pub struct Listing {
     pub version: &'static str,
     /// MD5 the store advertises; `None` serves the real archive's MD5.
@@ -308,7 +316,14 @@ pub struct Listing {
     pub widget_package_link: bool,
     /// Store entries served beside the color scheme, each with its own archive.
     pub extras: Vec<ExtraEntry>,
+    /// When non-zero, each `extras` download is held until this many of them
+    /// have been requested, or [`EXTRAS_BARRIER_TIMEOUT`] has passed; then
+    /// [`FakeStore::extras_barrier_timed_out`] says which happened.
+    pub extras_download_barrier: usize,
 }
+
+/// How long a held `extras` download waits for the rest of its barrier.
+pub(crate) const EXTRAS_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Default for Listing {
     fn default() -> Self {
@@ -334,6 +349,7 @@ impl Default for Listing {
             widget_metadata_symlink: false,
             widget_package_link: false,
             extras: Vec::new(),
+            extras_download_barrier: 0,
         }
     }
 }
@@ -424,6 +440,10 @@ impl FakeStore {
             download_stalls: listing.download_stalls,
             total_items: listing.total_items,
             catalog_requests: AtomicUsize::new(0),
+            extras_barrier: listing.extras_download_barrier,
+            extras_arrived: Mutex::new(0),
+            extras_released: Condvar::new(),
+            extras_barrier_timed_out: AtomicBool::new(false),
         });
         let shared = Arc::clone(&state);
         std::thread::spawn(move || {
@@ -446,6 +466,13 @@ impl FakeStore {
     /// How many catalog listing requests the store has answered.
     pub fn catalog_requests(&self) -> usize {
         self.served.catalog_requests.load(Ordering::SeqCst)
+    }
+
+    /// Whether any held `extras` download gave up waiting for the rest of
+    /// [`Listing::extras_download_barrier`], so the downloads did not all run
+    /// at once.
+    pub(crate) fn extras_barrier_timed_out(&self) -> bool {
+        self.served.extras_barrier_timed_out.load(Ordering::SeqCst)
     }
 }
 
@@ -562,6 +589,10 @@ struct ServedExtra {
     archive: Vec<u8>,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent fake-store switch the server reads per request"
+)]
 struct Served {
     entry: String,
     widget: Option<(u16, String)>,
@@ -579,6 +610,35 @@ struct Served {
     download_stalls: bool,
     total_items: TotalItems,
     catalog_requests: AtomicUsize,
+    extras_barrier: usize,
+    extras_arrived: Mutex<usize>,
+    extras_released: Condvar,
+    extras_barrier_timed_out: AtomicBool,
+}
+
+impl Served {
+    /// Holds an `extras` download until `extras_barrier` of them have
+    /// arrived, or records that it gave up after [`EXTRAS_BARRIER_TIMEOUT`].
+    fn wait_for_extras_barrier(&self) {
+        if self.extras_barrier == 0 {
+            return;
+        }
+        let mut arrived = self.extras_arrived.lock().unwrap();
+        *arrived += 1;
+        if *arrived >= self.extras_barrier {
+            self.extras_released.notify_all();
+            return;
+        }
+        let (_arrived, wait) = self
+            .extras_released
+            .wait_timeout_while(arrived, EXTRAS_BARRIER_TIMEOUT, |arrived| {
+                *arrived < self.extras_barrier
+            })
+            .unwrap();
+        if wait.timed_out() {
+            self.extras_barrier_timed_out.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 fn serve(mut stream: TcpStream, served: &Served) {
@@ -607,6 +667,7 @@ fn serve(mut stream: TcpStream, served: &Served) {
         .iter()
         .find(|extra| target == format!("/dl/extra-{}.tar.gz", extra.id))
     {
+        served.wait_for_extras_barrier();
         ("200 OK", extra.archive.clone())
     } else if target.starts_with("/dl/") {
         if served.download_stalls {

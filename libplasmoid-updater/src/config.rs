@@ -108,7 +108,14 @@ pub struct Config {
     /// a local fake store with [`Config::with_api_url`].
     pub api_url: String,
 
-    /// Maximum number of parallel installation threads.
+    /// Maximum number of components in flight at once: downloading, waiting for
+    /// the install slot, or installing.
+    ///
+    /// Installs run one at a time whatever this is: each component's backup,
+    /// install, registry write and version check wait for the one before to
+    /// finish, and a failed install's restore runs before the next install
+    /// starts. A tool that outlives its timeout kill keeps running beside the
+    /// next install.
     ///
     /// `None` (default) uses the number of logical CPU threads available.
     /// `Some(n)` pins the pool to exactly `n` threads.
@@ -313,11 +320,12 @@ impl Config {
         table
     }
 
-    /// Sets the maximum number of parallel installation threads.
+    /// Sets the maximum number of components in flight at once.
     ///
-    /// By default (`None`), the library uses the number of logical CPUs.
-    /// Setting this to a specific value pins the thread pool to exactly
-    /// that many threads.
+    /// Installs run one at a time whatever this is; see
+    /// [`threads`](Self::threads). By default (`None`), the library uses the
+    /// number of logical CPUs. Setting this to a specific value pins the
+    /// thread pool to exactly that many threads.
     ///
     /// # Example
     ///

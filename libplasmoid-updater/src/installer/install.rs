@@ -2351,7 +2351,7 @@ exit 0
         std::fs::write(&path, r#"{"KPlugin": "not an object"}"#).unwrap();
 
         // Either outcome is fine; a panic, which would unwind through the
-        // install pool and kill the whole run, is not.
+        // update pool and kill the whole run, is not.
         let _ = patch_metadata(&path, ComponentType::PlasmaWidget, "2.0");
     }
 
