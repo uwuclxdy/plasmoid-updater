@@ -135,15 +135,18 @@ pub(crate) struct InstallSlotGuard<'a> {
 ///
 /// The download runs first, emitting
 /// [`Event::Downloading`](crate::Event::Downloading) through `reporter` as it
-/// progresses, and needs nothing from the other components. The backup, the
-/// install, the registry write and the version check then run while holding
-/// the [`InstallSlot`]'s guard, one component at a time across the run:
-/// components of one type share a `.knsregistry` file, and each install reads,
-/// edits and rewrites it. The backup and the install also write into
-/// directories other components share: the backup timestamp directory every
-/// type backed up in the same second writes into, and the `/usr/share/icons`
-/// tree that system-wide icon and cursor themes both install into. A failed
-/// download leaves the component untouched, so it takes no backup.
+/// progresses, then the download is unpacked and checked and what the
+/// component's type installs by is resolved from it; all of that writes only
+/// the component's own temp dir and needs nothing from the other components. A
+/// failure there leaves the component untouched, so it takes no backup and has
+/// nothing restored over it. The backup, the install, the registry write and
+/// the version check then run while holding the [`InstallSlot`]'s guard, one
+/// component at a time across the run: components of one type share a
+/// `.knsregistry` file, and each install reads, edits and rewrites it. The
+/// backup and the install also write into directories other components share:
+/// the backup timestamp directory every type backed up in the same second
+/// writes into, and the `/usr/share/icons` tree that system-wide icon and
+/// cursor themes both install into.
 ///
 /// When the install fails, the original component is restored from its backup,
 /// still under the guard, unless the failed step left a process that may still
@@ -162,17 +165,12 @@ pub(crate) fn update_component(
     let component = &update.installed;
     let temp = download::create_temp_dir()?;
     let downloaded = download::download_package(update, client, temp.path(), reporter)?;
+    let unpacked = unpack_download(&downloaded, component, &update.latest_version, temp.path())?;
 
     let slot = install_slot.acquire();
     let backup_path = backup_component(component, backups, &slot)?;
 
-    match execute_installation(
-        &downloaded,
-        component,
-        &update.latest_version,
-        temp.path(),
-        &slot,
-    ) {
+    match execute_installation(&unpacked, component, &slot) {
         Ok(()) => {
             post_install_tasks(update, &slot)?;
             Ok(verify_installed_version(update, &slot))
@@ -199,13 +197,39 @@ fn validate_selected_update(update: &AvailableUpdate) -> Result<(), ComponentFai
     Ok(())
 }
 
-fn execute_installation(
+/// What a download installs, resolved from the unpacked tree before the
+/// install slot is taken, so a lookup that fails here takes no backup.
+#[derive(Debug)]
+enum Unpacked {
+    /// A single-file component's download that is the component file itself.
+    RawFile(PathBuf),
+    /// The file or directory a direct install copies into the component's path.
+    Direct(install::DirectSource),
+    /// A package without a direct fallback, its metadata patched for the new
+    /// version: `kpackagetool6` installs it, unless its plugin id names another
+    /// directory, which the install copies into place instead.
+    Package(PathBuf),
+    /// The extracted tree of a type that falls back to a direct install when
+    /// `kpackagetool6` fails. Its direct install source stays unresolved,
+    /// because the tool may have written the component by the time the direct
+    /// install runs.
+    Fallback {
+        tree: PathBuf,
+        /// The prepared package root, or the refusal preparing it hit; the
+        /// direct install decides then, and `kpackagetool6` never runs.
+        package: Result<PathBuf, ComponentFailure>,
+    },
+}
+
+/// Decides what the download installs, extracting and checking an archive and
+/// resolving what the component's type installs by, writing only
+/// `temp_path`.
+fn unpack_download(
     downloaded_path: &Path,
     component: &InstalledComponent,
     new_version: &str,
     temp_path: &Path,
-    _slot: &InstallSlotGuard<'_>,
-) -> Result<(), ComponentFailure> {
+) -> Result<Unpacked, ComponentFailure> {
     let is_single_file_type = matches!(
         component.component_type,
         ComponentType::ColorScheme | ComponentType::Wallpaper,
@@ -213,14 +237,111 @@ fn execute_installation(
     // A raw file is the component itself only when the download carries no
     // archive signature at all; an archive that fails to extract is an extract
     // failure, never a component file.
-    let is_raw_file = is_single_file_type && !has_archive_magic(downloaded_path);
+    if is_single_file_type && !has_archive_magic(downloaded_path) {
+        return Ok(Unpacked::RawFile(downloaded_path.to_path_buf()));
+    }
 
-    if is_raw_file {
-        let result = install::install_raw_file(downloaded_path, component);
-        let _ = fs::remove_file(downloaded_path);
-        result
-    } else {
-        install_from_archive(downloaded_path, component, new_version, temp_path)
+    let extract_dir = temp_path.join(format!("extract-{}", component.directory_name));
+    if extract_dir.exists() {
+        fs::remove_dir_all(&extract_dir)
+            .map_err(|e| ComponentFailure::io(FailureKind::Extract, &extract_dir, e))?;
+    }
+    let extracted = download::extract_archive(downloaded_path, &extract_dir);
+    // The archive is spent either way; removing it now frees its space while
+    // the extracted tree waits for the install slot.
+    if let Err(e) = fs::remove_file(downloaded_path) {
+        log::debug!(
+            target: "cleanup",
+            "failed to remove {}: {e}",
+            downloaded_path.display()
+        );
+    }
+    extracted?;
+
+    // The package must be a regular package of the component the store entry
+    // claims before any install step touches the installed tree: kpackagetool6
+    // follows every symlink in the package and blocks on a FIFO, and a copy
+    // would read whatever a link points at. The package root's own metadata is
+    // named first, so its refusal names the file rather than the link in it.
+    install::verify_extracted_package(&extract_dir)?;
+    install::verify_package_tree(&extract_dir, component.component_type)?;
+    install::verify_package_plugin_id(&extract_dir, component)?;
+    match component.component_type.kpackage_type() {
+        None => Ok(Unpacked::Direct(install::resolve_direct_source(
+            &extract_dir,
+            component,
+        )?)),
+        Some(_) if component.component_type.has_direct_fallback() => {
+            // `kpackagetool6` may write the component before the direct
+            // fallback runs, so a package route that refuses on its own does
+            // not fail the update. A package naming no plugin id is one the
+            // tool never installs, so that route is certain to fail for it
+            // too. When no route can install, the pair refuses here, before a
+            // backup exists.
+            let package = install::prepare_package(&extract_dir, component, new_version);
+            let package_route_refuses = match &package {
+                Err(_) => true,
+                Ok(package) => install::plugin_id(package).is_none(),
+            };
+            if package_route_refuses {
+                install::resolve_direct_source(&extract_dir, component)?;
+            }
+            Ok(Unpacked::Fallback {
+                tree: extract_dir,
+                package,
+            })
+        }
+        Some(_) => Ok(Unpacked::Package(install::prepare_package(
+            &extract_dir,
+            component,
+            new_version,
+        )?)),
+    }
+}
+
+/// Installs what [`unpack_download`] made ready. The run's temp dir, which
+/// holds it, is removed when the update returns.
+fn execute_installation(
+    unpacked: &Unpacked,
+    component: &InstalledComponent,
+    _slot: &InstallSlotGuard<'_>,
+) -> Result<(), ComponentFailure> {
+    match unpacked {
+        Unpacked::RawFile(file) => install::install_raw_file(file, component),
+        Unpacked::Direct(source) => install::install_direct(source, component),
+        Unpacked::Package(package_dir) => install::install_prepared_package(package_dir, component),
+        Unpacked::Fallback { tree, package } => {
+            let installed = match package {
+                Ok(package) => install::install_prepared_package(package, component),
+                Err(refused) => {
+                    log::warn!(
+                        target: "install",
+                        "{:?}: installing its files directly, the package could not be used: {:?}",
+                        component.name,
+                        refused.message,
+                    );
+                    return install::install_direct(
+                        &install::resolve_direct_source(tree, component)?,
+                        component,
+                    );
+                }
+            };
+            match installed {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    log::warn!(
+                        target: "install",
+                        "{:?}: falling back to a direct install: {:?}",
+                        component.name,
+                        e.message,
+                    );
+                    install::install_direct(
+                        &install::resolve_direct_source(tree, component)?,
+                        component,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -247,58 +368,6 @@ fn has_archive_magic(path: &Path) -> bool {
     ) || (n >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd]) // zstd
         || (n >= 6 && magic[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) // xz
         || (n >= 262 && &magic[257..262] == b"ustar") // tar (ustar/gnu)
-}
-
-fn install_from_archive(
-    downloaded_path: &Path,
-    component: &InstalledComponent,
-    new_version: &str,
-    temp_path: &Path,
-) -> Result<(), ComponentFailure> {
-    let extract_dir = temp_path.join(format!("extract-{}", component.directory_name));
-
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir)
-            .map_err(|e| ComponentFailure::io(FailureKind::Extract, &extract_dir, e))?;
-    }
-
-    if let Err(e) = download::extract_archive(downloaded_path, &extract_dir) {
-        let _ = fs::remove_file(downloaded_path);
-        return Err(e);
-    }
-
-    let _ = fs::remove_file(downloaded_path);
-
-    // The package must be a regular package of the component the store entry
-    // claims before any install step touches the installed tree: kpackagetool6
-    // follows every symlink in the package and blocks on a FIFO, and a copy
-    // would read whatever a link points at. The package root's own metadata is
-    // named first, so its refusal names the file rather than the link in it.
-    let result = install::verify_extracted_package(&extract_dir)
-        .and_then(|()| install::verify_package_tree(&extract_dir, component.component_type))
-        .and_then(|()| install::verify_package_plugin_id(&extract_dir, component))
-        .and_then(|()| {
-            if component.component_type.kpackage_type().is_some() {
-                match install::install_via_kpackage(&extract_dir, component, new_version) {
-                    Ok(()) => Ok(()),
-                    Err(e) if component.component_type.has_direct_fallback() => {
-                        log::warn!(
-                            target: "install",
-                            "kpackagetool6 failed for {}, falling back to direct install: {}",
-                            component.name,
-                            e.message,
-                        );
-                        install::install_direct(&extract_dir, component)
-                    }
-                    Err(e) => Err(e),
-                }
-            } else {
-                install::install_direct(&extract_dir, component)
-            }
-        });
-
-    let _ = fs::remove_dir_all(&extract_dir);
-    result
 }
 
 fn post_install_tasks(
@@ -626,15 +695,10 @@ mod tests {
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
+        let component = color_scheme(&dest);
+        let unpacked = unpack_download(&archive, &component, "2.0", &temp).unwrap();
         let slot = InstallSlot::new();
-        execute_installation(
-            &archive,
-            &color_scheme(&dest),
-            "2.0",
-            &temp,
-            &slot.acquire(),
-        )
-        .unwrap();
+        execute_installation(&unpacked, &component, &slot.acquire()).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&dest).unwrap(),
@@ -654,14 +718,7 @@ mod tests {
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
-        let slot = InstallSlot::new();
-        let result = execute_installation(
-            &archive,
-            &color_scheme(&dest),
-            "2.0",
-            &temp,
-            &slot.acquire(),
-        );
+        let result = unpack_download(&archive, &color_scheme(&dest), "2.0", &temp);
 
         let failure = result.expect_err("a corrupt archive installed");
         assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);

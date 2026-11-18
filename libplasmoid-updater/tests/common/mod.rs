@@ -227,6 +227,41 @@ impl Sandbox {
     }
 }
 
+/// Writes one KNewStuff registry file holding one entry; `id` is omitted when
+/// `None`, which leaves the entry out of the id cache.
+pub(crate) fn write_registry(
+    sandbox: &Sandbox,
+    file: &str,
+    category: u16,
+    name: &str,
+    version: &str,
+    installed_file: &str,
+    id: Option<u64>,
+) {
+    let registry = sandbox.data_home().join("knewstuff3").join(file);
+    std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    let id_element = id.map(|id| format!("<id>{id}</id>")).unwrap_or_default();
+    std::fs::write(
+        &registry,
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE khotnewstuff3>
+<hotnewstuffregistry>
+  <stuff category="{category}">
+    <name>{name}</name>
+    <providerid>api.kde-look.org</providerid>
+    <version>{version}</version>
+    <installedfile>{installed_file}</installedfile>
+    {id_element}
+    <status>installed</status>
+  </stuff>
+</hotnewstuffregistry>
+"#
+        ),
+    )
+    .unwrap();
+}
+
 /// A widget entry the fake category listing serves when the query names its
 /// subcategory id.
 #[derive(Clone, Copy)]
@@ -305,6 +340,9 @@ pub struct Listing {
     pub size_kb_override: Option<u64>,
     /// Zero bytes appended to the served color scheme archive.
     pub download_padding: usize,
+    /// When set, the color scheme's download is a `.tar.gz` of these archive
+    /// members, `(relative path, contents)`, in place of the default archive.
+    pub scheme_files: Option<&'static [(&'static str, &'static str)]>,
     /// When set, the widget download is a Plasma widget package whose
     /// `KPlugin.Id` is this value, named and versioned as `widget` says.
     pub widget_package_id: Option<&'static str>,
@@ -314,6 +352,16 @@ pub struct Listing {
     /// When set, the widget package carries a chain of links that each stay
     /// inside the package root on paper but resolve outside it.
     pub widget_package_link: bool,
+    /// When set, the widget download serves these bytes in place of the
+    /// package `widget_package_id` describes.
+    pub(crate) widget_download: Option<&'static [u8]>,
+    /// When set, the widget download is a `.tar.gz` of these archive members,
+    /// `(relative path, contents)`, in place of the package
+    /// `widget_package_id` describes.
+    pub(crate) widget_files: Option<&'static [(&'static str, &'static str)]>,
+    /// The `<downloadmd5sum1>` the widget entry advertises; `None` advertises
+    /// none.
+    pub(crate) widget_md5: Option<&'static str>,
     /// Store entries served beside the color scheme, each with its own archive.
     pub extras: Vec<ExtraEntry>,
     /// When non-zero, each `extras` download is held until this many of them
@@ -345,9 +393,13 @@ impl Default for Listing {
             no_md5: false,
             size_kb_override: None,
             download_padding: 0,
+            scheme_files: None,
             widget_package_id: None,
             widget_metadata_symlink: false,
             widget_package_link: false,
+            widget_download: None,
+            widget_files: None,
+            widget_md5: None,
             extras: Vec::new(),
             extras_download_barrier: 0,
         }
@@ -363,7 +415,9 @@ pub struct FakeStore {
 
 impl FakeStore {
     pub fn start(listing: Listing) -> Self {
-        let mut archive = scheme_archive();
+        let mut archive = listing
+            .scheme_files
+            .map_or_else(scheme_archive, files_archive);
         let size_kb = listing
             .size_kb_override
             .unwrap_or_else(|| archive.len().div_ceil(1024) as u64);
@@ -376,18 +430,20 @@ impl FakeStore {
         } else {
             format!("<downloadmd5sum1>{md5}</downloadmd5sum1>")
         };
-        let widget_archive = listing
-            .widget
-            .zip(listing.widget_package_id)
-            .map(|(widget, id)| {
-                widget_archive(
-                    id,
-                    widget.name,
-                    widget.version,
-                    listing.widget_metadata_symlink,
-                    listing.widget_package_link,
-                )
-            });
+        let widget_archive = listing.widget_download.map(<[u8]>::to_vec).or_else(|| {
+            let widget = listing.widget?;
+            if let Some(files) = listing.widget_files {
+                return Some(files_archive(files));
+            }
+            let id = listing.widget_package_id?;
+            Some(widget_archive(
+                id,
+                widget.name,
+                widget.version,
+                listing.widget_metadata_symlink,
+                listing.widget_package_link,
+            ))
+        });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let host = format!("http://127.0.0.1:{port}");
@@ -402,13 +458,17 @@ impl FakeStore {
             version = listing.version,
             link_version = listing.link_version.unwrap_or(listing.version),
         );
+        let widget_md5_field = listing
+            .widget_md5
+            .map(|md5| format!("<downloadmd5sum1>{md5}</downloadmd5sum1>"))
+            .unwrap_or_default();
         let widget = listing.widget.map(|widget| {
             let entry = format!(
                 "<content details=\"full\"><id>{}</id><name>{}</name>\
                  <version>{}</version><typeid>{}</typeid>\
                  <changed>2026-10-01T00:00:00+00:00</changed>\
                  <downloadlink1>{host}/dl/fake-widget.tar.gz</downloadlink1>\
-                 <download_version1>{}</download_version1></content>",
+                 <download_version1>{}</download_version1>{widget_md5_field}</content>",
                 widget.id, widget.name, widget.version, widget.type_id, widget.version,
             );
             (widget.type_id, entry)

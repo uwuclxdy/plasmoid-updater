@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use common::{
     ExtraEntry, FakeStore, Listing, NEW_CONTENT, NEW_VERSION, OLD_CONTENT, OLD_VERSION, SCHEME_ID,
-    SCHEME_NAME, Sandbox, assert_content,
+    SCHEME_NAME, Sandbox, assert_content, write_registry,
 };
 use libplasmoid_updater::{
     AvailableUpdate, ComponentType, Config, Error, Event, FailureKind, InstalledComponent,
@@ -701,41 +701,6 @@ const WALLPAPER_SIZE_CATEGORY: u16 = 298;
 /// store id the widget must resolve through its registry, not its name.
 const WIDGET_ID: u64 = 999_031;
 
-/// Writes one KNewStuff registry file holding one entry; `id` is omitted when
-/// `None`, which leaves the entry out of the id cache.
-fn write_registry(
-    sandbox: &Sandbox,
-    file: &str,
-    category: u16,
-    name: &str,
-    version: &str,
-    installed_file: &str,
-    id: Option<u64>,
-) {
-    let registry = sandbox.data_home().join("knewstuff3").join(file);
-    std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
-    let id_element = id.map(|id| format!("<id>{id}</id>")).unwrap_or_default();
-    std::fs::write(
-        &registry,
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE khotnewstuff3>
-<hotnewstuffregistry>
-  <stuff category="{category}">
-    <name>{name}</name>
-    <providerid>api.kde-look.org</providerid>
-    <version>{version}</version>
-    <installedfile>{installed_file}</installedfile>
-    {id_element}
-    <status>installed</status>
-  </stuff>
-</hotnewstuffregistry>
-"#
-        ),
-    )
-    .unwrap();
-}
-
 fn cursor_theme_path(sandbox: &Sandbox) -> std::path::PathBuf {
     sandbox.home_dir().join(".icons/Test-cursors")
 }
@@ -1291,6 +1256,236 @@ fn a_plasma_style_and_an_icon_theme_with_one_directory_name_keep_their_own_ids()
         std::fs::read_to_string(style.join("contents/colors")).unwrap(),
         "old-style",
         "the icon theme's archive replaced the plasma style"
+    );
+}
+
+// -- Direct and fallback installs --
+
+const AURORAE_ID: u64 = 999_024;
+const AURORAE_NAME: &str = "Tool Decor";
+const AURORAE_DIR: &str = "ToolDecor";
+/// KDE Store category id for Aurorae window decorations.
+const AURORAE_CATEGORY: u16 = 114;
+const AURORAE_PACKAGE_METADATA: &str =
+    r#"{"KPlugin":{"Name":"Tool Decor","Id":"ToolDecor","Version":"2.0"}}"#;
+
+const GLOBAL_THEME_ID: u64 = 999_026;
+const GLOBAL_THEME_NAME: &str = "Tool Global";
+const GLOBAL_THEME_DIR: &str = "ToolGlobal";
+/// KDE Store category id for global themes.
+const GLOBAL_THEME_CATEGORY: u16 = 722;
+const GLOBAL_THEME_PACKAGE_METADATA: &str =
+    r#"{"KPlugin":{"Name":"Tool Global","Id":"ToolGlobal","Version":"2.0"}}"#;
+
+const TOOL_STYLE_ID: u64 = 999_025;
+const TOOL_STYLE_NAME: &str = "Tool Style";
+const TOOL_STYLE_DIR: &str = "ToolStyle";
+const TOOL_STYLE_PACKAGE_METADATA: &str =
+    r#"{"KPlugin":{"Name":"Tool Style","Id":"ToolStyle","Version":"2.0"}}"#;
+
+/// An Aurorae theme whose archive holds its theme directory: the direct
+/// install resolves the directory from the unpacked tree and copies it in.
+#[test]
+fn an_aurorae_decoration_archive_installs_its_theme_directory() {
+    if let Some(child) = common::child() {
+        let result = update(&config(&child.store_url), &Quiet).unwrap();
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert_eq!(result.succeeded.len(), 1, "{result:?}");
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let decor = sandbox.data_home().join("aurorae/themes").join(AURORAE_DIR);
+    std::fs::create_dir_all(&decor).unwrap();
+    std::fs::write(decor.join("decoration.svg"), "<svg>old</svg>").unwrap();
+    std::fs::write(
+        decor.join("metadata.json"),
+        format!(
+            r#"{{"KPlugin":{{"Name":"{AURORAE_NAME}","Id":"{AURORAE_DIR}","Version":"1.0"}}}}"#
+        ),
+    )
+    .unwrap();
+    write_registry(
+        &sandbox,
+        "aurorae.knsregistry",
+        AURORAE_CATEGORY,
+        AURORAE_NAME,
+        "1.0",
+        &format!("{}/metadata.json", decor.display()),
+        Some(AURORAE_ID),
+    );
+    let store = FakeStore::start(Listing {
+        extras: vec![ExtraEntry {
+            id: AURORAE_ID,
+            name: AURORAE_NAME,
+            type_id: AURORAE_CATEGORY,
+            version: "2.0",
+            files: &[
+                ("ToolDecor/decoration.svg", "<svg>new</svg>"),
+                ("ToolDecor/metadata.json", AURORAE_PACKAGE_METADATA),
+            ],
+        }],
+        ..Listing::default()
+    });
+    sandbox.run_child(
+        "an_aurorae_decoration_archive_installs_its_theme_directory",
+        store.url(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(decor.join("decoration.svg")).unwrap(),
+        "<svg>new</svg>",
+        "the archive's theme directory did not install"
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(decor.join("metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        installed["KPlugin"]["Version"],
+        serde_json::Value::String("2.0".to_string()),
+        "the installed metadata does not name the new version"
+    );
+}
+
+/// A GlobalTheme whose `kpackagetool6` install fails still installs through
+/// the direct fallback, which resolves the theme directory from the package.
+#[test]
+fn a_global_theme_installs_through_the_direct_fallback_when_kpackagetool_fails() {
+    if let Some(child) = common::child() {
+        let result = update(&config(&child.store_url), &Quiet).unwrap();
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert_eq!(result.succeeded.len(), 1, "{result:?}");
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let theme = sandbox
+        .data_home()
+        .join("plasma/look-and-feel")
+        .join(GLOBAL_THEME_DIR);
+    std::fs::create_dir_all(theme.join("contents")).unwrap();
+    std::fs::write(
+        theme.join("metadata.json"),
+        format!(
+            r#"{{"KPlugin":{{"Name":"{GLOBAL_THEME_NAME}","Id":"{GLOBAL_THEME_DIR}","Version":"1.0"}}}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(theme.join("contents/layout.js"), "old-layout").unwrap();
+    write_registry(
+        &sandbox,
+        "lookandfeel.knsregistry",
+        GLOBAL_THEME_CATEGORY,
+        GLOBAL_THEME_NAME,
+        "1.0",
+        &format!("{}/metadata.json", theme.display()),
+        Some(GLOBAL_THEME_ID),
+    );
+    sandbox.fake_tool(
+        "kpackagetool6",
+        "echo 'Error: Could not install package' >&2\nexit 7\n",
+    );
+    let store = FakeStore::start(Listing {
+        extras: vec![ExtraEntry {
+            id: GLOBAL_THEME_ID,
+            name: GLOBAL_THEME_NAME,
+            type_id: GLOBAL_THEME_CATEGORY,
+            version: "2.0",
+            files: &[
+                ("ToolGlobal/metadata.json", GLOBAL_THEME_PACKAGE_METADATA),
+                ("ToolGlobal/contents/layout.js", "new-layout"),
+            ],
+        }],
+        ..Listing::default()
+    });
+    sandbox.run_child(
+        "a_global_theme_installs_through_the_direct_fallback_when_kpackagetool_fails",
+        store.url(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(theme.join("contents/layout.js")).unwrap(),
+        "new-layout",
+        "the direct fallback did not install the package's theme directory"
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(theme.join("metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        installed["KPlugin"]["Version"],
+        serde_json::Value::String("2.0".to_string()),
+        "the installed metadata does not name the new version"
+    );
+}
+
+/// A PlasmaStyle whose package holds its metadata at the archive root and no
+/// `colors/` or `widgets/` directory: the direct install has no structure to
+/// resolve, so `kpackagetool6` must install it instead of the package being
+/// refused for its missing direct structure.
+#[test]
+fn a_plasma_style_package_with_no_direct_structure_installs_through_kpackagetool() {
+    if let Some(child) = common::child() {
+        let result = update(&config(&child.store_url), &Quiet).unwrap();
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert_eq!(result.succeeded.len(), 1, "{result:?}");
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let style = sandbox
+        .data_home()
+        .join("plasma/desktoptheme")
+        .join(TOOL_STYLE_DIR);
+    std::fs::create_dir_all(style.join("contents")).unwrap();
+    std::fs::write(
+        style.join("metadata.json"),
+        format!(
+            r#"{{"KPlugin":{{"Name":"{TOOL_STYLE_NAME}","Id":"{TOOL_STYLE_DIR}","Version":"1.0"}}}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(style.join("contents/colors"), "old-style").unwrap();
+    write_registry(
+        &sandbox,
+        "plasma-themes.knsregistry",
+        STYLE_CATEGORY,
+        TOOL_STYLE_NAME,
+        "1.0",
+        &format!("{}/metadata.json", style.display()),
+        Some(TOOL_STYLE_ID),
+    );
+    sandbox.fake_tool(
+        "kpackagetool6",
+        &format!(
+            "printf 'installed by the tool\\n' > '{marker}'\nprintf '%s' '{metadata}' > '{installed}'\nexit 0\n",
+            marker = style.join("by-kpackagetool").display(),
+            metadata = TOOL_STYLE_PACKAGE_METADATA,
+            installed = style.join("metadata.json").display(),
+        ),
+    );
+    let store = FakeStore::start(Listing {
+        extras: vec![ExtraEntry {
+            id: TOOL_STYLE_ID,
+            name: TOOL_STYLE_NAME,
+            type_id: STYLE_CATEGORY,
+            version: "2.0",
+            files: &[
+                ("metadata.json", TOOL_STYLE_PACKAGE_METADATA),
+                ("contents/colors", "new-style"),
+            ],
+        }],
+        ..Listing::default()
+    });
+    sandbox.run_child(
+        "a_plasma_style_package_with_no_direct_structure_installs_through_kpackagetool",
+        store.url(),
+    );
+    assert!(
+        style.join("by-kpackagetool").exists(),
+        "the package did not reach kpackagetool6"
+    );
+    assert_eq!(
+        std::fs::read_to_string(style.join("contents/colors")).unwrap(),
+        "old-style",
+        "the direct install replaced the installed style"
     );
 }
 

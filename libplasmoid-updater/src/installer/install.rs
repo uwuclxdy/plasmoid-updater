@@ -1128,17 +1128,18 @@ fn install_via_kpackagetool(
     atomic_install_dir(package_dir, &component.path)
 }
 
-/// Installs or updates a component using kpackagetool, with metadata patching.
+/// Finds a package's root in an extracted tree, patches its metadata for the
+/// new version, and refuses a package `kpackagetool6` cannot address because
+/// it names no plugin id.
 ///
-/// kpackagetool addresses an installed package by its plugin id, so a
-/// component whose directory is named differently is installed at its own
-/// path instead: `-u` would answer "not installed" and `-i` would add a
-/// second tree under the id, leaving this one stale.
-pub(super) fn install_via_kpackage(
+/// The caller decides what a refusal means: a type without a direct fallback
+/// fails the update there, before its install slot is taken; a type with one
+/// keeps trying, since the fallback may install the package.
+pub(super) fn prepare_package(
     extract_dir: &Path,
     component: &InstalledComponent,
     new_version: &str,
-) -> Result<(), ComponentFailure> {
+) -> Result<PathBuf, ComponentFailure> {
     let package_dir = find_package_dir(extract_dir)
         .ok_or_else(|| install_failure("no metadata.json or metadata.desktop found in package"))?;
 
@@ -1162,7 +1163,30 @@ pub(super) fn install_via_kpackage(
         );
     }
 
-    if let Some(package_id) = plugin_id(&package_dir)
+    // kpackagetool6 addresses a package by its plugin id, and a package with
+    // none is one it never installs. A type with a direct fallback may still
+    // install such a package, so only the type without one refuses here,
+    // where no step has written the component.
+    if !component.component_type.has_direct_fallback() && plugin_id(&package_dir).is_none() {
+        return Err(install_failure(
+            "the package records no plugin id, which kpackagetool6 needs to install it",
+        ));
+    }
+
+    Ok(package_dir)
+}
+
+/// Installs the package root [`prepare_package`] patched.
+///
+/// A component whose directory is named differently from the package's plugin
+/// id is installed at its own path instead: kpackagetool addresses an
+/// installed package by its id, so `-u` would answer "not installed" and `-i`
+/// would add a second tree under the id, leaving this one stale.
+pub(super) fn install_prepared_package(
+    package_dir: &Path,
+    component: &InstalledComponent,
+) -> Result<(), ComponentFailure> {
+    if let Some(package_id) = plugin_id(package_dir)
         && package_id != component.directory_name
     {
         log::info!(
@@ -1171,11 +1195,11 @@ pub(super) fn install_via_kpackage(
             component.name,
             package_id,
         );
-        return atomic_install_dir(&package_dir, &component.path);
+        return atomic_install_dir(package_dir, &component.path);
     }
 
     let is_global = privilege::is_system_path(&component.path);
-    install_via_kpackagetool(&package_dir, component, is_global)
+    install_via_kpackagetool(package_dir, component, is_global)
 }
 
 // --- Component Locators ---
@@ -1276,6 +1300,42 @@ fn find_index_theme_dirs(extract_dir: &Path) -> Vec<PathBuf> {
     find_all_in_dir(extract_dir, |d| is_regular_file(&d.join("index.theme")))
 }
 
+/// Locates the theme directory an icon or cursor theme's archive installs.
+///
+/// A multi-variant pack ships several theme dirs in one archive; the variant
+/// named like the component is the one it owns. With no same-named variant, a
+/// single-theme archive still installs as before, and several variants none of
+/// which match is an error rather than a guess.
+fn locate_index_theme_dir(
+    extract_dir: &Path,
+    directory_name: &str,
+) -> Result<PathBuf, ComponentFailure> {
+    let themes = find_index_theme_dirs(extract_dir);
+    if themes.is_empty() {
+        return Err(install_failure("no theme (index.theme) found in archive"));
+    }
+    themes
+        .iter()
+        .map(PathBuf::as_path)
+        .find(|dir| dir.file_name().is_some_and(|name| name == directory_name))
+        .or_else(|| (themes.len() == 1).then(|| themes[0].as_path()))
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            // Sorted: directory iteration order is not stable, and the message
+            // names the variants in a fixed order.
+            let mut variants: Vec<String> = themes
+                .iter()
+                .filter_map(|dir| dir.file_name()?.to_str())
+                .map(|name| format!("{name:?}"))
+                .collect();
+            variants.sort();
+            install_failure(format!(
+                "archive holds several themes ({}) and none is named {directory_name:?}",
+                variants.join(", ")
+            ))
+        })
+}
+
 fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
     // directory-based wallpaper (with contents/ or metadata.json)
     if let Some(dir) = find_in_dir(extract_dir, |d| {
@@ -1307,23 +1367,61 @@ fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
 
 // --- Direct Installation Methods ---
 
-/// Installs a component using direct file operations (not kpackagetool).
-pub(super) fn install_direct(
+/// The file or directory a direct install copies into the component's path,
+/// resolved from the unpacked tree.
+#[derive(Debug)]
+pub(super) enum DirectSource {
+    /// A component whose installed form is one file.
+    File(PathBuf),
+    /// A component whose installed form is one directory.
+    Dir(PathBuf),
+    /// A wallpaper: one image file, or a directory of them.
+    Wallpaper(PathBuf),
+    /// A theme directory installed as a whole, under the name its type gives
+    /// it in the log.
+    ThemeDir {
+        source: PathBuf,
+        component_type: ComponentType,
+    },
+}
+
+/// Resolves what the component's type installs by from the unpacked tree.
+///
+/// A lookup that finds nothing fails here, before the install slot is taken,
+/// so its failure takes no backup and restores nothing. The one caller that
+/// runs after a slot is taken is the fallback of a type whose `kpackagetool6`
+/// install failed: the tool may have written the component by then, so a
+/// package its fallback installs is never refused up front.
+pub(super) fn resolve_direct_source(
     extract_dir: &Path,
     component: &InstalledComponent,
-) -> Result<(), ComponentFailure> {
+) -> Result<DirectSource, ComponentFailure> {
     match component.component_type {
-        ComponentType::ColorScheme => install_color_scheme(extract_dir, &component.path),
+        ComponentType::ColorScheme => locate_color_scheme_file(extract_dir)
+            .map(DirectSource::File)
+            .ok_or_else(|| install_failure("no color scheme file found in archive")),
         ComponentType::IconTheme | ComponentType::CursorTheme => {
-            install_index_theme(extract_dir, &component.path, &component.directory_name)
+            locate_index_theme_dir(extract_dir, &component.directory_name).map(DirectSource::Dir)
         }
-        ComponentType::Wallpaper => install_wallpaper(extract_dir, component),
+        ComponentType::Wallpaper => find_wallpaper_source(extract_dir)
+            .map(DirectSource::Wallpaper)
+            .ok_or_else(|| install_failure("no wallpaper found in archive")),
         ComponentType::AuroraeDecoration
         | ComponentType::GlobalTheme
         | ComponentType::PlasmaStyle
         | ComponentType::SplashScreen
         | ComponentType::SddmTheme => {
-            install_theme_dir(extract_dir, &component.path, component.component_type)
+            find_component_root_in_archive(extract_dir, component.component_type)
+                .map(|source| DirectSource::ThemeDir {
+                    source,
+                    component_type: component.component_type,
+                })
+                .ok_or_else(|| {
+                    install_failure(format!(
+                        "no valid {} structure found in archive",
+                        component.component_type
+                    ))
+                })
         }
         ComponentType::PlasmaWidget
         | ComponentType::WallpaperPlugin
@@ -1337,87 +1435,53 @@ pub(super) fn install_direct(
     }
 }
 
-fn install_color_scheme(extract_dir: &Path, dest_path: &Path) -> Result<(), ComponentFailure> {
-    let color_file = locate_color_scheme_file(extract_dir)
-        .ok_or_else(|| install_failure("no color scheme file found in archive"))?;
+/// Installs what [`resolve_direct_source`] resolved, using direct file
+/// operations (not kpackagetool).
+pub(super) fn install_direct(
+    source: &DirectSource,
+    component: &InstalledComponent,
+) -> Result<(), ComponentFailure> {
+    match source {
+        DirectSource::File(file) => install_color_scheme(file, &component.path),
+        DirectSource::Dir(dir) => install_index_theme(dir, &component.path),
+        DirectSource::Wallpaper(source) => install_wallpaper(source, &component.path),
+        DirectSource::ThemeDir {
+            source,
+            component_type,
+        } => install_theme_dir(source, &component.path, *component_type),
+    }
+}
 
-    atomic_install_file(&color_file, dest_path)?;
+fn install_color_scheme(color_file: &Path, dest_path: &Path) -> Result<(), ComponentFailure> {
+    atomic_install_file(color_file, dest_path)?;
     log::debug!(target: "install", "copied color scheme to {}", dest_path.display());
     Ok(())
 }
 
 /// Installs the directory holding `index.theme` (an icon or cursor theme).
-///
-/// A multi-variant pack ships several theme dirs in one archive; the variant
-/// named like the component is the one it owns. With no same-named variant, a
-/// single-theme archive still installs as before, and several variants none of
-/// which match is an error rather than a guess.
-fn install_index_theme(
-    extract_dir: &Path,
-    dest_dir: &Path,
-    directory_name: &str,
-) -> Result<(), ComponentFailure> {
-    let themes = find_index_theme_dirs(extract_dir);
-    if themes.is_empty() {
-        return Err(install_failure("no theme (index.theme) found in archive"));
-    }
-    let source_dir = themes
-        .iter()
-        .map(PathBuf::as_path)
-        .find(|dir| dir.file_name().is_some_and(|name| name == directory_name))
-        .or_else(|| (themes.len() == 1).then(|| themes[0].as_path()))
-        .ok_or_else(|| {
-            // Sorted: directory iteration order is not stable, and the message
-            // names the variants in a fixed order.
-            let mut variants: Vec<String> = themes
-                .iter()
-                .filter_map(|dir| dir.file_name().and_then(|name| name.to_str()))
-                .map(|name| format!("{name:?}"))
-                .collect();
-            variants.sort();
-            install_failure(format!(
-                "archive holds several themes ({}) and none is named {directory_name:?}",
-                variants.join(", ")
-            ))
-        })?;
-
+fn install_index_theme(source_dir: &Path, dest_dir: &Path) -> Result<(), ComponentFailure> {
     atomic_install_dir(source_dir, dest_dir)?;
     log::debug!(target: "install", "copied theme to {}", dest_dir.display());
     Ok(())
 }
 
-fn install_wallpaper(
-    extract_dir: &Path,
-    component: &InstalledComponent,
-) -> Result<(), ComponentFailure> {
-    let source = find_wallpaper_source(extract_dir)
-        .ok_or_else(|| install_failure("no wallpaper found in archive"))?;
-
-    let dest = &component.path;
-
+fn install_wallpaper(source: &Path, dest: &Path) -> Result<(), ComponentFailure> {
     if source.is_file() {
-        atomic_install_file(&source, dest)?;
+        atomic_install_file(source, dest)?;
         log::debug!(target: "install", "copied wallpaper to {}", dest.display());
     } else {
-        atomic_install_dir(&source, dest)?;
+        atomic_install_dir(source, dest)?;
         log::debug!(target: "install", "copied wallpaper dir to {}", dest.display());
     }
     Ok(())
 }
 
 fn install_theme_dir(
-    extract_dir: &Path,
+    source_dir: &Path,
     dest_dir: &Path,
     component_type: ComponentType,
 ) -> Result<(), ComponentFailure> {
-    let source_dir =
-        find_component_root_in_archive(extract_dir, component_type).ok_or_else(|| {
-            install_failure(format!(
-                "no valid {component_type} structure found in archive"
-            ))
-        })?;
-
-    atomic_install_dir(&source_dir, dest_dir)?;
+    atomic_install_dir(source_dir, dest_dir)?;
     log::debug!(target: "install", "copied {} to {}", component_type, dest_dir.display());
     Ok(())
 }
@@ -2679,7 +2743,8 @@ exit 0
             let dest = dir.path().join("Aaa-cursors");
             let component = theme_component(&dest, "Aaa-cursors", ComponentType::CursorTheme);
 
-            install_direct(&extract, &component).unwrap();
+            let source = resolve_direct_source(&extract, &component).unwrap();
+            install_direct(&source, &component).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(dest.join("cursors/left_ptr")).unwrap(),
@@ -2696,7 +2761,7 @@ exit 0
         let dest = dir.path().join("Other-cursors");
         let component = theme_component(&dest, "Other-cursors", ComponentType::CursorTheme);
 
-        let failure = install_direct(&extract, &component).unwrap_err();
+        let failure = resolve_direct_source(&extract, &component).unwrap_err();
 
         assert_eq!(failure.kind, FailureKind::Install);
         assert!(
@@ -2720,7 +2785,7 @@ exit 0
         let dest = dir.path().join("Lonely-cursors");
         let component = theme_component(&dest, "Lonely-cursors", ComponentType::CursorTheme);
 
-        let failure = install_direct(&extract, &component).unwrap_err();
+        let failure = resolve_direct_source(&extract, &component).unwrap_err();
 
         assert_eq!(failure.kind, FailureKind::Install);
         assert_eq!(failure.message, "no theme (index.theme) found in archive");
@@ -2737,7 +2802,8 @@ exit 0
         let dest = dir.path().join("Aaa-cursors");
         let component = theme_component(&dest, "Aaa-cursors", ComponentType::CursorTheme);
 
-        install_direct(&extract, &component).unwrap();
+        let source = resolve_direct_source(&extract, &component).unwrap();
+        install_direct(&source, &component).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dest.join("cursors/left_ptr")).unwrap(),
@@ -2830,7 +2896,8 @@ exit 0
             );
             let started = std::time::Instant::now();
 
-            let refusal = install_via_kpackage(&extract, &component, "2.0").unwrap_err();
+            let package_dir = prepare_package(&extract, &component, "2.0").unwrap();
+            let refusal = install_prepared_package(&package_dir, &component).unwrap_err();
 
             assert_eq!(refusal.kind, FailureKind::Install);
             assert!(refusal.message.contains("timed out"), "{}", refusal.message);
@@ -2889,9 +2956,17 @@ exit 0
         if std::env::var_os("PU_TEST_ID_LESS").is_some() {
             let extract = PathBuf::from(std::env::var("PU_TEST_EXTRACT").unwrap());
             let component_dir = PathBuf::from(std::env::var("PU_TEST_COMPONENT").unwrap());
-            let component = widget_at(&component_dir, "org.test.widget");
+            // A type with a direct fallback: the package's missing plugin id
+            // is judged after the tool answers, since the fallback may still
+            // install the package.
+            let component = theme_component(
+                &component_dir,
+                "org.test.widget",
+                ComponentType::GlobalTheme,
+            );
 
-            let refusal = install_via_kpackage(&extract, &component, "2.0").unwrap_err();
+            let package_dir = prepare_package(&extract, &component, "2.0").unwrap();
+            let refusal = install_prepared_package(&package_dir, &component).unwrap_err();
 
             assert_eq!(refusal.kind, FailureKind::Install);
             assert!(
@@ -2958,7 +3033,7 @@ exit 0
                 "org.test.widget",
             );
 
-            let refusal = install_via_kpackage(&extract, &component, "2.0").unwrap_err();
+            let refusal = prepare_package(&extract, &component, "2.0").unwrap_err();
 
             assert_eq!(refusal.kind, FailureKind::Install);
             assert!(
@@ -3088,7 +3163,8 @@ exit 0
                 "org.test.widget",
             );
 
-            let refusal = install_via_kpackage(&extract, &component, "2.0").unwrap_err();
+            let package_dir = prepare_package(&extract, &component, "2.0").unwrap();
+            let refusal = install_prepared_package(&package_dir, &component).unwrap_err();
 
             assert_eq!(
                 refusal.message,
