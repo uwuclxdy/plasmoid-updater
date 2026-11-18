@@ -4,8 +4,6 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, FixedOffset};
-
 use crate::types::{InstalledComponent, StoreEntry};
 use crate::version::normalize_version;
 
@@ -79,10 +77,10 @@ fn newest_entry<'a>(
     newest
 }
 
-/// The `<changed>` value as an instant: `None` when it is empty or not an
-/// RFC 3339 timestamp.
-fn changed_instant(entry: &StoreEntry) -> Option<DateTime<FixedOffset>> {
-    DateTime::parse_from_rfc3339(entry.changed_date.trim()).ok()
+/// The `<changed>` value as an instant: `None` when it is empty or not a
+/// timestamp with an offset.
+fn changed_instant(entry: &StoreEntry) -> Option<jiff::Timestamp> {
+    entry.changed_date.trim().parse().ok()
 }
 
 /// Whether `candidate` supersedes `incumbent` for the installed slot: a later
@@ -354,6 +352,22 @@ mod tests {
             Some(100)
         );
         assert_eq!(resolve_with(&component, &[later, earlier]), Some(100));
+    }
+
+    #[test]
+    fn a_changed_date_in_the_store_form_reads_as_its_instant() {
+        for changed in [
+            "2024-05-12T10:22:31+00:00",
+            " \t2024-05-12T10:22:31+00:00\n",
+        ] {
+            let entry = make_entry_by(100, "Clock", 708, changed, "");
+
+            assert_eq!(
+                changed_instant(&entry),
+                Some(jiff::Timestamp::from_second(1_715_509_351).unwrap()),
+                "{changed:?}"
+            );
+        }
     }
 
     #[test]

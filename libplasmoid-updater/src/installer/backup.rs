@@ -111,9 +111,23 @@ fn backup_base_dir_for(component: &InstalledComponent, system_base: &Path) -> Pa
     }
 }
 
-/// Generates a timestamp string for backup directories.
+/// The backup directory name for this instant, in the system time zone.
 fn timestamp() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string()
+    backup_name(jiff::ZonedDateTime::now().datetime())
+}
+
+/// The backup directory name for a local wall time.
+fn backup_name(at: jiff::civil::DateTime) -> String {
+    at.strftime(BACKUP_TIMESTAMP_FORMAT).to_string()
+}
+
+/// The wall time a backup directory's name encodes, or `None` for a name the
+/// program would not write for that wall time. A name is a backup's only when
+/// it is the exact spelling [`backup_name`] gives it: a parseable variant of
+/// the name a person or another tool made is never counted and never removed.
+fn backup_time(name: &str) -> Option<jiff::civil::DateTime> {
+    let at = jiff::civil::DateTime::strptime(BACKUP_TIMESTAMP_FORMAT, name).ok()?;
+    (backup_name(at) == name).then_some(at)
 }
 
 /// Creates a backup of the component before updating, recording the timestamp
@@ -574,13 +588,13 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), ComponentFailure> {
     Ok(())
 }
 
-/// The timestamp [`timestamp`] encodes in a backup directory's name.
+/// The wall time [`timestamp`] encodes in a backup directory's name.
 const BACKUP_TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H-%M-%S";
 
-/// Orders backups oldest first: by the instant the name encodes, and a shared
-/// instant by name, so the order never follows the order the directory was
-/// listed in.
-fn oldest_first(backups: &mut [(chrono::NaiveDateTime, PathBuf)]) {
+/// Orders backups oldest first: by the wall time the name encodes, and a
+/// shared wall time by name, so the order never follows the order the
+/// directory was listed in.
+fn oldest_first(backups: &mut [(jiff::civil::DateTime, PathBuf)]) {
     backups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 }
 
@@ -637,7 +651,7 @@ fn system_backup_dirs(base: &Path, type_subdir: &str) -> Vec<PathBuf> {
 /// Removes old backup directories, keeping the most recent `max_keep` and
 /// never one of `skip`, the directories the current run created.
 ///
-/// Only a directory whose name parses as a timestamp is a backup, and only a
+/// Only a directory named as the program names a backup is a backup, and only a
 /// backup is ever pruned: a stray directory is neither counted toward the limit
 /// nor removed in a real backup's place. The encoded timestamp orders the
 /// backups, since a cache restored from a tarball or written on another clock
@@ -655,12 +669,10 @@ fn cleanup_old_backups_in(
         user_backup_dirs(base, type_subdir)
     };
 
-    let mut backups: Vec<(chrono::NaiveDateTime, PathBuf)> = candidates
+    let mut backups: Vec<(jiff::civil::DateTime, PathBuf)> = candidates
         .into_iter()
         .filter_map(|path| {
-            let name = path.file_name()?.to_str()?;
-            let created =
-                chrono::NaiveDateTime::parse_from_str(name, BACKUP_TIMESTAMP_FORMAT).ok()?;
+            let created = backup_time(path.file_name()?.to_str()?)?;
             Some((created, path))
         })
         .collect();
@@ -883,8 +895,10 @@ mod tests {
     /// A backup directory name a day or more after this run's own clock, so
     /// the run's backups sort oldest in the retention window.
     fn timestamp_ahead_of_now(days: i64) -> String {
-        (chrono::Local::now() + chrono::Duration::days(days))
-            .format(BACKUP_TIMESTAMP_FORMAT)
+        jiff::ZonedDateTime::now()
+            .checked_add(jiff::SignedDuration::from_hours(24 * days))
+            .unwrap()
+            .strftime(BACKUP_TIMESTAMP_FORMAT)
             .to_string()
     }
 
@@ -1038,6 +1052,40 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_never_counts_a_name_the_program_would_not_write() {
+        let base = tempfile::tempdir().unwrap();
+        let subdir = ComponentType::PlasmaWidget.backup_subdir();
+        for day in 1..=5 {
+            make_backup(base.path(), &format!("2024-01-0{day}T00-00-00"), subdir);
+        }
+        // Names the format parses but the program would not write: a
+        // parse-only guard counts them, so retention removes one of them or a
+        // real backup in its place.
+        let strays = ["+ 2023-01-01T00-00-00", "2024-1-1T0-0-0"];
+        for stray in strays {
+            make_backup(base.path(), stray, subdir);
+        }
+
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
+
+        for day in 1..=5 {
+            assert!(
+                base.path()
+                    .join(format!("2024-01-0{day}T00-00-00"))
+                    .join(subdir)
+                    .is_dir(),
+                "backup {day} was pruned for a name the program would not write"
+            );
+        }
+        for stray in strays {
+            assert!(
+                base.path().join(stray).join(subdir).is_dir(),
+                "{stray:?} was removed though the program never wrote it"
+            );
+        }
+    }
+
+    #[test]
     fn cleanup_orders_backups_by_their_encoded_time() {
         let base = tempfile::tempdir().unwrap();
         let subdir = ComponentType::PlasmaWidget.backup_subdir();
@@ -1067,10 +1115,10 @@ mod tests {
     #[test]
     fn cleanup_orders_equal_instants_by_name() {
         let instant =
-            chrono::NaiveDateTime::parse_from_str("2024-01-01T00-00-00", BACKUP_TIMESTAMP_FORMAT)
+            jiff::civil::DateTime::strptime(BACKUP_TIMESTAMP_FORMAT, "2024-01-01T00-00-00")
                 .unwrap();
-        // The same instant under the two spellings a one-digit hour allows,
-        // handed over newest-first so nothing but the tie-break can order them.
+        // Two entries of one wall time, handed over in descending name order
+        // so nothing but the tie-break can order them.
         let mut backups = vec![
             (instant, PathBuf::from("2024-01-01T00-00-00")),
             (instant, PathBuf::from("2024-01-01T0-00-00")),
@@ -1083,6 +1131,155 @@ mod tests {
             .map(|(_, path)| path.to_str().unwrap())
             .collect();
         assert_eq!(names, ["2024-01-01T0-00-00", "2024-01-01T00-00-00"]);
+    }
+
+    #[test]
+    fn a_backup_name_spells_the_wall_time_zero_padded() {
+        let at = jiff::civil::date(2026, 3, 5).at(7, 8, 9, 999_999_999);
+
+        assert_eq!(backup_name(at), "2026-03-05T07-08-09");
+    }
+
+    #[test]
+    fn every_name_the_program_writes_parses_back_to_the_wall_time_it_spells() {
+        for (name, at) in [
+            (
+                "2026-03-05T07-08-09",
+                jiff::civil::date(2026, 3, 5).at(7, 8, 9, 0),
+            ),
+            (
+                "2024-01-01T00-00-00",
+                jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
+            ),
+            (
+                "2024-12-31T23-59-59",
+                jiff::civil::date(2024, 12, 31).at(23, 59, 59, 0),
+            ),
+        ] {
+            assert_eq!(backup_time(name), Some(at), "{name}");
+        }
+
+        let name = timestamp();
+        let at = backup_time(&name).unwrap_or_else(|| panic!("{name:?} is not a backup name"));
+        let spelled = format!(
+            "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",
+            at.year(),
+            at.month(),
+            at.day(),
+            at.hour(),
+            at.minute(),
+            at.second()
+        );
+        assert_eq!(spelled, name);
+        assert_eq!(at.subsec_nanosecond(), 0, "{name}");
+    }
+
+    /// Names that are not a backup's: retention neither counts nor removes a
+    /// directory under any of them. A name outside the format is not one, and
+    /// neither is a name the format parses to a wall time it spells
+    /// differently.
+    #[test]
+    fn a_name_outside_the_backup_format_is_never_a_backup() {
+        for name in [
+            "",
+            "not-a-date",
+            "2024-01-01",
+            "2024-01-01T00-00",
+            "2024-01-01T00:00:00",
+            "2024-01-01T00-00-00.5",
+            "2024-01-01T000-00-00",
+            "2024-001-01T00-00-00",
+            "2024-01-01T00-00-000",
+            "2024-01-01T24-00-00",
+            "2024-01-01T00-60-00",
+            "2023-02-29T00-00-00",
+            "2024-04-31T00-00-00",
+            "2024-13-01T00-00-00",
+            "2024-00-01T00-00-00",
+            "2024-01-00T00-00-00",
+            "2024-01-01t00-00-00",
+            "2024-01-01T00-00-00x",
+            "2024-01-01T00-00-00\n",
+            "2024-01-01T00-00-00 ",
+            "2024-01-01T00-00-00\0",
+            "20240-01-01T00-00-00",
+            "02024-01-01T00-00-00",
+            "\u{ff12}\u{ff10}\u{ff12}\u{ff14}-01-01T00-00-00",
+            "+ 2023-01-01T00-00-00",
+            "+\t2023-01-01T00-00-00",
+            "- 2024-01-01T00-00-00",
+            "+ 99-01-01T00-00-00",
+            "2024-1-1T0-0-0",
+            "+2024-01-01T00-00-00",
+            "2024-01-01T 0-00-00",
+        ] {
+            assert_eq!(backup_time(name), None, "{name:?} parsed as a backup");
+        }
+    }
+
+    const TZ_CHILD_READING: &str = "PLASMOID_UPDATER_TZ_CHILD_READING";
+
+    /// Under a zone 5 h 45 min east of UTC with no DST, named either way `TZ`
+    /// allows, the backup name spells the UTC second it was read in plus
+    /// exactly that offset.
+    #[test]
+    fn the_backup_name_follows_the_system_time_zone() {
+        if let Some(reading) = std::env::var_os(TZ_CHILD_READING) {
+            // One UTC second brackets the name, so both name the same second.
+            for _ in 0..100 {
+                let before = jiff::Timestamp::now().as_second();
+                let name = timestamp();
+                if jiff::Timestamp::now().as_second() == before {
+                    let system_zone = jiff::tz::TimeZone::system();
+                    let zone = system_zone.iana_name().unwrap_or("-");
+                    std::fs::write(reading, format!("{before} {name} {zone}")).unwrap();
+                    return;
+                }
+            }
+            panic!("the clock ticked across every bracketed reading");
+        }
+
+        for tz in ["Asia/Kathmandu", ":Asia/Kathmandu"] {
+            let dir = tempfile::tempdir().unwrap();
+            let reading = dir.path().join("reading");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "installer::backup::tests::the_backup_name_follows_the_system_time_zone",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env("TZ", tz)
+                .env(TZ_CHILD_READING, &reading)
+                .output()
+                .unwrap();
+            let read = std::fs::read_to_string(&reading).unwrap_or_default();
+            assert!(
+                output.status.success() && !read.is_empty(),
+                "child under TZ={tz} failed ({})\n--- stdout\n{}\n--- stderr\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let (utc_second, rest) = read.split_once(' ').unwrap();
+            let (name, zone) = rest.split_once(' ').unwrap();
+            assert_eq!(
+                zone, "Asia/Kathmandu",
+                "TZ={tz}: the host's time zone database has no Asia/Kathmandu (tzdata missing?)"
+            );
+            let shifted = utc_second.parse::<i64>().unwrap() + 5 * 3600 + 45 * 60;
+            let expected = std::process::Command::new("date")
+                .args(["-u", "-d", &format!("@{shifted}"), "+%Y-%m-%dT%H-%M-%S"])
+                .output()
+                .unwrap();
+            assert!(expected.status.success());
+            assert_eq!(
+                name,
+                String::from_utf8_lossy(&expected.stdout).trim_end(),
+                "TZ={tz}, UTC second {utc_second}"
+            );
+        }
     }
 
     #[test]

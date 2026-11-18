@@ -31,7 +31,7 @@ regex = "1.13.1"
 rayon = "1.12.0"
 parking_lot = "0.13.0"
 versions = "8.0.1"
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+jiff = { version = "1.0.1", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 tempfile = "3.27.0"
 # 2.0.1 hard-pins `indexmap =2.11.4`, which conflicts with toml's `indexmap ^2.13`; the resolver keeps 2.0.0 here
 freedesktop_entry_parser = "2.0.0"
