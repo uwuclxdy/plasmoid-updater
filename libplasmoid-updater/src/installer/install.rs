@@ -880,8 +880,15 @@ pub(super) fn verify_package_plugin_id(
 const KPACKAGETOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How long a killed `kpackagetool6` and its process group get to exit before
-/// they are killed outright, and how long its pipe readers may take to finish.
+/// they are killed outright, and how long its pipe readers and the group probe
+/// may take to answer.
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the child gets to be reaped after the `SIGKILL`. A child the
+/// signal cannot reach (a `sudo` the user may not signal) lives as long as its
+/// command does, so waiting for it would hold the run and its lock until the
+/// tool exits.
+const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn kpackagetool_timeout() -> std::time::Duration {
     // A unit test cannot wait out the production deadline, so it may shorten it.
@@ -898,27 +905,119 @@ fn kpackagetool_timeout() -> std::time::Duration {
 }
 
 /// Builds a base `kpackagetool6` command with `-t <type>`, `sudo`, and
-/// `--global` as needed.
+/// `--global` as needed, with the route it runs by.
 ///
 /// The not-installed answer this module matches is English text and
 /// kpackagetool prints it in the locale it inherits, so every call runs in the
 /// C locale. `sudo` resets the environment, so there the locale goes through
 /// `env`, which `sudo` passes on to the tool.
-fn kpackagetool_cmd(kpackage_type: &str, global: bool) -> std::process::Command {
-    let mut cmd = if global && !privilege::is_root() {
+fn kpackagetool_cmd(kpackage_type: &str, global: bool) -> (std::process::Command, Route) {
+    let (mut cmd, route) = if global && !privilege::is_root() {
         let mut cmd = privilege::sudo_command("env");
         cmd.args(["LC_ALL=C", "LANGUAGE=C", "kpackagetool6"]);
-        cmd
+        (cmd, Route::Elevated)
     } else {
         let mut cmd = std::process::Command::new("kpackagetool6");
         cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
-        cmd
+        (cmd, Route::Direct)
     };
     cmd.arg("-t").arg(kpackage_type);
     if global {
         cmd.arg("--global");
     }
-    cmd
+    (cmd, route)
+}
+
+/// How a timed-out command's child relates to the tool it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// The child is the tool, running as this process's user.
+    Direct,
+    /// The child is the elevation command, which runs the tool as root and
+    /// may put it in a session of its own, out of the child's process group.
+    Elevated,
+}
+
+/// When the timed-out child was reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reaped {
+    /// On its own or within the `SIGTERM` grace, before any `SIGKILL`.
+    BeforeKill,
+    /// Only after the `SIGKILL`.
+    AfterKill,
+    /// Not within [`REAP_BOUND`] after the `SIGKILL`.
+    Never,
+    /// Waiting for it failed.
+    WaitFailed,
+}
+
+/// What signal 0 to the child's process group answered (kill(2)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    /// `ESRCH`: no process is left in the group.
+    Empty,
+    /// The signal could be sent: a process is left.
+    Alive,
+    /// `EPERM`: a process is left that this user may not signal.
+    Denied,
+    /// Any other error, which says nothing either way.
+    Unknown,
+}
+
+impl Probe {
+    fn from_answer(answer: nix::Result<()>) -> Self {
+        match answer {
+            Ok(()) => Self::Alive,
+            Err(nix::errno::Errno::ESRCH) => Self::Empty,
+            Err(nix::errno::Errno::EPERM) => Self::Denied,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+/// What the timeout path saw of the child, its pipes and its group.
+#[derive(Clone, Copy, Debug)]
+struct Observed {
+    route: Route,
+    reaped: Reaped,
+    /// Both pipe readers reached EOF within the bound.
+    readers_finished: bool,
+    probe: Probe,
+}
+
+/// Whether a timed-out tool is gone, judged from [`Observed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Every observation a surviving tool cannot produce holds.
+    Gone,
+    /// Nothing shows a survivor, but nothing proves the tool gone either.
+    MayRun,
+    /// A process was seen after the kill: the group probe found one, or one
+    /// still holds the pipes.
+    Survivor,
+}
+
+impl Observed {
+    /// The tool counts as gone only on a positive check. Both routes need EOF
+    /// on both pipes and an empty group. On the direct route the child is the
+    /// tool, so its reaped exit, after the `SIGKILL` too, means it ended. The
+    /// elevation command exits only after its command does, but a `SIGKILL`
+    /// ends it without the tool, so there only a reap before any `SIGKILL`
+    /// counts.
+    fn verdict(self) -> Verdict {
+        if matches!(self.probe, Probe::Alive | Probe::Denied) || !self.readers_finished {
+            return Verdict::Survivor;
+        }
+        let reaped = match self.route {
+            Route::Direct => matches!(self.reaped, Reaped::BeforeKill | Reaped::AfterKill),
+            Route::Elevated => self.reaped == Reaped::BeforeKill,
+        };
+        if reaped && self.probe == Probe::Empty {
+            Verdict::Gone
+        } else {
+            Verdict::MayRun
+        }
+    }
 }
 
 /// Drains one of a child's pipes on its own thread.
@@ -930,16 +1029,15 @@ fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandl
     })
 }
 
-/// Joins the pipe readers, giving them `grace` to finish.
+/// Joins the pipe readers, giving them until `deadline` to finish.
 ///
 /// A reader ends when every holder of its write end dies. A process that
 /// outlived the kill keeps one open, so a plain join could hold the run; this
 /// returns `false` instead.
 fn join_readers_bounded(
     readers: Vec<std::thread::JoinHandle<Vec<u8>>>,
-    grace: std::time::Duration,
+    deadline: std::time::Instant,
 ) -> (Vec<Vec<u8>>, bool) {
-    let deadline = std::time::Instant::now() + grace;
     loop {
         if readers.iter().all(std::thread::JoinHandle::is_finished) {
             break;
@@ -956,30 +1054,81 @@ fn join_readers_bounded(
     (drained, true)
 }
 
-/// Whether any process is left in `group`, checked without sending a signal.
-fn process_group_alive(group: Pid) -> bool {
-    killpg(group, None).is_ok()
+/// Probes `group` with signal 0 until it answers `ESRCH` or `deadline`
+/// passes: a process the kill ended stays in the group until it is reaped.
+fn probe_group(group: Pid, deadline: std::time::Instant) -> Probe {
+    loop {
+        let probe = Probe::from_answer(killpg(group, None));
+        if probe == Probe::Empty || std::time::Instant::now() >= deadline {
+            return probe;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Polls `child` until it is reaped or `bound` passes; `Ok(false)` when it was
+/// not.
+fn reap_within(
+    child: &mut std::process::Child,
+    bound: std::time::Duration,
+) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// Ends the child and every process it forked, giving the group a grace on
-/// `SIGTERM` before `SIGKILL`: `sudo` and the tool under it share the group,
-/// so the signal reaches the tool that actually holds the pipes. Returns
-/// whether a process survived the kill, which only a process running as
-/// another user (a root tool under sudo) can.
-fn terminate_group(child: &mut std::process::Child, group: Pid) -> bool {
+/// `SIGTERM` before `SIGKILL`, and returns when the child was reaped.
+///
+/// A child still there [`REAP_BOUND`] after the `SIGKILL` is left unreaped and
+/// the run goes on: until it is reaped its pid, which is also the group's id,
+/// cannot be reused, so the probe that follows never meets a stranger's group;
+/// once it exits it stays a zombie until this process ends and init reaps it.
+fn terminate_group(child: &mut std::process::Child, group: Pid) -> Reaped {
     let _ = killpg(group, Signal::SIGTERM);
-    let grace_deadline = std::time::Instant::now() + KILL_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return process_group_alive(group),
-            Ok(None) if std::time::Instant::now() >= grace_deadline => break,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
-            Err(_) => return process_group_alive(group),
-        }
+    match reap_within(child, KILL_GRACE) {
+        Ok(true) => return Reaped::BeforeKill,
+        Ok(false) => {}
+        Err(_) => return Reaped::WaitFailed,
     }
     let _ = killpg(group, Signal::SIGKILL);
-    let _ = child.wait();
-    process_group_alive(group)
+    match reap_within(child, REAP_BOUND) {
+        Ok(true) => Reaped::AfterKill,
+        Ok(false) => Reaped::Never,
+        Err(_) => Reaped::WaitFailed,
+    }
+}
+
+/// Kills the timed-out child's group and gathers what [`Observed::verdict`]
+/// judges. `wait_failed` marks a child whose wait already failed, which no
+/// later reap makes a positive check.
+fn observe_kill(
+    child: &mut std::process::Child,
+    group: Pid,
+    readers: Vec<std::thread::JoinHandle<Vec<u8>>>,
+    route: Route,
+    wait_failed: bool,
+) -> Observed {
+    let reaped = terminate_group(child, group);
+    let deadline = std::time::Instant::now() + KILL_GRACE;
+    let (_, readers_finished) = join_readers_bounded(readers, deadline);
+    Observed {
+        route,
+        reaped: if wait_failed {
+            Reaped::WaitFailed
+        } else {
+            reaped
+        },
+        readers_finished,
+        probe: probe_group(group, deadline),
+    }
 }
 
 /// Runs `command` in its own process group, killing the whole group once
@@ -988,9 +1137,12 @@ fn terminate_group(child: &mut std::process::Child, group: Pid) -> bool {
 /// Stdout and stderr are drained while the tool runs, so a child that fills a
 /// pipe cannot block the wait; a killed group closes its pipes and both
 /// readers finish. The readers are joined with a bound, because a descendant
-/// that survived the grace would otherwise keep the run waiting.
+/// that survived the grace would otherwise keep the run waiting. A killed run
+/// sets `process_may_still_run` unless [`Observed::verdict`] finds the tool
+/// gone.
 fn run_with_timeout(
     command: &mut std::process::Command,
+    route: Route,
     timeout: std::time::Duration,
     tool: &str,
 ) -> Result<std::process::Output, ComponentFailure> {
@@ -1013,7 +1165,8 @@ fn run_with_timeout(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let (drained, finished) = join_readers_bounded(readers, KILL_GRACE);
+                let (drained, finished) =
+                    join_readers_bounded(readers, std::time::Instant::now() + KILL_GRACE);
                 if !finished {
                     let mut failure =
                         install_failure(format!("{tool} exited but kept its output pipes open"));
@@ -1030,9 +1183,8 @@ fn run_with_timeout(
                 });
             }
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let still_running = terminate_group(&mut child, group);
-                let _ = join_readers_bounded(readers, KILL_GRACE);
-                let message = if still_running {
+                let verdict = observe_kill(&mut child, group, readers, route, false).verdict();
+                let message = if verdict == Verdict::Survivor {
                     format!(
                         "{tool} timed out after {} s and is still running",
                         timeout.as_secs()
@@ -1041,15 +1193,14 @@ fn run_with_timeout(
                     format!("{tool} timed out after {} s", timeout.as_secs())
                 };
                 let mut failure = install_failure(message);
-                failure.process_may_still_run = still_running;
+                failure.process_may_still_run = verdict != Verdict::Gone;
                 return Err(failure);
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
             Err(e) => {
-                let still_running = terminate_group(&mut child, group);
-                let _ = join_readers_bounded(readers, KILL_GRACE);
+                let verdict = observe_kill(&mut child, group, readers, route, true).verdict();
                 let mut failure = install_failure(format!("failed to wait for {tool}: {e}"));
-                failure.process_may_still_run = still_running;
+                failure.process_may_still_run = verdict != Verdict::Gone;
                 return Err(failure);
             }
         }
@@ -1095,10 +1246,10 @@ fn install_via_kpackagetool(
     })?;
     let timeout = kpackagetool_timeout();
 
+    let (mut command, route) = kpackagetool_cmd(kpackage_type, global);
     let output = run_with_timeout(
-        kpackagetool_cmd(kpackage_type, global)
-            .arg("-u")
-            .arg(package_dir),
+        command.arg("-u").arg(package_dir),
+        route,
         timeout,
         "kpackagetool6",
     )?;
@@ -2865,17 +3016,19 @@ exit 0
             .unwrap();
         let group = Pid::from_raw(child.id() as i32);
 
-        assert!(process_group_alive(group), "a live group was read as gone");
+        assert_eq!(
+            probe_group(group, std::time::Instant::now()),
+            Probe::Alive,
+            "a live group was read as gone"
+        );
 
         let _ = killpg(group, Signal::SIGKILL);
         let _ = child.wait();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while process_group_alive(group) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
 
-        assert!(
-            !process_group_alive(group),
+        assert_eq!(
+            probe_group(group, deadline),
+            Probe::Empty,
             "a dead group was read as alive"
         );
     }
@@ -2943,6 +3096,719 @@ exit 0
             output.status,
             done.exists(),
             String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    const DETACHED_CHILD: &str =
+        "installer::install::tests::a_timed_out_tool_sudo_detached_keeps_the_backup";
+
+    /// A fake `sudo` that runs its command in a new session, as sudo's
+    /// `use_pty` does, and outlives `SIGTERM` without passing it on: the
+    /// command stays out of the process group the timeout signals.
+    const DETACHING_SUDO: &str = "#!/bin/sh\ntrap '' TERM\nsetsid \"$@\" &\nwait\n";
+
+    /// A fake `kpackagetool6` that records its pid and outlives the timeout.
+    const RECORDED_SLEEPING_KPACKAGETOOL: &str =
+        "#!/bin/sh\necho $$ > \"$PU_TEST_TOOL_PID\"\nexec sleep 30\n";
+
+    /// Whether `pid` names a process that has not exited; a zombie has.
+    fn process_running(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+        })
+    }
+
+    #[test]
+    fn a_timed_out_tool_sudo_detached_keeps_the_backup() {
+        if std::env::var_os("PU_TEST_DETACHED_TOOL").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let package_dir = root.join("package");
+            let backup = root.join("backup");
+            let component = widget_at(&root.join("component"), "org.test.widget");
+            let slot = super::super::InstallSlot::new();
+
+            let failure = install_via_kpackagetool(&package_dir, &component, true).unwrap_err();
+            assert!(
+                failure.process_may_still_run,
+                "a tool the timeout never observed exit was read as gone: {}",
+                failure.message
+            );
+            let refusal = super::super::handle_installation_failure(
+                &backup,
+                &component,
+                &failure,
+                &slot.acquire(),
+            )
+            .unwrap_err();
+
+            assert_eq!(refusal.kind, FailureKind::Install);
+            assert!(
+                refusal.message.contains(&backup.display().to_string()),
+                "the failure does not name the kept backup: {}",
+                refusal.message
+            );
+            assert_eq!(
+                std::fs::read_to_string(component.path.join("marker")).unwrap(),
+                "being written",
+                "the backup was restored over a tree the tool may still be writing"
+            );
+            assert_eq!(
+                std::fs::read_to_string(backup.join("marker")).unwrap(),
+                "old",
+                "the kept backup changed"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("sudo"), DETACHING_SUDO);
+        write_script(&bin.join("kpackagetool6"), RECORDED_SLEEPING_KPACKAGETOOL);
+        let root = dir.path().join("root");
+        let package = root.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("component")).unwrap();
+        std::fs::write(root.join("component").join("marker"), b"being written").unwrap();
+        std::fs::create_dir_all(root.join("backup")).unwrap();
+        std::fs::write(root.join("backup").join("marker"), b"old").unwrap();
+        let tool_pid = dir.path().join("tool-pid");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            DETACHED_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_DETACHED_TOOL", "1"),
+                ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "100"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_TOOL_PID", tool_pid.to_str().unwrap()),
+            ],
+        );
+
+        let pid: i32 = std::fs::read_to_string(&tool_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let survived = process_running(pid);
+        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !process_running(pid),
+            "the fake tool {pid} outlived the test"
+        );
+        assert!(
+            survived,
+            "the fake tool had exited before the run returned, so the fixture tests nothing"
+        );
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Kills the process whose pid `pid_file` holds, waits for it to go, and
+    /// returns whether it was still running.
+    fn stop_recorded(pid_file: &Path) -> bool {
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let running = process_running(pid);
+        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!process_running(pid), "the stub {pid} outlived the test");
+        running
+    }
+
+    fn assert_child_done(output: &std::process::Output, done: &Path) {
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn the_verdict_counts_a_tool_gone_only_on_a_positive_check() {
+        use Probe::{Alive, Denied, Empty, Unknown};
+        use Reaped::{AfterKill, BeforeKill, Never, WaitFailed};
+        use Route::{Direct, Elevated};
+        use Verdict::{Gone, MayRun, Survivor};
+
+        let rows = [
+            // Direct: exits within the grace, or is killed by the SIGKILL.
+            (Direct, BeforeKill, true, Empty, Gone),
+            (Direct, AfterKill, true, Empty, Gone),
+            // Direct: a same-group descendant outlives it.
+            (Direct, BeforeKill, true, Alive, Survivor),
+            // A descendant holds the pipes past the bound.
+            (Direct, BeforeKill, false, Empty, Survivor),
+            (Elevated, BeforeKill, false, Empty, Survivor),
+            // A process this user may not signal is left.
+            (Direct, AfterKill, true, Denied, Survivor),
+            (Elevated, BeforeKill, true, Denied, Survivor),
+            (Elevated, AfterKill, true, Alive, Survivor),
+            // Elevated: sudo ends only after its command, unless SIGKILLed.
+            (Elevated, BeforeKill, true, Empty, Gone),
+            (Elevated, AfterKill, true, Empty, MayRun),
+            // Not reaped within the bound after the SIGKILL.
+            (Direct, Never, true, Empty, MayRun),
+            (Elevated, Never, true, Empty, MayRun),
+            // A wait error.
+            (Direct, WaitFailed, true, Empty, MayRun),
+            (Elevated, WaitFailed, true, Empty, MayRun),
+            // A probe answer that says nothing.
+            (Direct, BeforeKill, true, Unknown, MayRun),
+            (Elevated, BeforeKill, true, Unknown, MayRun),
+        ];
+        for (route, reaped, readers_finished, probe, expected) in rows {
+            let observed = Observed {
+                route,
+                reaped,
+                readers_finished,
+                probe,
+            };
+            assert_eq!(observed.verdict(), expected, "{observed:?}");
+        }
+    }
+
+    #[test]
+    fn the_group_probe_reads_eperm_as_a_live_process() {
+        use nix::errno::Errno;
+
+        assert_eq!(Probe::from_answer(Ok(())), Probe::Alive);
+        assert_eq!(Probe::from_answer(Err(Errno::ESRCH)), Probe::Empty);
+        assert_eq!(Probe::from_answer(Err(Errno::EPERM)), Probe::Denied);
+        assert_eq!(Probe::from_answer(Err(Errno::EINVAL)), Probe::Unknown);
+    }
+
+    const WAITING_SUDO_CHILD: &str =
+        "installer::install::tests::a_sudo_reaped_only_after_the_sigkill_keeps_the_backup";
+
+    /// A fake `sudo` that outlives `SIGTERM` and becomes its command, so only
+    /// the `SIGKILL` ends it, and the group is empty once it is reaped.
+    const KILLED_SUDO: &str = "#!/bin/sh\ntrap '' TERM\nexec \"$@\"\n";
+
+    /// A `sudo` that needed the `SIGKILL` proves nothing about its command, even
+    /// when the group probe then finds the group empty and both pipes closed.
+    #[test]
+    fn a_sudo_reaped_only_after_the_sigkill_keeps_the_backup() {
+        if std::env::var_os("PU_TEST_WAITING_SUDO").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let backup = root.join("backup");
+            let component = widget_at(&root.join("component"), "org.test.widget");
+            let slot = super::super::InstallSlot::new();
+
+            let failure =
+                install_via_kpackagetool(&root.join("package"), &component, true).unwrap_err();
+            assert_eq!(failure.message, "kpackagetool6 timed out after 0 s");
+            assert!(
+                failure.process_may_still_run,
+                "a sudo that needed the SIGKILL was read as proof its tool is gone"
+            );
+            let refusal = super::super::handle_installation_failure(
+                &backup,
+                &component,
+                &failure,
+                &slot.acquire(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                refusal.message,
+                format!(
+                    "install failed (kpackagetool6 timed out after 0 s), and the tool that failed it may still be running; the backup was kept at {}",
+                    backup.display()
+                )
+            );
+            assert_eq!(
+                std::fs::read_to_string(component.path.join("marker")).unwrap(),
+                "being written"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("sudo"), KILLED_SUDO);
+        write_script(&bin.join("kpackagetool6"), RECORDED_SLEEPING_KPACKAGETOOL);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("package")).unwrap();
+        std::fs::write(
+            root.join("package").join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("component")).unwrap();
+        std::fs::write(root.join("component").join("marker"), b"being written").unwrap();
+        std::fs::create_dir_all(root.join("backup")).unwrap();
+        std::fs::write(root.join("backup").join("marker"), b"old").unwrap();
+        let tool_pid = dir.path().join("tool-pid");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            WAITING_SUDO_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_WAITING_SUDO", "1"),
+                ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "500"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_TOOL_PID", tool_pid.to_str().unwrap()),
+            ],
+        );
+
+        let survived = stop_recorded(&tool_pid);
+        assert_child_done(&output, &done);
+        assert!(
+            !survived,
+            "the fake tool outlived the SIGKILL, so the group probe was not empty"
+        );
+    }
+
+    const TERM_EXIT_CHILD: &str =
+        "installer::install::tests::a_timed_out_tool_that_exits_on_sigterm_is_restored";
+
+    /// A tool that ends on `SIGTERM` within the grace, with its group and its
+    /// pipes, is gone, and its backup goes back as before.
+    #[test]
+    fn a_timed_out_tool_that_exits_on_sigterm_is_restored() {
+        if std::env::var_os("PU_TEST_TERM_EXIT").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let backup = root.join("backup");
+            let component = widget_at(&root.join("component"), "org.test.widget");
+            let slot = super::super::InstallSlot::new();
+
+            let failure =
+                install_via_kpackagetool(&root.join("package"), &component, false).unwrap_err();
+            assert_eq!(failure.message, "kpackagetool6 timed out after 0 s");
+            assert!(
+                !failure.process_may_still_run,
+                "a tool that exited on SIGTERM was read as possibly running"
+            );
+            super::super::handle_installation_failure(
+                &backup,
+                &component,
+                &failure,
+                &slot.acquire(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(component.path.join("marker")).unwrap(),
+                "old"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("kpackagetool6"), RECORDED_SLEEPING_KPACKAGETOOL);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("package")).unwrap();
+        std::fs::write(
+            root.join("package").join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("component")).unwrap();
+        std::fs::write(root.join("component").join("marker"), b"being written").unwrap();
+        std::fs::create_dir_all(root.join("backup")).unwrap();
+        std::fs::write(root.join("backup").join("marker"), b"old").unwrap();
+        let tool_pid = dir.path().join("tool-pid");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            TERM_EXIT_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_TERM_EXIT", "1"),
+                ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "500"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_TOOL_PID", tool_pid.to_str().unwrap()),
+            ],
+        );
+
+        let survived = stop_recorded(&tool_pid);
+        assert_child_done(&output, &done);
+        assert!(!survived, "the fake tool outlived the SIGTERM");
+    }
+
+    const UNREAPED_CHILD: &str =
+        "installer::install::tests::a_child_the_sigkill_misses_does_not_hold_the_run";
+
+    /// A fake `kpackagetool6` the group's signals never reach: it moves into
+    /// its parent's process group, as a `sudo` the user may not signal stays
+    /// out of the kill's reach, and closes the pipes so only the wait for it
+    /// could hold the run.
+    const GROUP_LEAVING_KPACKAGETOOL: &str = r#"#!/bin/sh
+exec perl -e 'setpgrp(0, getpgrp(getppid())) or die; open(my $f, ">", $ENV{PU_TEST_TOOL_PID}) or die; print $f "$$\n"; close($f); sleep 30' >/dev/null 2>&1
+"#;
+
+    #[test]
+    fn a_child_the_sigkill_misses_does_not_hold_the_run() {
+        if std::env::var_os("PU_TEST_UNREAPED").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let component = widget_at(&root.join("component"), "org.test.widget");
+            let started = std::time::Instant::now();
+
+            let failure =
+                install_via_kpackagetool(&root.join("package"), &component, false).unwrap_err();
+            let elapsed = started.elapsed();
+
+            // The 1 s timeout, the grace, the reap bound, and slack for a
+            // loaded machine; the stub sleeps 30 s.
+            let bound = std::time::Duration::from_secs(1 + 2) + KILL_GRACE + REAP_BOUND;
+            assert!(
+                elapsed < bound,
+                "the wait after the SIGKILL held the run for {elapsed:?}"
+            );
+            assert_eq!(failure.message, "kpackagetool6 timed out after 1 s");
+            assert!(failure.process_may_still_run);
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("kpackagetool6"), GROUP_LEAVING_KPACKAGETOOL);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("package")).unwrap();
+        std::fs::write(
+            root.join("package").join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("component")).unwrap();
+        let tool_pid = dir.path().join("tool-pid");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            UNREAPED_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_UNREAPED", "1"),
+                ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "1000"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_TOOL_PID", tool_pid.to_str().unwrap()),
+            ],
+        );
+
+        let survived = stop_recorded(&tool_pid);
+        assert_child_done(&output, &done);
+        assert!(
+            survived,
+            "the fake tool did not outlive the SIGKILL, so the fixture tests nothing"
+        );
+    }
+
+    const KEPT_BACKUP_CHILD: &str =
+        "installer::install::tests::a_kept_backup_is_repaired_once_the_timed_out_tool_is_gone";
+
+    /// A fake `kpackagetool6` that starts writing the component, then leaves a
+    /// writer in a session of its own holding the pipes, and ends on
+    /// `SIGTERM`.
+    const SESSION_LEAVING_KPACKAGETOOL: &str = r#"#!/bin/sh
+printf half > "$PU_TEST_COMPONENT/marker"
+setsid sh -c 'echo $$ > "$PU_TEST_TOOL_PID"; exec sleep 30' &
+exec sleep 30
+"#;
+
+    /// The first run's timed-out tool leaves a writer behind, so the backup
+    /// and its install record stay; once that writer is gone, the next run's
+    /// repair puts the component back from the kept backup.
+    #[test]
+    fn a_kept_backup_is_repaired_once_the_timed_out_tool_is_gone() {
+        if let Some(run) = std::env::var_os("PU_TEST_KEPT_BACKUP_RUN") {
+            let sites = super::super::RecordSites::scan(false);
+            if run == "repair" {
+                super::super::repair_records(&sites);
+            } else {
+                let component = widget_at(
+                    Path::new(&std::env::var("PU_TEST_COMPONENT").unwrap()),
+                    "org.test.widget",
+                );
+                let update = crate::types::AvailableUpdate::builder(component, 1, "2.0")
+                    .download_url(std::env::var("PU_TEST_DOWNLOAD").unwrap())
+                    .build();
+                let slot = super::super::InstallSlot::new();
+                let refusal = super::super::update_component(
+                    &update,
+                    &reqwest::blocking::Client::new(),
+                    &(),
+                    &super::super::BackupLedger::default(),
+                    &slot,
+                    &sites,
+                )
+                .err()
+                .expect("the timed-out install was reported as landed");
+                assert_eq!(refusal.kind, FailureKind::Install);
+                assert!(
+                    refusal.message.starts_with(
+                        "install failed (kpackagetool6 timed out after 1 s and is still running), and the tool that failed it may still be running; the backup was kept at "
+                    ),
+                    "{}",
+                    refusal.message
+                );
+            }
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("kpackagetool6"), SESSION_LEAVING_KPACKAGETOOL);
+        let component = root.join("data/plasma/plasmoids/org.test.widget");
+        std::fs::create_dir_all(&component).unwrap();
+        std::fs::write(
+            component.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget", "Version": "1.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(component.join("marker"), b"old").unwrap();
+        let package = root.join("src/org.test.widget");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget", "Version": "2.0"}}"#,
+        )
+        .unwrap();
+        let archive = root.join("package.tar");
+        let status = std::process::Command::new("tar")
+            .arg("--create")
+            .arg("--format=ustar")
+            .arg("--file")
+            .arg(&archive)
+            .arg("--directory")
+            .arg(root.join("src"))
+            .arg("org.test.widget")
+            .status()
+            .unwrap();
+        assert!(status.success(), "tar failed building the fixture");
+        let body = String::from_utf8(std::fs::read(&archive).unwrap()).unwrap();
+        let (base, _) = crate::testutil::serve(move |_| crate::testutil::ok(body.clone()));
+        for sub in ["home", "config", "cache", "share", "tmp"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let tool_pid = root.join("tool-pid");
+        let done = root.join("child-done");
+        let path = |sub: &str| root.join(sub).to_str().unwrap().to_string();
+        let download = format!("{base}/package.tar");
+        let mut envs = vec![
+            ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "1000".to_string()),
+            ("PU_TEST_CHILD_DONE", done.to_str().unwrap().to_string()),
+            ("PU_TEST_COMPONENT", component.to_str().unwrap().to_string()),
+            ("PU_TEST_DOWNLOAD", download),
+            ("PU_TEST_TOOL_PID", tool_pid.to_str().unwrap().to_string()),
+            ("HOME", path("home")),
+            ("XDG_DATA_HOME", path("data")),
+            ("XDG_CONFIG_HOME", path("config")),
+            ("XDG_CACHE_HOME", path("cache")),
+            ("XDG_DATA_DIRS", path("share")),
+            ("TMPDIR", path("tmp")),
+        ];
+        let run = |envs: &[(&str, String)]| {
+            let envs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            run_child(KEPT_BACKUP_CHILD, &bin, &envs)
+        };
+
+        envs.push(("PU_TEST_KEPT_BACKUP_RUN", "update".to_string()));
+        let timed_out = run(&envs);
+        let survived = stop_recorded(&tool_pid);
+        assert_child_done(&timed_out, &done);
+        assert!(
+            survived,
+            "the writer did not outlive the run, so the fixture tests nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(component.join("marker")).unwrap(),
+            "half",
+            "the backup was restored over a tree the tool's writer may still be writing"
+        );
+        let record = super::super::record::record_path(&component);
+        let named = std::fs::read_to_string(&record).unwrap();
+        let backup = PathBuf::from(named.strip_suffix('\n').unwrap());
+        assert_eq!(
+            std::fs::read_to_string(backup.join("marker")).unwrap(),
+            "old"
+        );
+
+        std::fs::remove_file(&done).unwrap();
+        envs.pop();
+        envs.push(("PU_TEST_KEPT_BACKUP_RUN", "repair".to_string()));
+        let repaired = run(&envs);
+        assert_child_done(&repaired, &done);
+        assert_eq!(
+            std::fs::read_to_string(component.join("marker")).unwrap(),
+            "old",
+            "the next run did not restore the component from the kept backup"
+        );
+        assert!(
+            !record.exists(),
+            "the repaired component's install record stayed"
+        );
+    }
+
+    const FALLBACK_CHILD: &str =
+        "installer::install::tests::a_timed_out_fallback_install_does_not_copy_over_the_tool";
+
+    /// A global theme's `kpackagetool6` times out with a writer still holding
+    /// the pipes, so the tool may still run: the type's direct fallback must
+    /// not copy the package over it, and the backup and its record stay for
+    /// the next run.
+    #[test]
+    fn a_timed_out_fallback_install_does_not_copy_over_the_tool() {
+        if std::env::var_os("PU_TEST_FALLBACK_RUN").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let component = InstalledComponent::new(
+                "Test Global Theme",
+                "org.test.globaltheme",
+                ComponentType::GlobalTheme,
+                root.join("data/plasma/look-and-feel/org.test.globaltheme"),
+            )
+            .with_version("1.0");
+            let update = crate::types::AvailableUpdate::builder(component, 1, "2.0")
+                .download_url(std::env::var("PU_TEST_DOWNLOAD").unwrap())
+                .build();
+            let slot = super::super::InstallSlot::new();
+            let sites = super::super::RecordSites::scan(false);
+
+            let refusal = super::super::update_component(
+                &update,
+                &reqwest::blocking::Client::new(),
+                &(),
+                &super::super::BackupLedger::default(),
+                &slot,
+                &sites,
+            )
+            .err()
+            .expect("a timed-out fallback install was reported as landed");
+            assert_eq!(refusal.kind, FailureKind::Install);
+            assert!(
+                refusal.message.starts_with(
+                    "install failed (kpackagetool6 timed out after 1 s and is still running), and the tool that failed it may still be running; the backup was kept at "
+                ),
+                "{}",
+                refusal.message
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("kpackagetool6"), SESSION_LEAVING_KPACKAGETOOL);
+        let component_path = root.join("data/plasma/look-and-feel/org.test.globaltheme");
+        std::fs::create_dir_all(&component_path).unwrap();
+        std::fs::write(
+            component_path.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.globaltheme", "Version": "1.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(component_path.join("marker"), b"old").unwrap();
+        let package = root.join("src/org.test.globaltheme");
+        std::fs::create_dir_all(package.join("contents")).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.globaltheme", "Version": "2.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("contents").join("copied"), b"new").unwrap();
+        let archive = root.join("package.tar");
+        let status = std::process::Command::new("tar")
+            .arg("--create")
+            .arg("--format=ustar")
+            .arg("--file")
+            .arg(&archive)
+            .arg("--directory")
+            .arg(root.join("src"))
+            .arg("org.test.globaltheme")
+            .status()
+            .unwrap();
+        assert!(status.success(), "tar failed building the fixture");
+        let body = String::from_utf8(std::fs::read(&archive).unwrap()).unwrap();
+        let (base, _) = crate::testutil::serve(move |_| crate::testutil::ok(body.clone()));
+        for sub in ["home", "config", "cache", "share", "tmp"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let tool_pid = root.join("tool-pid");
+        let done = root.join("child-done");
+        let path = |sub: &str| root.join(sub).to_str().unwrap().to_string();
+        let envs = vec![
+            ("PU_TEST_FALLBACK_RUN", "1".to_string()),
+            ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "1000".to_string()),
+            ("PU_TEST_CHILD_DONE", done.to_str().unwrap().to_string()),
+            ("PU_TEST_ROOT", root.to_str().unwrap().to_string()),
+            ("PU_TEST_DOWNLOAD", format!("{base}/package.tar")),
+            ("PU_TEST_TOOL_PID", tool_pid.to_str().unwrap().to_string()),
+            (
+                "PU_TEST_COMPONENT",
+                component_path.to_str().unwrap().to_string(),
+            ),
+            ("HOME", path("home")),
+            ("XDG_DATA_HOME", path("data")),
+            ("XDG_CONFIG_HOME", path("config")),
+            ("XDG_CACHE_HOME", path("cache")),
+            ("XDG_DATA_DIRS", path("share")),
+            ("TMPDIR", path("tmp")),
+        ];
+        let envs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+        let output = run_child(FALLBACK_CHILD, &bin, &envs);
+
+        let survived = stop_recorded(&tool_pid);
+        assert_child_done(&output, &done);
+        assert!(
+            survived,
+            "the tool did not outlive the run, so the fixture tests nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(component_path.join("marker")).unwrap(),
+            "half",
+            "the direct fallback copied over a tool that may still be running"
+        );
+        assert!(
+            !component_path.join("contents").exists(),
+            "the direct fallback ran: the package's contents landed in the component"
+        );
+        let record = super::super::record::record_path(&component_path);
+        let named = std::fs::read_to_string(&record).unwrap();
+        let backup = PathBuf::from(named.strip_suffix('\n').unwrap());
+        assert_eq!(
+            std::fs::read_to_string(backup.join("marker")).unwrap(),
+            "old",
+            "the kept backup changed"
         );
     }
 

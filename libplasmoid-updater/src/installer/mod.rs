@@ -350,6 +350,9 @@ fn execute_installation(
             };
             match installed {
                 Ok(()) => Ok(()),
+                // A tool the timeout could not prove gone may still be writing
+                // the tree, so nothing may be copied over it.
+                Err(e) if e.process_may_still_run => Err(e),
                 Err(e) => {
                     log::warn!(
                         target: "install",
