@@ -206,9 +206,10 @@ fn installer_sibling_component(name: &str) -> Option<&str> {
 }
 
 /// Returns whether `name` is one of the hidden siblings the installer writes
-/// beside a component, which a directory scan must never read as a component.
+/// beside a component (a tree in flight, or an install record), which a scan
+/// must never read as a component.
 pub(crate) fn is_installer_sibling(name: &str) -> bool {
-    installer_sibling_component(name).is_some()
+    installer_sibling_component(name).is_some() || super::record::is_record_name(name)
 }
 
 /// Returns whether `path` exists, without folding a failed lookup into "no":
@@ -357,7 +358,7 @@ pub(crate) fn recover_interrupted_installs(system: bool) {
 /// The directories a recovery scan covers, each once: global themes and splash
 /// screens share one directory, and a second scan of it would only repeat every
 /// decision over the same siblings.
-fn recover_dirs(system: bool) -> Vec<PathBuf> {
+pub(super) fn recover_dirs(system: bool) -> Vec<PathBuf> {
     let types = if system {
         ComponentType::all()
     } else {

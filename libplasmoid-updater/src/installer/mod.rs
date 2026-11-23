@@ -11,6 +11,7 @@ mod install;
 mod lock;
 mod plasmashell;
 pub(crate) mod privilege;
+mod record;
 
 use std::{
     fs,
@@ -36,6 +37,10 @@ pub(crate) use install::{
 };
 pub(crate) use lock::{UpdateLock, run_lock_held};
 pub(crate) use plasmashell::{requires_restart, restart_plasmashell};
+pub(crate) use record::{
+    RecordRows, RecordSites, record_rows, repair as repair_records,
+    report_lost as report_lost_records, spared_backups,
+};
 
 /// A single component's failure: the [`FailureKind`] naming the failed stage
 /// plus a human-readable message. The run-level [`crate::Error`] is never
@@ -93,10 +98,10 @@ pub(crate) struct InstallOutcome {
 
 /// The run's one install slot.
 ///
-/// The backup, install, registry write, version check and restore steps take
-/// a reference to the guard [`Self::acquire`] hands out, so calling one of
-/// them without a live guard does not compile; the functions they delegate to
-/// take none.
+/// The install record, backup, install, metadata patch, registry write,
+/// version check and restore steps take a reference to the guard
+/// [`Self::acquire`] hands out, so calling one of them without a live guard
+/// does not compile; the functions they delegate to take none.
 pub(crate) struct InstallSlot {
     held: Mutex<()>,
 }
@@ -148,6 +153,17 @@ pub(crate) struct InstallSlotGuard<'a> {
 /// writes into, and the `/usr/share/icons` tree that system-wide icon and
 /// cursor themes both install into.
 ///
+/// Under the guard, before the backup, an install record an interrupted
+/// install left beside the component is settled first (see
+/// [`record::settle_prior`]); after the backup, the component's record names
+/// it until the install settles, so a run killed mid-install is repaired from
+/// it by the next run. The record goes once the files are in place, before the
+/// registry write, and once a failed install is restored; it stays while a
+/// process the failed step started may still run, or when the restore failed. A
+/// record that cannot be removed once the files are in place fails the
+/// component before the registry write, so a later repair cannot put the old
+/// files back over a run it reported as landed.
+///
 /// When the install fails, the original component is restored from its backup,
 /// still under the guard, unless the failed step left a process that may still
 /// write that tree; if the restore itself fails, the returned
@@ -160,6 +176,7 @@ pub(crate) fn update_component(
     reporter: &dyn Reporter,
     backups: &BackupLedger,
     install_slot: &InstallSlot,
+    sites: &RecordSites,
 ) -> Result<InstallOutcome, ComponentFailure> {
     validate_selected_update(update)?;
     let component = &update.installed;
@@ -168,16 +185,21 @@ pub(crate) fn update_component(
     let unpacked = unpack_download(&downloaded, component, &update.latest_version, temp.path())?;
 
     let slot = install_slot.acquire();
+    let prior = record::settle_prior(sites, component, &slot)?;
     let backup_path = backup_component(component, backups, &slot)?;
+    let record = record::Open::write(sites, component, backup_path.as_deref(), prior, &slot);
 
     match execute_installation(&unpacked, component, &slot) {
         Ok(()) => {
-            post_install_tasks(update, &slot)?;
+            patch_installed_metadata(update, &slot);
+            record.landed(sites, &slot)?;
+            write_registry_entry(update, &slot)?;
             Ok(verify_installed_version(update, &slot))
         }
         Err(e) => {
             if let Some(backup) = &backup_path {
                 handle_installation_failure(backup, component, &e, &slot)?;
+                record.restored(sites, &slot);
             }
             Err(e)
         }
@@ -370,10 +392,8 @@ fn has_archive_magic(path: &Path) -> bool {
         || (n >= 262 && &magic[257..262] == b"ustar") // tar (ustar/gnu)
 }
 
-fn post_install_tasks(
-    update: &AvailableUpdate,
-    _slot: &InstallSlotGuard<'_>,
-) -> Result<(), ComponentFailure> {
+/// Writes the new version into the installed metadata, warning when it cannot.
+fn patch_installed_metadata(update: &AvailableUpdate, _slot: &InstallSlotGuard<'_>) {
     let component = &update.installed;
 
     let installed_json = component.path.join("metadata.json");
@@ -392,7 +412,12 @@ fn post_install_tasks(
     {
         log::warn!(target: "patch", "failed to update installed metadata.desktop: {}", e.message);
     }
+}
 
+fn write_registry_entry(
+    update: &AvailableUpdate,
+    _slot: &InstallSlotGuard<'_>,
+) -> Result<(), ComponentFailure> {
     registry::update_registry_after_install(update).map_err(|e| {
         ComponentFailure::new(
             FailureKind::Registry,

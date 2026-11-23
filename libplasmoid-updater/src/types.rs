@@ -962,6 +962,10 @@ impl Diagnostic {
 /// keys on it.
 pub(crate) const NO_DOWNLOAD_URL_REASON: &str = "no download url available";
 
+/// The diagnostic reason a component carries when a killed run left it for the
+/// next `update` to put back.
+pub(crate) const INTERRUPTED_INSTALL_REASON: &str = "interrupted install, run update to restore";
+
 /// A component whose store entry offered no download link for its version.
 ///
 /// It is neither unresolved nor skipped: `check` reports the diagnostic and
@@ -1005,9 +1009,18 @@ pub(crate) struct UpdateCheckResult {
     pub skipped: Vec<String>,
     /// The components behind the store-entry skips in `skipped`.
     pub unmatched: Vec<InstalledComponent>,
+    /// The paths, folded by [`crate::registry::normalize_path`], of the
+    /// components whose store entry is not newer than what is installed.
+    pub current: Vec<PathBuf>,
 }
 
 impl UpdateCheckResult {
+    /// Notes a component the store entry it matched does not update.
+    pub(crate) fn mark_current(&mut self, component: &InstalledComponent) {
+        self.current
+            .push(crate::registry::normalize_path(&component.path));
+    }
+
     /// Skips a component no store entry of its type matches: its name joins
     /// `skipped` and the component itself `unmatched`.
     pub fn skip_unmatched(&mut self, component: &InstalledComponent) {

@@ -38,6 +38,7 @@ pub(crate) fn fetch_updates(
     api_client: &ApiClient,
     config: &Config,
     reporter: &dyn Reporter,
+    records: Option<&installer::RecordSites>,
 ) -> crate::Result<UpdateCheckResult> {
     let components = find_installed(config.system)?;
     reporter.event(&Event::Checking {
@@ -46,7 +47,7 @@ pub(crate) fn fetch_updates(
     // Closes the check part on every path out of this function, a panic
     // unwinding out of the store check included.
     let _checked = CheckedOnDrop(reporter);
-    check_with_components(config, api_client, components)
+    check_with_components(config, api_client, components, records)
 }
 
 /// Emits [`Event::Checked`] once when dropped, so a check that sent
@@ -207,6 +208,7 @@ pub(crate) fn install_updates(
     config: &Config,
     reporter: &dyn Reporter,
     skipped: Vec<String>,
+    records: &installer::RecordSites,
 ) -> crate::Result<UpdateResult> {
     let _inhibit = if config.inhibit_idle {
         installer::InhibitGuard::acquire()
@@ -235,6 +237,7 @@ pub(crate) fn install_updates(
                         reporter,
                         &backups,
                         &install_slot,
+                        records,
                     );
                     report_outcome(&update.installed, &outcome, reporter);
                     (update, outcome)
@@ -243,8 +246,9 @@ pub(crate) fn install_updates(
         });
     // Retention runs once every install has finished, so no component's backup
     // can be pruned by a later component of its own type while it is still
-    // being installed.
-    installer::prune_backups(&backups);
+    // being installed, and every record this run's installs left open is on
+    // disk for it to spare.
+    installer::prune_backups(&backups, &installer::spared_backups(records));
 
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();

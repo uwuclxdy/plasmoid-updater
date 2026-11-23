@@ -13,7 +13,7 @@ use crate::{
     api::ApiClient,
     config::Config,
     registry::{RegistryIdCache, RegistryInstall},
-    types::{Diagnostic, InstalledComponent, UpdateCheckResult},
+    types::{Diagnostic, INTERRUPTED_INSTALL_REASON, InstalledComponent, UpdateCheckResult},
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
@@ -42,13 +42,27 @@ impl IdLookup<'_> {
 }
 
 /// Checks for updates using pre-discovered components.
+///
+/// With `records`, a component an interrupted install's record holds is
+/// reported through that record's row alone: it is neither checked against
+/// the store nor offered. `None` skips the records, as for a check while
+/// another run holds the update lock.
 pub(crate) fn check_with_components(
     config: &Config,
     api_client: &ApiClient,
     components: Vec<crate::types::InstalledComponent>,
+    records: Option<&crate::installer::RecordSites>,
 ) -> Result<UpdateCheckResult> {
     let mut result = UpdateCheckResult::default();
-    add_stranded_diagnostics(config.system, &mut result);
+    let record_rows = records
+        .map(|sites| crate::installer::record_rows(sites, &components))
+        .unwrap_or_default();
+    add_stranded_diagnostics(config.system, &record_rows, &mut result);
+    let components: Vec<InstalledComponent> = components
+        .into_iter()
+        .filter(|component| !record_rows.holds(&component.path))
+        .collect();
+    result.unresolved.extend(record_rows.rows);
 
     if components.is_empty() {
         return Ok(result);
@@ -124,25 +138,33 @@ fn record_component_check(
         } => {
             result.add_no_matching_download(component, diagnostic);
         }
-        evaluation::ComponentCheckResult::UpToDate => {}
+        evaluation::ComponentCheckResult::UpToDate => result.mark_current(component),
     }
 }
 
 /// Reports every component a killed run stranded in a hidden sibling. `check`
 /// never writes, so the diagnostic is the only thing it can offer; `update`
-/// repairs the tree first, before this check runs.
+/// repairs the tree first, before this check runs. A component an install
+/// record's row already answers for gets no second row.
 ///
 /// A hidden sibling seen while another run holds the update lock belongs to
 /// that live run's swap, not to a dead one, so the scan is skipped then.
-fn add_stranded_diagnostics(system: bool, result: &mut UpdateCheckResult) {
+fn add_stranded_diagnostics(
+    system: bool,
+    record_rows: &crate::installer::RecordRows,
+    result: &mut UpdateCheckResult,
+) {
     if crate::installer::run_lock_held() {
         return;
     }
     for (name, path) in crate::installer::stranded_components(system) {
+        if record_rows.holds(&path) {
+            continue;
+        }
         result.add_unresolved(Diagnostic::new(
             name,
             path,
-            "interrupted install, run update to restore".to_string(),
+            INTERRUPTED_INSTALL_REASON.to_string(),
         ));
     }
 }
@@ -222,14 +244,15 @@ mod tests {
 
             let mut result = crate::types::UpdateCheckResult::default();
             let lock = crate::installer::UpdateLock::acquire().unwrap();
-            super::add_stranded_diagnostics(false, &mut result);
+            let no_records = crate::installer::RecordRows::default();
+            super::add_stranded_diagnostics(false, &no_records, &mut result);
             assert!(
                 result.unresolved.is_empty(),
                 "a live run's lock did not hide its swap: {:?}",
                 result.unresolved
             );
             drop(lock);
-            super::add_stranded_diagnostics(false, &mut result);
+            super::add_stranded_diagnostics(false, &no_records, &mut result);
             assert_eq!(
                 result.unresolved.len(),
                 1,
@@ -573,7 +596,7 @@ mod tests {
             let component = component(PathBuf::from("/plasmoids/org.example.distro"), true);
 
             let result =
-                super::check_with_components(&config, &api_client, vec![component.clone()])
+                super::check_with_components(&config, &api_client, vec![component.clone()], None)
                     .unwrap();
 
             assert_eq!(result.skipped, vec![component.name]);

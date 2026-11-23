@@ -21,6 +21,7 @@ use std::{
 use crate::{
     Error, Result,
     installer::{ComponentFailure, privilege},
+    paths::Trust,
     types::{AvailableUpdate, ComponentType, InstalledComponent},
 };
 
@@ -60,35 +61,34 @@ fn user_components(
     entries: Vec<RegistryEntry>,
     roots: &[PathBuf],
 ) -> Vec<InstalledComponent> {
-    // A registry records the resolved spelling, while an XDG variable can be
-    // spelled with `.` or `..`: compare both sides the same way.
-    let roots: Vec<PathBuf> = roots
-        .iter()
-        .map(|root| utils::normalize_path(root))
-        .collect();
+    let roots = normalized_roots(roots);
     entries
         .into_iter()
         .filter_map(|entry| {
-            let path = utils::resolve_component_path(entry.installed_path);
-            if !is_contained(&path, &roots) {
-                log::warn!(
-                    target: "registry",
-                    "ignoring {component_type} entry {:?}: {path:?} is outside the user data directories",
-                    entry.name,
-                );
-                return None;
-            }
-            let directory_name = utils::extract_directory_name(&path)?;
-            // The installer's hidden siblings carry the component's own
-            // metadata and name; an entry naming one is not a component.
-            if crate::installer::is_installer_sibling(&directory_name) {
-                log::warn!(
-                    target: "registry",
-                    "ignoring {component_type} entry {:?}: its path names an installer sibling",
-                    entry.name,
-                );
-                return None;
-            }
+            let (path, directory_name) = match admit(entry.installed_path, &roots) {
+                Ok(admitted) => admitted,
+                #[expect(
+                    clippy::unnecessary_debug_formatting,
+                    reason = "the path is the registry's text, quoted as data"
+                )]
+                Err(Refused::Outside(path)) => {
+                    log::warn!(
+                        target: "registry",
+                        "ignoring {component_type} entry {:?}: {path:?} is outside the user data directories",
+                        entry.name,
+                    );
+                    return None;
+                }
+                Err(Refused::Sibling) => {
+                    log::warn!(
+                        target: "registry",
+                        "ignoring {component_type} entry {:?}: its path names an installer sibling",
+                        entry.name,
+                    );
+                    return None;
+                }
+                Err(Refused::Nameless) => return None,
+            };
             Some(InstalledComponent {
                 name: entry.name,
                 directory_name,
@@ -100,6 +100,180 @@ fn user_components(
             })
         })
         .collect()
+}
+
+/// The user's data directories folded the way a registry path is compared: a
+/// registry records the resolved spelling, while an XDG variable can be
+/// spelled with `.` or `..`.
+fn normalized_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .map(|root| utils::normalize_path(root))
+        .collect()
+}
+
+/// Why a registry entry's install path names no component a run may touch.
+enum Refused {
+    /// The path lies outside every root, or dodges them with `..`.
+    Outside(PathBuf),
+    /// The path names one of the installer's hidden siblings, which carry the
+    /// component's own metadata and name.
+    Sibling,
+    /// The path has no file name to call the component by.
+    Nameless,
+}
+
+/// The component path and directory name a registry entry's `installedfile`
+/// names, when it is one a run may touch: under one of `roots`, and not an
+/// installer sibling.
+fn admit(installed: PathBuf, roots: &[PathBuf]) -> std::result::Result<(PathBuf, String), Refused> {
+    let path = utils::resolve_component_path(installed);
+    if !is_contained(&path, roots) {
+        return Err(Refused::Outside(path));
+    }
+    let directory_name = utils::extract_directory_name(&path).ok_or(Refused::Nameless)?;
+    if crate::installer::is_installer_sibling(&directory_name) {
+        return Err(Refused::Sibling);
+    }
+    Ok((path, directory_name))
+}
+
+/// What the KNewStuff registries a run reads say about where its components
+/// sit.
+pub(crate) struct Registered {
+    /// The install path of every component a registry that could be read
+    /// names.
+    pub(crate) paths: Vec<PathBuf>,
+    /// Each registry that is there but could not be read or looked at, with
+    /// why: the components it names are unknown.
+    pub(crate) unread: Vec<(PathBuf, String)>,
+}
+
+/// The install path of every component the KNewStuff registries this run
+/// reads name, admitted the way discovery admits a registry-only component: a
+/// user run reads the user's registries and keeps paths under the user's data
+/// directories, a `--system` run reads the trusted system registries and keeps
+/// paths under the system data directories trusted now, plus every registry
+/// that is there but could not be read or looked at. It logs nothing of its
+/// own: discovery reports the entries it refuses, the trust check reports a
+/// path it cannot decide, and the caller decides what an unread registry
+/// means.
+pub(crate) fn registered_paths(system: bool) -> Registered {
+    let files: Vec<&'static str> = ComponentType::all()
+        .iter()
+        .filter_map(|component_type| component_type.registry_file())
+        .collect();
+    if system {
+        return system_registered(
+            crate::paths::system_data_candidates(system),
+            &files,
+            crate::paths::system_path_trust,
+        );
+    }
+    let knewstuff = crate::paths::knewstuff_dir();
+    let registries: Vec<PathBuf> = files.iter().map(|file| knewstuff.join(file)).collect();
+    registered_in(
+        &registries,
+        &normalized_roots(&crate::paths::user_data_roots()),
+    )
+}
+
+/// [`registered_paths`] for a `--system` run, each candidate root judged by
+/// `trust` at this call: a trusted root's registries are read, a refused or
+/// absent root is no source, and a root whose trust cannot be decided is an
+/// unread source, since a registry under it may name a component a record sits
+/// beside.
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the failing component is quoted as data, as the trust warning prints it"
+)]
+fn system_registered(
+    candidates: &[PathBuf],
+    files: &[&str],
+    trust: fn(&Path) -> Trust,
+) -> Registered {
+    let mut roots = Vec::new();
+    let mut undecided = Vec::new();
+    for root in candidates {
+        match trust(root) {
+            Trust::Trusted => roots.push(root.clone()),
+            Trust::Refused => {}
+            Trust::Unreadable { component, error } => {
+                undecided.push((root.join("knewstuff3"), format!("{component:?}: {error}")));
+            }
+        }
+    }
+    let (registries, mut unread) = system_registries(&roots, files, trust);
+    let mut registered = registered_in(&registries, &roots);
+    registered.unread.append(&mut undecided);
+    registered.unread.append(&mut unread);
+    registered
+}
+
+/// Splits the candidate system registries under `roots` into those the run may
+/// read and those whose trust the check could not decide: a record may sit
+/// beside a component a registry the run could not look at names, so such a
+/// registry is reported as unread. A refused candidate is neither: the run
+/// never reads an untrusted registry's components. An unreadable directory
+/// hides every registry in it, so it draws one entry, not one per type.
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the failing component is quoted as data, as the trust warning prints it"
+)]
+fn system_registries(
+    roots: &[PathBuf],
+    files: &[&str],
+    trust: fn(&Path) -> Trust,
+) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+    let mut registries = Vec::new();
+    let mut unread = Vec::new();
+    for root in roots {
+        let dir = root.join("knewstuff3");
+        match trust(&dir) {
+            Trust::Refused => continue,
+            Trust::Unreadable { component, error } => {
+                unread.push((dir, format!("{component:?}: {error}")));
+                continue;
+            }
+            Trust::Trusted => {}
+        }
+        for file in files {
+            let registry = dir.join(file);
+            match trust(&registry) {
+                Trust::Trusted => registries.push(registry),
+                Trust::Refused => {}
+                Trust::Unreadable { component, error } => {
+                    unread.push((registry, format!("{component:?}: {error}")));
+                }
+            }
+        }
+    }
+    (registries, unread)
+}
+
+/// [`registered_paths`] over `registries`, keeping paths under `roots`. A
+/// registry [`crate::paths::absence`] proves absent names nothing; any other
+/// failure to read or parse one leaves what it names unknown.
+fn registered_in(registries: &[PathBuf], roots: &[PathBuf]) -> Registered {
+    let mut registered = Registered {
+        paths: Vec::new(),
+        unread: Vec::new(),
+    };
+    for registry in registries {
+        match read_registry_file(registry) {
+            Ok(entries) => registered.paths.extend(
+                entries
+                    .into_iter()
+                    .filter_map(|entry| admit(entry.installed_path, roots).ok())
+                    .map(|(path, _)| path),
+            ),
+            Err(Error::Io { source, .. }) if crate::paths::absence(&source).is_some() => {}
+            Err(error) => registered
+                .unread
+                .push((registry.clone(), error.to_string())),
+        }
+    }
+    registered
 }
 
 /// Returns whether `path` may be an install target: a plain absolute path
@@ -145,26 +319,30 @@ fn scan_system_components_trusting(
 
     for registry in trusted_registries(&trusted_roots, registry_file, trusted) {
         for entry in read_registry_file(&registry)? {
-            let path = utils::resolve_component_path(entry.installed_path);
-            if !is_contained(&path, &trusted_roots) {
-                log::warn!(
-                    target: "registry",
-                    "ignoring {component_type} system entry {:?}: {path:?} is outside the system data directories",
-                    entry.name,
-                );
-                continue;
-            }
-            let Some(directory_name) = utils::extract_directory_name(&path) else {
-                continue;
+            let (path, directory_name) = match admit(entry.installed_path, &trusted_roots) {
+                Ok(admitted) => admitted,
+                #[expect(
+                    clippy::unnecessary_debug_formatting,
+                    reason = "the path is the registry's text, quoted as data"
+                )]
+                Err(Refused::Outside(path)) => {
+                    log::warn!(
+                        target: "registry",
+                        "ignoring {component_type} system entry {:?}: {path:?} is outside the system data directories",
+                        entry.name,
+                    );
+                    continue;
+                }
+                Err(Refused::Sibling) => {
+                    log::warn!(
+                        target: "registry",
+                        "ignoring {component_type} system entry {:?}: its path names an installer sibling",
+                        entry.name,
+                    );
+                    continue;
+                }
+                Err(Refused::Nameless) => continue,
             };
-            if crate::installer::is_installer_sibling(&directory_name) {
-                log::warn!(
-                    target: "registry",
-                    "ignoring {component_type} system entry {:?}: its path names an installer sibling",
-                    entry.name,
-                );
-                continue;
-            }
             if !seen.insert(directory_name.clone()) {
                 continue;
             }
@@ -847,6 +1025,167 @@ mod tests {
         let components = user_components(ComponentType::ColorScheme, entries, &[root]);
 
         assert!(components.is_empty(), "{components:?}");
+    }
+
+    /// A registry that is not there, or whose path runs through a regular
+    /// file, names nothing; one that is there but does not parse or cannot be
+    /// read leaves what it names unknown, so it is listed as unread.
+    #[test]
+    fn a_registry_that_is_there_but_cannot_be_read_is_listed_as_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let component = root.join("color-schemes/S.colors");
+        let valid = root.join("valid.knsregistry");
+        fs::write(
+            &valid,
+            format!(
+                "<hotnewstuffregistry><stuff category=\"112\"><name>S</name><installedfile>{}</installedfile></stuff></hotnewstuffregistry>",
+                component.display()
+            ),
+        )
+        .unwrap();
+        let file = root.join("file");
+        fs::write(&file, b"").unwrap();
+        let torn = root.join("torn.knsregistry");
+        fs::write(&torn, "<hotnewstuffregistry><stuff category=\"112\">").unwrap();
+        let closed = root.join("closed.knsregistry");
+        fs::write(&closed, "<hotnewstuffregistry></hotnewstuffregistry>").unwrap();
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        let registries = [
+            valid,
+            root.join("absent.knsregistry"),
+            file.join("under-a-file.knsregistry"),
+            torn.clone(),
+            closed.clone(),
+        ];
+
+        let registered = registered_in(&registries, &[root.to_path_buf()]);
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(registered.paths, [component]);
+        let unread: Vec<&Path> = registered
+            .unread
+            .iter()
+            .map(|(registry, _)| registry.as_path())
+            .collect();
+        let expected: &[&Path] = if privilege::is_root() {
+            &[&torn]
+        } else {
+            &[&torn, &closed]
+        };
+        assert_eq!(unread, expected);
+    }
+
+    /// A candidate registry whose trust the check could not decide is unread,
+    /// so a record beside a component it names is not pruned as unseen; a
+    /// refused candidate is reported nowhere.
+    #[test]
+    fn a_registry_the_trust_check_cannot_look_at_is_unread() {
+        let root = Path::new("/r");
+        let files = ["comic.knsregistry", "colorschemes.knsregistry"];
+        let (registries, unread) = system_registries(&[root.to_path_buf()], &files, |path| {
+            match path.file_name().and_then(std::ffi::OsStr::to_str) {
+                Some("knewstuff3" | "colorschemes.knsregistry") => Trust::Trusted,
+                Some("comic.knsregistry") => Trust::Unreadable {
+                    component: path.to_path_buf(),
+                    error: std::io::Error::from_raw_os_error(nix::libc::EACCES),
+                },
+                _ => Trust::Refused,
+            }
+        });
+        assert_eq!(
+            registries,
+            [root.join("knewstuff3/colorschemes.knsregistry")]
+        );
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert_eq!(unread[0].0, root.join("knewstuff3/comic.knsregistry"));
+        assert!(
+            unread[0].1.contains("Permission denied"),
+            "{:?}",
+            unread[0].1
+        );
+
+        // An unreadable directory hides every registry in it, with one entry.
+        let (registries, unread) = system_registries(&[root.to_path_buf()], &files, |path| {
+            if path.ends_with("knewstuff3") {
+                Trust::Unreadable {
+                    component: path.to_path_buf(),
+                    error: std::io::Error::from_raw_os_error(nix::libc::EACCES),
+                }
+            } else {
+                Trust::Refused
+            }
+        });
+        assert!(registries.is_empty(), "{registries:?}");
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert_eq!(unread[0].0, root.join("knewstuff3"));
+
+        let (registries, unread) =
+            system_registries(&[root.to_path_buf()], &files, |_| Trust::Refused);
+        assert!(
+            registries.is_empty() && unread.is_empty(),
+            "{registries:?} {unread:?}"
+        );
+    }
+
+    /// Each scan asks the trust check about every system root: a root it
+    /// cannot decide is an unread source at that scan, whatever an earlier
+    /// scan in the process read there, and a refused one is no source at all.
+    #[test]
+    fn a_system_root_undecided_at_the_scan_is_an_unread_source() {
+        let undecided = PathBuf::from("/r/secret/share");
+        let candidates = [
+            PathBuf::from("/r/user"),
+            undecided.clone(),
+            PathBuf::from("/r/srv"),
+        ];
+        let files = ["colorschemes.knsregistry"];
+        let all_trusted = system_registered(&candidates, &files, |path| {
+            if path.starts_with("/r/user") {
+                Trust::Refused
+            } else {
+                Trust::Trusted
+            }
+        });
+        assert_eq!(all_trusted.unread, Vec::<(PathBuf, String)>::new());
+
+        let registered = system_registered(&candidates, &files, |path| {
+            if path.starts_with("/r/user") {
+                Trust::Refused
+            } else if path == Path::new("/r/secret/share") {
+                Trust::Unreadable {
+                    component: PathBuf::from("/r/secret"),
+                    error: std::io::Error::from_raw_os_error(nix::libc::EACCES),
+                }
+            } else {
+                Trust::Trusted
+            }
+        });
+
+        let error = std::io::Error::from_raw_os_error(nix::libc::EACCES);
+        assert_eq!(
+            registered.unread,
+            [(
+                undecided.join("knewstuff3"),
+                format!("\"/r/secret\": {error}")
+            )]
+        );
+    }
+
+    /// A registry whose path holds a component too long to name cannot be
+    /// there, so it names nothing and is not unread.
+    #[test]
+    fn a_registry_too_long_to_name_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir
+            .path()
+            .join("n".repeat(300))
+            .join("colorschemes.knsregistry");
+
+        let registered = registered_in(&[registry], &[dir.path().to_path_buf()]);
+
+        assert_eq!(registered.paths, Vec::<PathBuf>::new());
+        assert_eq!(registered.unread, Vec::<(PathBuf, String)>::new());
     }
 
     #[test]

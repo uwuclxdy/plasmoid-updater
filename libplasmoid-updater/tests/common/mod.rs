@@ -202,17 +202,45 @@ impl Sandbox {
         self.run_child_with_data_home(test, store_url, &self.root.path().join("data"));
     }
 
+    /// Starts this test binary filtered to `test` inside the sandbox without
+    /// waiting for it, for a test that kills the run part-way.
+    pub(crate) fn spawn_child(&self, test: &str, store_url: &str) -> std::process::Child {
+        self.command(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_FLAG, "1")
+            .env(STORE_URL_VAR, store_url)
+            .env(MARKER_VAR, self.root.path().join("child-done"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// The command [`run_child`](Self::run_child) runs, unstarted, for a test
+    /// that sets more of the child's environment or its working directory.
+    /// The child marks its completion in [`Self::child_marker`].
+    pub(crate) fn child_command(&self, test: &str, store_url: &str) -> Command {
+        let mut command = self.command(std::env::current_exe().unwrap());
+        command
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_FLAG, "1")
+            .env(STORE_URL_VAR, store_url)
+            .env(MARKER_VAR, self.child_marker());
+        command
+    }
+
+    /// The file a child run writes once its body ran to the end.
+    pub(crate) fn child_marker(&self) -> PathBuf {
+        self.root.path().join("child-done")
+    }
+
     /// Like [`run_child`](Self::run_child), with `XDG_DATA_HOME` overridden to
     /// `data_home` (the later `env` wins over [`command`](Self::command)'s
     /// default), for a test that needs a differently-spelled data directory.
     pub fn run_child_with_data_home(&self, test: &str, store_url: &str, data_home: &Path) {
-        let marker = self.root.path().join("child-done");
+        let marker = self.child_marker();
         let output = self
-            .command(std::env::current_exe().unwrap())
-            .args([test, "--exact", "--nocapture", "--test-threads=1"])
-            .env(CHILD_FLAG, "1")
-            .env(STORE_URL_VAR, store_url)
-            .env(MARKER_VAR, &marker)
+            .child_command(test, store_url)
             .env("XDG_DATA_HOME", data_home)
             .output()
             .unwrap();

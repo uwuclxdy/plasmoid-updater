@@ -440,12 +440,15 @@ pub(crate) fn copy_dir_as_root(src: &Path, dest: &Path) -> Result<(), ComponentF
     }
 }
 
-/// Removes a file as root, whatever the path looks like.
+/// Removes a file as root, whatever the path looks like; a file already gone
+/// is gone, as the non-root arm's `rm -f` has it.
 pub(crate) fn remove_file_as_root(path: &Path) -> Result<(), ComponentFailure> {
     if is_root() {
-        std::fs::remove_file(path)
-            .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
-        Ok(())
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ComponentFailure::io(FailureKind::Install, path, e)),
+        }
     } else {
         run_sudo_os(&[OsStr::new("rm"), OsStr::new("-f"), path.as_os_str()])
     }
@@ -478,6 +481,19 @@ mod tests {
     use std::ffi::OsString;
 
     use super::*;
+
+    /// A root run removes a file already gone without failing: the non-root
+    /// arm's `rm -f` has the same answer.
+    #[test]
+    fn removing_a_missing_file_as_root_succeeds() {
+        if !is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        let removed = remove_file_as_root(&missing);
+        assert!(removed.is_ok(), "{removed:?}");
+    }
 
     /// Builds a fake `sudo` that records its arguments and refuses, then runs
     /// this test again with that `sudo` first on `PATH`.

@@ -108,11 +108,16 @@ pub fn check(config: &Config, reporter: &dyn Reporter) -> Result<CheckResult> {
     crate::utils::validate_environment(config.skip_plasma_detection)?;
 
     let api_client = api::ApiClient::new(config)?;
-    let result = crate::utils::fetch_updates(&api_client, config, reporter)?;
+    // Another run's open records belong to installs still running.
+    let records =
+        (!installer::run_lock_held()).then(|| installer::RecordSites::scan(config.system));
+    let result = crate::utils::fetch_updates(&api_client, config, reporter, records.as_ref())?;
+    let result = crate::utils::apply_exclusions(result, config);
+    if let Some(records) = &records {
+        installer::report_lost_records(records, &result.updates, &result.current, false);
+    }
 
-    Ok(CheckResult::from_internal(crate::utils::apply_exclusions(
-        result, config,
-    )))
+    Ok(CheckResult::from_internal(result))
 }
 
 /// Result of checking for available updates.
@@ -265,11 +270,13 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
     let _lock = installer::UpdateLock::acquire()?;
     crate::utils::validate_environment(config.skip_plasma_detection)?;
     crate::utils::require_extractor()?;
-    repair_after_interrupted_run(config);
+    let records = installer::RecordSites::scan(config.system);
+    repair_after_interrupted_run(config, &records);
 
     let api_client = api::ApiClient::new(config)?;
-    let fetched = crate::utils::fetch_updates(&api_client, config, reporter)?;
+    let fetched = crate::utils::fetch_updates(&api_client, config, reporter, Some(&records))?;
     let mut check_result = crate::utils::apply_exclusions(fetched, config);
+    installer::report_lost_records(&records, &check_result.updates, &check_result.current, true);
 
     let mut skipped = check_result.skipped;
     skipped.extend(
@@ -303,6 +310,7 @@ pub fn update(config: &Config, reporter: &dyn Reporter) -> Result<UpdateResult> 
         config,
         reporter,
         skipped,
+        &records,
     )?;
     result.failed.extend(failed);
     Ok(result)
@@ -354,7 +362,8 @@ pub fn install(
         Err(error) => return Err(error),
     };
     crate::utils::validate_environment(config.skip_plasma_detection)?;
-    repair_after_interrupted_run(config);
+    let records = installer::RecordSites::scan(config.system);
+    repair_after_interrupted_run(config, &records);
 
     if updates.is_empty() {
         return Ok(UpdateResult::default());
@@ -364,7 +373,7 @@ pub fn install(
 
     let api_client = api::ApiClient::new(config)?;
 
-    crate::utils::install_updates(updates, &api_client, config, reporter, Vec::new())
+    crate::utils::install_updates(updates, &api_client, config, reporter, Vec::new(), &records)
 }
 
 /// Clears what a run killed mid-install left behind, before this run scans or
@@ -372,9 +381,12 @@ pub fn install(
 ///
 /// The caller holds the run lock, which is what makes every one of these
 /// leftovers a dead run's: component trees stranded in hidden siblings by a
-/// swap that never finished, and download directories in the temp dir.
-fn repair_after_interrupted_run(config: &Config) {
+/// swap that never finished, components an install record says were being
+/// replaced (put back from the backup it names), and download directories in
+/// the temp dir.
+fn repair_after_interrupted_run(config: &Config, records: &installer::RecordSites) {
     installer::recover_interrupted_installs(config.system);
+    installer::repair_records(records);
     installer::remove_stale_temp_dirs();
 }
 
@@ -455,7 +467,10 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 /// directories that [`install`]'s repair settles: any hidden `-new`/`-old`
 /// sibling it finds — a component stranded in `-old`, both copies of an
 /// interrupted swap, a dead copy beside a live component, or a lone `-new`
-/// copy of an install killed mid-copy.
+/// copy of an install killed mid-copy — or an install record it restores from
+/// or removes. A record whose backup is gone, or one the repair keeps, needs
+/// no write and does not count, and neither does a registry or directory it
+/// cannot read: the repair cannot read it either, so it writes nothing there.
 ///
 /// It scans the directories [`install`]'s repair scans, user-local ones or,
 /// under [`Config::system`], system-wide ones, and reads the disk only: it
@@ -491,7 +506,9 @@ pub fn get_installed(config: &Config) -> Result<Vec<InstalledComponent>> {
 /// ```
 pub fn needs_repair(config: &Config) -> Result<bool> {
     crate::utils::validate_environment(config.skip_plasma_detection)?;
-    Ok(!installer::run_lock_held() && installer::has_interrupted_installs(config.system))
+    Ok(!installer::run_lock_held()
+        && (installer::has_interrupted_installs(config.system)
+            || installer::RecordSites::scan(config.system).has_repair_work()))
 }
 
 /// Restarts the systemd user unit whose main process owns

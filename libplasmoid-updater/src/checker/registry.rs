@@ -89,7 +89,7 @@ pub(crate) fn check_components(
                 } => {
                     result.add_no_matching_download(component, diagnostic);
                 }
-                evaluation::ComponentCheckResult::UpToDate => {}
+                evaluation::ComponentCheckResult::UpToDate => result.mark_current(component),
                 evaluation::ComponentCheckResult::Unmatched(diagnostic) => {
                     if system {
                         result.skip_unmatched(component);

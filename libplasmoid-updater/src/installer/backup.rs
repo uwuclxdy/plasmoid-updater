@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{ComponentFailure, InstallSlotGuard};
+use super::{ComponentFailure, InstallSlotGuard, record::Spared};
 use crate::{FailureKind, installer::privilege, types::InstalledComponent};
 
 const MAX_BACKUPS_PER_TYPE: usize = 5;
@@ -49,12 +49,13 @@ impl BackupLedger {
 }
 
 /// Keeps the newest [`MAX_BACKUPS_PER_TYPE`] backups of every component type
-/// this run backed up, never taking away one this run made.
+/// this run backed up, never taking away one this run made or one an open
+/// install record may name (`spared`).
 ///
 /// Called once the run's installs have all finished: pruning inside one
 /// component's backup could take away a backup a still-running component of the
 /// same type will need for its restore.
-pub(crate) fn prune_backups(ledger: &BackupLedger) {
+pub(crate) fn prune_backups(ledger: &BackupLedger, spared: &Spared) {
     let created = {
         let mut guard = ledger
             .created
@@ -77,23 +78,29 @@ pub(crate) fn prune_backups(ledger: &BackupLedger) {
         }
     }
     for ((base, system), records) in by_base {
-        prune_backups_in(&base, &records, system, MAX_BACKUPS_PER_TYPE);
+        prune_backups_in(&base, &records, system, MAX_BACKUPS_PER_TYPE, spared);
     }
 }
 
-fn prune_backups_in(base: &Path, created: &[BackupRecord], system: bool, max_keep: usize) {
+fn prune_backups_in(
+    base: &Path,
+    created: &[BackupRecord],
+    system: bool,
+    max_keep: usize,
+    spared: &Spared,
+) {
     let types: BTreeSet<&str> = created.iter().map(|record| record.type_subdir).collect();
     let skip: Vec<PathBuf> = created
         .iter()
         .map(|record| record.timestamp_dir.clone())
         .collect();
     for type_subdir in types {
-        cleanup_old_backups_in(base, type_subdir, max_keep, &skip, system);
+        cleanup_old_backups_in(base, type_subdir, max_keep, &skip, system, spared);
     }
 }
 
 /// The base backup directory for user-mode backups.
-fn user_backup_base_dir() -> PathBuf {
+pub(super) fn user_backup_base_dir() -> PathBuf {
     crate::paths::cache_home().join("plasmoid-updater/backups")
 }
 
@@ -125,7 +132,7 @@ fn backup_name(at: jiff::civil::DateTime) -> String {
 /// program would not write for that wall time. A name is a backup's only when
 /// it is the exact spelling [`backup_name`] gives it: a parseable variant of
 /// the name a person or another tool made is never counted and never removed.
-fn backup_time(name: &str) -> Option<jiff::civil::DateTime> {
+pub(super) fn backup_time(name: &str) -> Option<jiff::civil::DateTime> {
     let at = jiff::civil::DateTime::strptime(BACKUP_TIMESTAMP_FORMAT, name).ok()?;
     (backup_name(at) == name).then_some(at)
 }
@@ -650,7 +657,8 @@ fn system_backup_dirs(base: &Path, type_subdir: &str) -> Vec<PathBuf> {
 }
 
 /// Removes old backup directories, keeping the most recent `max_keep` and
-/// never one of `skip`, the directories the current run created.
+/// never one of `skip`, the directories the current run created, nor one
+/// `spared` keeps for an open install record.
 ///
 /// Only a directory named as the program names a backup is a backup, and only a
 /// backup is ever pruned: a stray directory is neither counted toward the limit
@@ -663,6 +671,7 @@ fn cleanup_old_backups_in(
     max_keep: usize,
     skip: &[PathBuf],
     system: bool,
+    spared: &Spared,
 ) {
     let candidates = if system {
         system_backup_dirs(base, type_subdir)
@@ -692,7 +701,7 @@ fn cleanup_old_backups_in(
         // This run's own backups are chosen by identity: clock skew can sort
         // one oldest, and restoring an update's own backup is the one thing
         // retention must never take away.
-        if skip.contains(&path) {
+        if skip.contains(&path) || spared.spares(&path, type_subdir) {
             continue;
         }
         remove_backup(&path, type_subdir, system);
@@ -726,7 +735,7 @@ fn remove_backup(path: &Path, type_subdir: &str, system: bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::installer) mod tests {
     use super::*;
     use crate::testutil::logs::{capture_logs, captured_logs};
     use crate::types::ComponentType;
@@ -753,7 +762,7 @@ mod tests {
         assert_eq!(count_before, 7);
 
         // Run cleanup keeping 5
-        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false, &Spared::default());
 
         // Verify only 5 remain
         let count_after = std::fs::read_dir(base.path())
@@ -855,7 +864,7 @@ mod tests {
             std::fs::create_dir_all(&type_dir).unwrap();
         }
 
-        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false, &Spared::default());
 
         // All 3 should still exist
         let count = std::fs::read_dir(base.path())
@@ -965,7 +974,7 @@ mod tests {
         })
         .collect();
 
-        prune_backups_in(base.path(), &created, false, 5);
+        prune_backups_in(base.path(), &created, false, 5, &Spared::default());
 
         for day in 1..=3 {
             assert!(
@@ -1011,6 +1020,7 @@ mod tests {
             5,
             std::slice::from_ref(&current),
             false,
+            &Spared::default(),
         );
 
         assert!(current_type.is_dir(), "the run's own backup was pruned");
@@ -1039,7 +1049,7 @@ mod tests {
         }
         make_backup(base.path(), "not-a-date", subdir);
 
-        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false, &Spared::default());
 
         for day in 1..=5 {
             assert!(
@@ -1067,7 +1077,7 @@ mod tests {
             make_backup(base.path(), stray, subdir);
         }
 
-        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false, &Spared::default());
 
         for day in 1..=5 {
             assert!(
@@ -1102,7 +1112,7 @@ mod tests {
             .unwrap();
         assert!(touched.success());
 
-        cleanup_old_backups_in(base.path(), subdir, 1, &[], false);
+        cleanup_old_backups_in(base.path(), subdir, 1, &[], false, &Spared::default());
 
         assert!(
             base.path()
@@ -1485,7 +1495,7 @@ mod tests {
             .unwrap();
         assert!(touched.success());
 
-        cleanup_old_backups_in(base.path(), subdir, 5, &[], false);
+        cleanup_old_backups_in(base.path(), subdir, 5, &[], false, &Spared::default());
 
         let named = std::fs::read_dir(base.path())
             .unwrap()
@@ -1756,21 +1766,21 @@ mod tests {
         }
     }
 
-    struct SudoChild {
+    pub(in crate::installer) struct SudoChild {
         _dir: tempfile::TempDir,
-        root: PathBuf,
-        output: std::process::Output,
-        log: String,
+        pub(in crate::installer) root: PathBuf,
+        pub(in crate::installer) output: std::process::Output,
+        pub(in crate::installer) log: String,
     }
 
     /// The fixture root when this process is `test`'s child run.
-    fn backup_child_root(test: &str) -> Option<PathBuf> {
+    pub(in crate::installer) fn backup_child_root(test: &str) -> Option<PathBuf> {
         let child = std::env::var("PU_BACKUP_CHILD_TEST").ok()?;
         (child == test).then(|| PathBuf::from(std::env::var("PU_BACKUP_ROOT").unwrap()))
     }
 
     /// Fails unless `sudo` on `PATH` is the fixture's, never the real one.
-    fn assert_fake_sudo(root: &Path) {
+    pub(in crate::installer) fn assert_fake_sudo(root: &Path) {
         let resolved = std::process::Command::new("sh")
             .args(["-c", "command -v sudo"])
             .output()
@@ -1797,6 +1807,13 @@ mod tests {
     }
 
     fn run_backup_child_with(test: &str, tail: &str) -> SudoChild {
+        run_sudo_child("installer::backup::tests", test, tail)
+    }
+
+    /// Re-runs `module`'s `test` in a child process with a fake `sudo` first on
+    /// `PATH` that logs its arguments, then runs `tail`, and a fresh fixture
+    /// root in `PU_BACKUP_ROOT`.
+    pub(in crate::installer) fn run_sudo_child(module: &str, test: &str, tail: &str) -> SudoChild {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let bin = root.join("bin");
@@ -1811,7 +1828,7 @@ mod tests {
         let log_path = root.join("sudo.log");
 
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg(format!("installer::backup::tests::{test}"))
+            .arg(format!("{module}::{test}"))
             .args(["--exact", "--nocapture", "--test-threads=1"])
             .env_clear()
             .env(
@@ -2055,7 +2072,7 @@ mod tests {
             // The newest is this run's own and must survive.
             ledger.record(&base.join("2024-01-06T00-00-00"), subdir, true);
 
-            prune_backups(&ledger);
+            prune_backups(&ledger, &Spared::default());
 
             assert!(
                 !base.join("2024-01-01T00-00-00").join(subdir).exists(),

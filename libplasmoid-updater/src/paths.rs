@@ -35,7 +35,14 @@ pub(crate) fn user_data_roots() -> Vec<PathBuf> {
     vec![data_home(), config_home(), user_home().to_path_buf()]
 }
 
-static SYSTEM_DATA_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+/// The system data roots `XDG_DATA_DIRS` names, and those of them the trust
+/// check passed when the list was first asked for.
+struct SystemDataDirs {
+    candidates: Vec<PathBuf>,
+    trusted: Vec<PathBuf>,
+}
+
+static SYSTEM_DATA_DIRS: OnceLock<SystemDataDirs> = OnceLock::new();
 
 /// Returns the system-wide data directories a system component may come from,
 /// respecting XDG_DATA_DIRS.
@@ -48,30 +55,82 @@ static SYSTEM_DATA_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 ///
 /// A user run (`system == false`) gets an empty list without reading the
 /// environment or the filesystem: user components never come from these
-/// directories. A `--system` run resolves the candidate list once per process;
-/// every consumer still judges each path under it before use, since a directory
-/// can turn untrusted later in the run.
+/// directories. A `--system` run resolves the list once per process; every
+/// consumer still judges each path under it before use, since a directory can
+/// turn untrusted later in the run.
 pub(crate) fn system_data_dirs(system: bool) -> &'static [PathBuf] {
     if !system {
         return &[];
     }
+    &system_dirs().trusted
+}
+
+/// Returns every system data root `XDG_DATA_DIRS` names, judged by nothing:
+/// a caller that must see a root's trust change within the process asks the
+/// trust check about each one itself.
+pub(crate) fn system_data_candidates(system: bool) -> &'static [PathBuf] {
+    if !system {
+        return &[];
+    }
+    &system_dirs().candidates
+}
+
+fn system_dirs() -> &'static SystemDataDirs {
     SYSTEM_DATA_DIRS.get_or_init(|| {
         let raw = std::env::var("XDG_DATA_DIRS")
             .ok()
             .filter(|dirs| !dirs.is_empty())
             .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
-        trusted_system_dirs(&raw)
+        system_dirs_from(&raw, system_path_trust)
     })
 }
 
-/// Splits an XDG_DATA_DIRS value into the directories that may hold system
-/// data: the user-owned ones are dropped, each with a warning.
-fn trusted_system_dirs(raw: &str) -> Vec<PathBuf> {
-    raw.split(':')
+/// Splits an XDG_DATA_DIRS value into its directories and keeps apart the
+/// ones that may hold system data; a refused directory is left out of those,
+/// with a warning.
+fn system_dirs_from(raw: &str, trust: fn(&Path) -> Trust) -> SystemDataDirs {
+    let candidates: Vec<PathBuf> = raw
+        .split(':')
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
-        .filter(|dir| is_trusted_system_path(dir))
-        .collect()
+        .collect();
+    let trusted = candidates
+        .iter()
+        .filter(|dir| matches!(trust(dir), Trust::Trusted))
+        .cloned()
+        .collect();
+    SystemDataDirs {
+        candidates,
+        trusted,
+    }
+}
+
+/// What a failed stat or open proves about the path it named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Absent {
+    /// Nothing is there: the path does not exist, or one of its components
+    /// is not a directory.
+    Gone,
+    /// The path is too long for a path-based call to reach, so nothing any
+    /// reader or writer of this run looks for by it is there for them.
+    Unreachable,
+}
+
+/// The one rule for what a failed stat or open of a path proves: `NotFound`
+/// and `ENOTDIR` that nothing is there, `ENAMETOOLONG` that nothing there can
+/// be reached by that path. Any other failure proves nothing (`None`): the
+/// path may hold what was looked for.
+pub(crate) fn absence(error: &std::io::Error) -> Option<Absent> {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) {
+        Some(Absent::Gone)
+    } else if error.raw_os_error() == Some(nix::libc::ENAMETOOLONG) {
+        Some(Absent::Unreachable)
+    } else {
+        None
+    }
 }
 
 /// Returns whether ownership `uid` and permission bits `mode` make a path
@@ -80,23 +139,52 @@ pub(crate) fn trusted_owner(uid: u32, mode: u32) -> bool {
     uid == 0 && mode & 0o022 == 0
 }
 
-/// Returns whether `path` is an absolute path whose every component is a real,
-/// root-owned file or directory that group or others cannot write.
+/// What a trust check says about a path.
+pub(crate) enum Trust {
+    /// Every component is a real, root-owned file or directory that group or
+    /// others cannot write.
+    Trusted,
+    /// The check decided against the path: it is absent, a symlink, not
+    /// root's, or writable by group or others.
+    Refused,
+    /// A component could not be looked at, so nothing is known about the path:
+    /// what sits under it, a registry file included, cannot be ruled out.
+    Unreadable {
+        /// The component the stat failed on.
+        component: PathBuf,
+        /// That failure.
+        error: std::io::Error,
+    },
+}
+
+/// Returns what the trust check says about `path`: an absolute path whose
+/// every component is a real, root-owned file or directory that group or
+/// others cannot write, or why it is not.
 ///
 /// Every component is judged, not only the last: a user-owned symlink partway
 /// down would otherwise land the lookup wherever the user points it, and the
 /// real directory it resolves to would lend its trust to that path.
 ///
 /// A component that exists and fails the check is named in a warning, once per
-/// process for each distinct refusal; a path that does not exist is not trusted
-/// and not warned about, since a directory missing from `XDG_DATA_DIRS` is a
-/// normal configuration.
-pub(crate) fn is_trusted_system_path(path: &Path) -> bool {
+/// process for each distinct refusal; a path [`absence`] proves absent is
+/// refused without a warning, since a directory missing from `XDG_DATA_DIRS`
+/// is a normal configuration. A refusal in one ancestor decides the whole
+/// path, even when a deeper component cannot be looked at: nothing under a
+/// refused ancestor is trusted. Only a path whose every ancestor is trusted
+/// and that holds a component the check could not look at is
+/// [`Trust::Unreadable`], and it is warned about: the path is not refused, it
+/// is unknown.
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the failing component is quoted as data, as the trust warning prints it"
+)]
+pub(crate) fn system_path_trust(path: &Path) -> Trust {
     if !path.is_absolute() {
         warn_untrusted_once(path, format_args!("not an absolute path"));
-        return false;
+        return Trust::Refused;
     }
 
+    let mut unseen = None;
     for component in path.ancestors() {
         match std::fs::symlink_metadata(component) {
             Ok(metadata) => {
@@ -109,17 +197,27 @@ pub(crate) fn is_trusted_system_path(path: &Path) -> bool {
                             "{component:?} is a symlink, not owned by root, or writable by group or others"
                         ),
                     );
-                    return false;
+                    return Trust::Refused;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) if absence(&e).is_some() => return Trust::Refused,
             Err(e) => {
-                warn_untrusted_once(path, format_args!("{component:?}: {e}"));
-                return false;
+                if unseen.is_none() {
+                    unseen = Some((component.to_path_buf(), e));
+                }
             }
         }
     }
-    true
+    if let Some((component, error)) = unseen {
+        warn_untrusted_once(path, format_args!("{component:?}: {error}"));
+        return Trust::Unreadable { component, error };
+    }
+    Trust::Trusted
+}
+
+/// Returns whether [`system_path_trust`] trusts `path`.
+pub(crate) fn is_trusted_system_path(path: &Path) -> bool {
+    matches!(system_path_trust(path), Trust::Trusted)
 }
 
 static WARNED_REFUSALS: OnceLock<Mutex<HashSet<(PathBuf, String)>>> = OnceLock::new();
@@ -323,8 +421,91 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(warnings(&unreadable, "Permission denied"), 1, "{lines:?}");
+        assert_eq!(
+            warnings(
+                &unreadable,
+                "is a symlink, not owned by root, or writable by group or others"
+            ),
+            1,
+            "{lines:?}"
+        );
         assert_eq!(warnings(&relative, "not an absolute path"), 1, "{lines:?}");
+    }
+
+    /// A refusal in an ancestor decides the whole path even where a deeper
+    /// component cannot be looked at: nothing under a refused ancestor is
+    /// trusted, and the refusal is what the warning names.
+    #[test]
+    fn a_refused_ancestor_decides_even_where_a_component_is_unseen() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unseen = locked.join("knewstuff3");
+
+        let verdict = system_path_trust(&unseen);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(verdict, Trust::Refused));
+        assert!(matches!(
+            system_path_trust(&dir.path().join("missing")),
+            Trust::Refused
+        ));
+    }
+
+    /// A path through a regular file, or one holding a component too long to
+    /// name, cannot exist: the check refuses it as it refuses a missing path,
+    /// at once and with no warning, whatever its ancestors are.
+    #[test]
+    fn a_path_that_cannot_exist_is_refused_without_a_warning() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let through_file = file.join("knewstuff3");
+        let too_long = dir.path().join("n".repeat(300)).join("knewstuff3");
+
+        let lines = captured_logs_while(|| {
+            assert!(matches!(system_path_trust(&through_file), Trust::Refused));
+            assert!(matches!(system_path_trust(&too_long), Trust::Refused));
+        });
+
+        let named: Vec<&String> = lines
+            .iter()
+            .filter(|line| {
+                line.contains(&format!("{through_file:?}"))
+                    || line.contains(&format!("{too_long:?}"))
+            })
+            .collect();
+        assert_eq!(named, Vec::<&String>::new());
+    }
+
+    /// The absence rule every stat and open of the record scan, the registry
+    /// read and the trust check shares.
+    #[test]
+    fn only_a_missing_path_a_file_in_the_way_or_a_too_long_name_proves_absence() {
+        let error = std::io::Error::from_raw_os_error;
+        assert_eq!(absence(&error(nix::libc::ENOENT)), Some(Absent::Gone));
+        assert_eq!(absence(&error(nix::libc::ENOTDIR)), Some(Absent::Gone));
+        assert_eq!(
+            absence(&error(nix::libc::ENAMETOOLONG)),
+            Some(Absent::Unreachable)
+        );
+        for unknown in [
+            nix::libc::EACCES,
+            nix::libc::EIO,
+            nix::libc::ELOOP,
+            nix::libc::EISDIR,
+        ] {
+            assert_eq!(absence(&error(unknown)), None, "errno {unknown}");
+        }
     }
 
     #[test]
@@ -369,11 +550,11 @@ mod tests {
             return;
         }
 
-        let roots = trusted_system_dirs(&format!(
-            "{}:{}",
-            user_owned.display(),
-            root_owned.display()
-        ));
+        let roots = system_dirs_from(
+            &format!("{}:{}", user_owned.display(), root_owned.display()),
+            system_path_trust,
+        )
+        .trusted;
 
         assert_eq!(roots, vec![root_owned]);
     }
