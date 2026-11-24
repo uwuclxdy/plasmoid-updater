@@ -29,7 +29,8 @@ use crate::{AvailableUpdate, Event, FailureKind, Reporter};
 
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
 const DOWNLOAD_BUFFER_SIZE: usize = 8192;
-/// The cap on an unverified download whose entry advertises no size at all.
+/// The cap on an unverified download whose entry advertises no known size: none
+/// at all, or an advertised 0 counting as no size.
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 /// The most an archive may claim to unpack to before extraction is refused.
 const MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -158,14 +159,15 @@ fn grant_owner_access(path: &Path) {
 /// A verified download is bounded by the extraction cap: nothing past it could
 /// be unpacked. An unverified one is bounded by twice the size its entry
 /// advertised plus a margin for the store's under-reporting, and falls back to
-/// [`MAX_DOWNLOAD_BYTES`] when no size is advertised either.
+/// [`MAX_DOWNLOAD_BYTES`] when no size is advertised either, an advertised 0
+/// counting as no size.
 fn download_limit(checksum: Option<&str>, advertised: Option<u64>) -> u64 {
     match (checksum, advertised) {
         (Some(_), _) => MAX_EXTRACTED_BYTES,
-        (None, Some(size)) => size
+        (None, Some(size)) if size > 0 => size
             .saturating_mul(2)
             .saturating_add(ADVERTISED_SIZE_SLACK_BYTES),
-        (None, None) => MAX_DOWNLOAD_BYTES,
+        (None, _) => MAX_DOWNLOAD_BYTES,
     }
 }
 
@@ -175,8 +177,8 @@ fn download_limit(checksum: Option<&str>, advertised: Option<u64>) -> u64 {
 ///
 /// A download without an advertised MD5 is logged as unverified and capped at
 /// twice its advertised size plus a margin, or at [`MAX_DOWNLOAD_BYTES`] when
-/// no size is given; a verified one is capped at [`MAX_EXTRACTED_BYTES`].
-/// Reading past the cap is a download failure.
+/// no size is given, an advertised 0 counting as none; a verified one is capped
+/// at [`MAX_EXTRACTED_BYTES`]. Reading past the cap is a download failure.
 ///
 /// The component's directory name namespaces the download file, preventing
 /// filename collisions when multiple components download in parallel.
@@ -667,6 +669,58 @@ mod tests {
         );
     }
 
+    /// A store entry sizing its download at 0 is capped as one with no size at
+    /// all: the 2 MiB body unpacks under the no-size cap and the warning names
+    /// that cap, where a twice-zero cap would have refused it at 1 MiB.
+    #[test]
+    fn an_unverified_download_sized_at_zero_is_capped_at_the_no_size_limit() {
+        use crate::testutil::logs::{capture_logs, captured_logs};
+
+        let dir = tempfile::tempdir().unwrap();
+        let payload = "c".repeat(2 * 1024 * 1024);
+        let archive = dir.path().join("FakeScheme.colors.tar");
+        write_archive(&archive, &[("FakeScheme.colors", payload.as_str())]);
+        let body = String::from_utf8(std::fs::read(&archive).unwrap()).unwrap();
+        assert!(
+            body.len() > 1024 * 1024,
+            "the fixture is {} bytes, not past the 1 MiB cap a 0 would give it",
+            body.len()
+        );
+        let (base, _) = crate::testutil::serve(move |_| crate::testutil::ok(body.clone()));
+        let url = format!("{base}/dl/fake-scheme.tar.gz");
+
+        capture_logs();
+        let client = reqwest::blocking::Client::new();
+        let downloaded = download_package(
+            &update_fixture(&url, None, Some(0)),
+            &client,
+            dir.path(),
+            &(),
+        )
+        .expect("an unverified download whose entry sizes it at 0 was refused");
+
+        let dest = dir.path().join("out");
+        extract_archive(&downloaded, &dest).expect("the downloaded archive did not extract");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("FakeScheme.colors")).unwrap(),
+            payload,
+            "the downloaded package did not unpack as the scheme"
+        );
+
+        let lines = captured_logs();
+        let warning = format!(
+            "the store advertises no checksum, so the download is unverified and capped at \
+             {MAX_DOWNLOAD_BYTES} bytes"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("download: ") && line.ends_with(&warning)),
+            "the unverified warning did not name the no-size cap ({MAX_DOWNLOAD_BYTES} bytes): \
+             {lines:?}"
+        );
+    }
+
     #[test]
     fn an_archive_unpacking_past_the_cap_is_refused() {
         let mut budget = ListingBudget::new();
@@ -795,7 +849,9 @@ mod tests {
     #[test]
     fn an_unverified_download_is_capped_at_twice_its_advertised_size_plus_a_mib() {
         assert_eq!(download_limit(None, Some(4096)), 2 * 4096 + 1024 * 1024);
+        assert_eq!(download_limit(None, Some(1000)), 2 * 1000 + 1024 * 1024);
         assert_eq!(download_limit(None, None), MAX_DOWNLOAD_BYTES);
+        assert_eq!(download_limit(None, Some(0)), MAX_DOWNLOAD_BYTES);
     }
 
     #[test]
