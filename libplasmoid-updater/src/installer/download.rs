@@ -3,13 +3,28 @@
 use std::{
     fs::{self, File},
     io::{BufRead as _, Read, Write},
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    os::unix::{
+        fs::{MetadataExt as _, PermissionsExt as _},
+        process::CommandExt as _,
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
-use super::ComponentFailure;
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
+
+use super::{
+    ComponentFailure,
+    install::{
+        KILL_GRACE, REAP_BOUND, Route, join_readers_bounded, reap_within, run_with_timeout,
+        spawn_reader,
+    },
+};
 use crate::{AvailableUpdate, Event, FailureKind, Reporter};
 
 const DOWNLOAD_TIMEOUT_SECS: u64 = 60;
@@ -24,6 +39,29 @@ const MAX_EXTRACTED_MEMBERS: u64 = 100_000;
 /// store under-reports often enough (3 of 21 measurable no-MD5 entries served
 /// more than advertised plus a KiB) that the limit carries a margin.
 const ADVERTISED_SIZE_SLACK_BYTES: u64 = 1024 * 1024;
+/// How long a `bsdtar` call (the listing or the extraction) may run before its
+/// process group is killed. Extraction cost follows member count and directory
+/// depth rather than archive size: a 99,000-member, 101 MB archive extracted in
+/// 15-20 s, while a 12.8 MB archive of 3,000 nested directories took 65-77 s
+/// (measured 2026-11-23 on an NVMe disk under heavy load). 120 s leaves the
+/// measured slow shape room to finish; a slower disk or an archive of the
+/// slowest per-member shape near the member cap can still overrun it. A hung
+/// `bsdtar` costs the run the bound instead of the update lock.
+const BSDTAR_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn bsdtar_timeout() -> Duration {
+    // A unit test cannot wait out the production deadline, so it may shorten it.
+    #[cfg(test)]
+    {
+        if let Some(millis) = std::env::var("PU_TEST_BSDTAR_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            return Duration::from_millis(millis);
+        }
+    }
+    BSDTAR_TIMEOUT
+}
 
 /// The directory the run unpacks downloads into.
 fn temp_base() -> PathBuf {
@@ -284,25 +322,57 @@ fn member_size(line: &str) -> Option<u64> {
     line.split_whitespace().nth(4)?.parse().ok()
 }
 
-/// Extracts a package archive to the destination directory using `bsdtar`.
+/// Ends a listing that is not to finish on its own: kills the whole process
+/// group, reaps the child within [`REAP_BOUND`] and drains its stderr within
+/// [`KILL_GRACE`]; a reader still holding the pipe when the grace runs out is
+/// left detached.
+fn end_listing(
+    child: &mut std::process::Child,
+    group: Pid,
+    stderr_reader: Option<std::thread::JoinHandle<Vec<u8>>>,
+) {
+    let _ = killpg(group, Signal::SIGKILL);
+    drop(reap_within(child, REAP_BOUND));
+    if let Some(reader) = stderr_reader {
+        drop(join_readers_bounded(
+            vec![reader],
+            Instant::now() + KILL_GRACE,
+        ));
+    }
+}
+
+/// The listing's failure when the deadline killed it.
+fn listing_timeout(timeout: Duration) -> ComponentFailure {
+    ComponentFailure::new(
+        FailureKind::Extract,
+        format!("bsdtar timed out after {} s", timeout.as_secs()),
+    )
+}
+
+/// Lists `archive_path`, capping what its lines add up to.
 ///
-/// The archive is listed first, one line at a time: as soon as the members add
-/// up past [`MAX_EXTRACTED_BYTES`] or the archive holds more than
-/// [`MAX_EXTRACTED_MEMBERS`], the listing child is killed and nothing is
-/// written, so a hostile archive cannot fill the disk or hold its whole
-/// listing in memory.
-pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), ComponentFailure> {
+/// The tool runs in a process group of its own, and the whole group is killed
+/// at `timeout`. The listing's pipe can still stay open past that kill: a
+/// `bsdtar` hanging before its first line holds its own write end, and a
+/// descendant that left the group holds a copy of it. So the lines are read on
+/// a thread of their own, and the caller waits for each only until the
+/// deadline.
+fn list_archive(archive_path: &Path, timeout: Duration) -> Result<(), ComponentFailure> {
+    let mut budget = ListingBudget::new();
     let mut child = Command::new("bsdtar")
         // Numeric owners keep the size in the same column whatever user and
         // group names the archive itself carries.
         .args(["-t", "-v", "--numeric-owner", "-f"])
         .arg(archive_path)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| {
             ComponentFailure::new(FailureKind::Extract, format!("failed to run bsdtar: {e}"))
         })?;
+    let group = Pid::from_raw(child.id() as i32);
 
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
@@ -312,51 +382,86 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), Co
             "bsdtar produced no listing stream".to_string(),
         ));
     };
-    let stderr_reader = child.stderr.take().map(|mut stderr| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            buf
-        })
+    let stderr_reader = child.stderr.take().map(spawn_reader);
+
+    // A listing line carries an untrusted member path, and a pax path of 1 MiB
+    // lists as one line, so the reader may run only a line or two ahead of the
+    // budget that judges them.
+    let (sender, lines) = mpsc::sync_channel(2);
+    std::thread::spawn(move || {
+        let mut listing = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = Vec::new();
+            let sent = match listing.read_until(b'\n', &mut line) {
+                Ok(0) => return,
+                Ok(_) => sender.send(Ok(line)),
+                Err(e) => sender.send(Err(e)),
+            };
+            if sent.is_err() {
+                return;
+            }
+        }
     });
 
-    let mut budget = ListingBudget::new();
-    let mut listing = std::io::BufReader::new(stdout);
-    let mut line = Vec::new();
+    let deadline = Instant::now() + timeout;
     let refusal = loop {
-        line.clear();
-        match listing.read_until(b'\n', &mut line) {
-            Ok(0) => break None,
-            Ok(_) => {
+        match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(line)) => {
                 if let Err(e) = budget.add(&String::from_utf8_lossy(&line)) {
                     break Some(e);
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 break Some(ComponentFailure::new(
                     FailureKind::Extract,
                     format!("failed to read the archive listing: {e}"),
                 ));
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                end_listing(&mut child, group, stderr_reader);
+                return Err(listing_timeout(timeout));
+            }
         }
     };
+    drop(lines);
 
     if let Some(failure) = refusal {
-        let _ = child.kill();
-        let _ = child.wait();
-        if let Some(reader) = stderr_reader {
-            let _ = reader.join();
-        }
+        end_listing(&mut child, group, stderr_reader);
         return Err(failure);
     }
 
+    // A listing can end its stdout and still hold on, so the child keeps the
+    // same deadline: one that outlives it is a hung call like any other.
+    let reaped = match reap_within(
+        &mut child,
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
+        Ok(reaped) => reaped,
+        Err(e) => {
+            end_listing(&mut child, group, stderr_reader);
+            return Err(ComponentFailure::new(
+                FailureKind::Extract,
+                format!("failed to wait for bsdtar: {e}"),
+            ));
+        }
+    };
+    if !reaped {
+        end_listing(&mut child, group, stderr_reader);
+        return Err(listing_timeout(timeout));
+    }
     let status = child.wait().map_err(|e| {
         ComponentFailure::new(
             FailureKind::Extract,
             format!("failed to wait for bsdtar: {e}"),
         )
     })?;
-    let stderr = stderr_reader.map_or_else(Vec::new, |reader| reader.join().unwrap_or_default());
+    // A descendant of a tool that already exited can still hold the pipe open,
+    // so the drain is bounded like the readers of a killed group.
+    let stderr = stderr_reader.map_or_else(Vec::new, |reader| {
+        let (mut drained, _) = join_readers_bounded(vec![reader], Instant::now() + KILL_GRACE);
+        drained.pop().unwrap_or_default()
+    });
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         let detail = if stderr.trim().is_empty() {
@@ -366,20 +471,44 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), Co
         };
         return Err(ComponentFailure::new(FailureKind::Extract, detail));
     }
+    Ok(())
+}
+
+/// The extract stage's kind for a failure the shared timeout helper reports as
+/// an install failure.
+fn extraction_failure(failure: ComponentFailure) -> ComponentFailure {
+    let mut extract = ComponentFailure::new(FailureKind::Extract, failure.message);
+    extract.process_may_still_run = failure.process_may_still_run;
+    extract
+}
+
+/// Extracts a package archive to the destination directory using `bsdtar`.
+///
+/// The archive is listed first, one line at a time: as soon as the members add
+/// up past [`MAX_EXTRACTED_BYTES`] or the archive holds more than
+/// [`MAX_EXTRACTED_MEMBERS`], the listing child is killed and nothing is
+/// written, so a hostile archive cannot fill the disk or hold its whole
+/// listing in memory.
+///
+/// Both `bsdtar` calls run under [`BSDTAR_TIMEOUT`], each in a process group of
+/// its own, so a hung tool fails the component as an extract failure naming the
+/// bound instead of holding the update lock, and the call waits on its pipes no
+/// longer than the kill grace.
+pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), ComponentFailure> {
+    let timeout = bsdtar_timeout();
+    list_archive(archive_path, timeout)?;
 
     fs::create_dir_all(dest).map_err(|e| ComponentFailure::io(FailureKind::Extract, dest, e))?;
 
-    let output = Command::new("bsdtar")
-        .args([
-            "-xf",
-            &archive_path.to_string_lossy(),
-            "-C",
-            &dest.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| {
-            ComponentFailure::new(FailureKind::Extract, format!("failed to run bsdtar: {e}"))
-        })?;
+    let mut command = Command::new("bsdtar");
+    command.stdin(Stdio::null()).args([
+        "-xf",
+        &archive_path.to_string_lossy(),
+        "-C",
+        &dest.to_string_lossy(),
+    ]);
+    let output = run_with_timeout(&mut command, Route::Direct, timeout, "bsdtar")
+        .map_err(extraction_failure)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -396,8 +525,54 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), Co
 
 #[cfg(test)]
 mod tests {
+    use super::super::install::tests::{process_running, run_child, write_script};
     use super::*;
     use crate::types::{ComponentType, InstalledComponent};
+
+    /// The host's `bsdtar`, which a sandbox's own `bsdtar` wraps.
+    fn real_bsdtar() -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("bsdtar"))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("no bsdtar on PATH"))
+    }
+
+    /// Whether the pid a fake tool recorded at `path` still runs.
+    fn recorded_still_running(path: &Path) -> bool {
+        let pid: i32 = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("no pid recorded at {}: {e}", path.display()))
+            .trim()
+            .parse()
+            .unwrap();
+        process_running(pid)
+    }
+
+    /// A timeout of `seconds`, the grace a killed process group gets, and slack
+    /// for a loaded runner.
+    fn within_bound(seconds: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(seconds)
+            + super::super::install::KILL_GRACE
+            + std::time::Duration::from_secs(2)
+    }
+
+    /// Builds a plain `ustar` archive at `archive` holding `files`.
+    fn write_archive(archive: &Path, files: &[(&str, &str)]) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut command = Command::new("tar");
+        command
+            .args(["--create", "--format=ustar", "--file"])
+            .arg(archive)
+            .arg("--directory")
+            .arg(&src);
+        for (name, content) in files {
+            std::fs::write(src.join(name), content).unwrap();
+            command.arg(name);
+        }
+        let status = command.status().unwrap();
+        assert!(status.success(), "tar failed building the fixture archive");
+    }
 
     fn update_fixture(url: &str, checksum: Option<&str>, size: Option<u64>) -> AvailableUpdate {
         AvailableUpdate {
@@ -768,6 +943,724 @@ mod tests {
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    const HUNG_LISTING_CHILD: &str =
+        "installer::download::tests::a_listing_that_prints_nothing_is_killed_at_the_bound";
+
+    /// A fake `bsdtar` that prints no listing line, keeps its stdout open
+    /// through a helper of its own and sleeps, so only a kill of the whole
+    /// process group ends the caller's read.
+    const HUNG_LISTING_BSDTAR: &str = r#"#!/bin/sh
+if [ "$1" = "-t" ]; then
+  sh -c 'echo $$ > "$PU_TEST_BSDTAR_HELPER_PID"; exec sleep 10' &
+  echo $$ > "$PU_TEST_BSDTAR_PID"
+  exec sleep 10
+fi
+exec "$PU_TEST_REAL_BSDTAR" "$@"
+"#;
+
+    #[test]
+    fn a_listing_that_prints_nothing_is_killed_at_the_bound() {
+        if std::env::var_os("PU_TEST_HUNG_LISTING").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let archive = root.join("package.tar");
+            let dest = root.join("out");
+            let started = std::time::Instant::now();
+
+            let refusal = extract_archive(&archive, &dest).unwrap_err();
+            let elapsed = started.elapsed();
+
+            assert_eq!(refusal.kind, FailureKind::Extract);
+            assert_eq!(refusal.message, "bsdtar timed out after 1 s");
+            assert!(
+                elapsed < within_bound(1),
+                "the listing read was not ended at its bound: {elapsed:?}"
+            );
+            assert!(!dest.exists(), "a hung listing still extracted the archive");
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("bsdtar"), HUNG_LISTING_BSDTAR);
+        write_archive(
+            &root.join("package.tar"),
+            &[("Fake.colors", "[General]\nName=Fake\n")],
+        );
+        let tool_pid = root.join("tool-pid");
+        let helper_pid = root.join("helper-pid");
+        let done = root.join("child-done");
+
+        let output = run_child(
+            HUNG_LISTING_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_HUNG_LISTING", "1"),
+                ("PU_TEST_BSDTAR_TIMEOUT_MS", "1000"),
+                ("PU_TEST_REAL_BSDTAR", real_bsdtar().to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_BSDTAR_PID", tool_pid.to_str().unwrap()),
+                ("PU_TEST_BSDTAR_HELPER_PID", helper_pid.to_str().unwrap()),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+            ],
+        );
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        for pid in [&tool_pid, &helper_pid] {
+            assert!(
+                !recorded_still_running(pid),
+                "a fake bsdtar outlived the bound and is still running"
+            );
+        }
+    }
+
+    const ESCAPED_HOLDER_CHILD: &str = "installer::download::tests::a_listing_whose_stdout_an_outside_process_holds_is_refused_at_the_bound";
+
+    /// A fake `bsdtar` whose listing starts a helper in a session of its own, so
+    /// the group kill cannot reach it, and that helper keeps the listing's
+    /// stdout open after the real tool has exited.
+    const ESCAPED_HOLDER_BSDTAR: &str = r#"#!/bin/sh
+if [ "$1" = "-t" ]; then
+  setsid sh -c 'echo $$ > "$PU_TEST_BSDTAR_HELPER_PID"; exec sleep 12' 2>/dev/null &
+  exec "$PU_TEST_REAL_BSDTAR" "$@"
+fi
+exec "$PU_TEST_REAL_BSDTAR" "$@"
+"#;
+
+    #[test]
+    fn a_listing_whose_stdout_an_outside_process_holds_is_refused_at_the_bound() {
+        if std::env::var_os("PU_TEST_ESCAPED_HOLDER").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let archive = root.join("package.tar");
+            let dest = root.join("out");
+            let started = std::time::Instant::now();
+
+            let refusal = extract_archive(&archive, &dest).unwrap_err();
+            let elapsed = started.elapsed();
+
+            assert_eq!(refusal.kind, FailureKind::Extract, "{}", refusal.message);
+            assert_eq!(refusal.message, "bsdtar timed out after 1 s");
+            assert!(
+                elapsed < within_bound(1),
+                "the listing was held by a process outside its group: {elapsed:?}"
+            );
+            assert!(!dest.exists(), "a hung listing still extracted the archive");
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("bsdtar"), ESCAPED_HOLDER_BSDTAR);
+        write_archive(
+            &root.join("package.tar"),
+            &[("Fake.colors", "[General]\nName=Fake\n")],
+        );
+        let helper_pid = root.join("helper-pid");
+        let done = root.join("child-done");
+
+        let output = run_child(
+            ESCAPED_HOLDER_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_ESCAPED_HOLDER", "1"),
+                ("PU_TEST_BSDTAR_TIMEOUT_MS", "1000"),
+                ("PU_TEST_REAL_BSDTAR", real_bsdtar().to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_BSDTAR_HELPER_PID", helper_pid.to_str().unwrap()),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+            ],
+        );
+
+        let survived = recorded_still_running(&helper_pid);
+        stop_recorded(&helper_pid);
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            survived,
+            "the stdout holder did not outlive the call, so the fixture tests nothing"
+        );
+    }
+
+    const STDIN_CHILD: &str =
+        "installer::download::tests::both_bsdtar_calls_get_stdin_from_dev_null";
+
+    /// A fake `bsdtar` that records what each call's fd 0 is before running the
+    /// real tool.
+    const STDIN_BSDTAR: &str = r#"#!/bin/sh
+if [ "$1" = "-t" ]; then
+  readlink "/proc/$$/fd/0" > "$PU_TEST_LISTING_STDIN_SEEN"
+fi
+if [ "$1" = "-xf" ]; then
+  readlink "/proc/$$/fd/0" > "$PU_TEST_EXTRACTION_STDIN_SEEN"
+fi
+exec "$PU_TEST_REAL_BSDTAR" "$@"
+"#;
+
+    /// Both `bsdtar` calls get their stdin from `/dev/null` rather than the
+    /// caller's own, so no archive can prompt on or read it.
+    #[test]
+    fn both_bsdtar_calls_get_stdin_from_dev_null() {
+        if std::env::var_os("PU_TEST_STDIN").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let archive = root.join("package.tar");
+            let dest = root.join("out");
+
+            extract_archive(&archive, &dest).expect("a plain archive was refused");
+
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("bsdtar"), STDIN_BSDTAR);
+        write_archive(
+            &root.join("package.tar"),
+            &[("Fake.colors", "[General]\nName=Fake\n")],
+        );
+        let stdin_file = root.join("stdin.txt");
+        std::fs::write(&stdin_file, "caller input\n").unwrap();
+        let listing_seen = root.join("listing-stdin");
+        let extraction_seen = root.join("extraction-stdin");
+        let done = root.join("child-done");
+        let path = std::ffi::OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", STDIN_CHILD, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_STDIN", "1")
+            .env("PU_TEST_REAL_BSDTAR", real_bsdtar())
+            .env("PU_TEST_ROOT", &root)
+            .env("PU_TEST_LISTING_STDIN_SEEN", &listing_seen)
+            .env("PU_TEST_EXTRACTION_STDIN_SEEN", &extraction_seen)
+            .env("PU_TEST_CHILD_DONE", &done)
+            .stdin(std::fs::File::open(&stdin_file).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        for (call, path) in [("extraction", &extraction_seen), ("listing", &listing_seen)] {
+            let seen = std::fs::read_to_string(path).unwrap_or_default();
+            assert_eq!(
+                seen.trim(),
+                "/dev/null",
+                "the {call} call read its stdin from {:?}",
+                seen.trim()
+            );
+        }
+    }
+
+    const HUNG_EXTRACTION_CHILD: &str =
+        "installer::download::tests::an_extraction_that_hangs_is_refused_at_the_bound";
+
+    /// A fake `bsdtar` that lists through the real tool and sleeps in place of
+    /// the extraction, recording its pid.
+    const HUNG_EXTRACTION_BSDTAR: &str = r#"#!/bin/sh
+if [ "$1" = "-xf" ]; then
+  echo $$ > "$PU_TEST_BSDTAR_PID"
+  exec sleep 10
+fi
+exec "$PU_TEST_REAL_BSDTAR" "$@"
+"#;
+
+    #[test]
+    fn an_extraction_that_hangs_is_refused_at_the_bound() {
+        if std::env::var_os("PU_TEST_HUNG_EXTRACTION").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let archive = root.join("package.tar");
+            let dest = root.join("out");
+            let started = std::time::Instant::now();
+
+            let refusal = extract_archive(&archive, &dest).unwrap_err();
+            let elapsed = started.elapsed();
+
+            assert_eq!(refusal.kind, FailureKind::Extract);
+            assert_eq!(refusal.message, "bsdtar timed out after 1 s");
+            assert!(
+                !refusal.process_may_still_run,
+                "a killed extraction's process was read as possibly running"
+            );
+            assert!(
+                elapsed < within_bound(1),
+                "the extraction outlived its bound: {elapsed:?}"
+            );
+            assert!(
+                !dest.join("Fake.colors").exists(),
+                "a timed-out extraction wrote the archive out"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("bsdtar"), HUNG_EXTRACTION_BSDTAR);
+        write_archive(
+            &root.join("package.tar"),
+            &[("Fake.colors", "[General]\nName=Fake\n")],
+        );
+        let tool_pid = root.join("tool-pid");
+        let done = root.join("child-done");
+
+        let output = run_child(
+            HUNG_EXTRACTION_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_HUNG_EXTRACTION", "1"),
+                ("PU_TEST_BSDTAR_TIMEOUT_MS", "1000"),
+                ("PU_TEST_REAL_BSDTAR", real_bsdtar().to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_BSDTAR_PID", tool_pid.to_str().unwrap()),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+            ],
+        );
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !recorded_still_running(&tool_pid),
+            "a fake bsdtar outlived the bound and is still running"
+        );
+    }
+
+    const UNBOUNDED_EXTRACTION_CHILD: &str =
+        "installer::download::tests::a_hung_extraction_fails_its_component_and_the_run_goes_on";
+
+    /// A fake `bsdtar` that hangs only on the extraction of the archive named
+    /// `Slow` and runs the real tool for every other call.
+    const SLOW_EXTRACTION_BSDTAR: &str = r#"#!/bin/sh
+hang=0
+for arg in "$@"; do
+  case "$arg" in
+    *Slow.colors.tar*) hang=1 ;;
+  esac
+done
+if [ "$hang" = 1 ] && [ "$1" = "-xf" ]; then
+  echo $$ > "$PU_TEST_BSDTAR_PID"
+  exec sleep 10
+fi
+exec "$PU_TEST_REAL_BSDTAR" "$@"
+"#;
+
+    /// A color scheme installed in the sandbox, named `name`.
+    fn scheme_at(root: &Path, name: &str) -> InstalledComponent {
+        let path = root
+            .join("data")
+            .join("color-schemes")
+            .join(format!("{name}.colors"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old").unwrap();
+        InstalledComponent {
+            name: name.to_string(),
+            directory_name: name.to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::ColorScheme,
+            path,
+            is_system: false,
+            release_date: String::new(),
+        }
+    }
+
+    /// A component whose extraction passes the bound fails as `Extract`,
+    /// naming the bound, and the run installs the next component anyway.
+    #[test]
+    fn a_hung_extraction_fails_its_component_and_the_run_goes_on() {
+        if std::env::var_os("PU_TEST_UNBOUNDED_EXTRACTION").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let base = std::env::var("PU_TEST_EXTRACT_STORE_URL").unwrap();
+            let slow = scheme_at(&root, "Slow");
+            let fast = scheme_at(&root, "Fast");
+            let updates = [
+                crate::types::AvailableUpdate::builder(slow.clone(), 1, "2.0")
+                    .download_url(format!("{base}/dl/Slow.colors.tar"))
+                    .build(),
+                crate::types::AvailableUpdate::builder(fast.clone(), 2, "2.0")
+                    .download_url(format!("{base}/dl/Fast.colors.tar"))
+                    .build(),
+            ];
+            let config = crate::Config::new()
+                .with_api_url(&base)
+                .with_skip_plasma_detection(true)
+                .with_inhibit_idle(false)
+                .with_threads(1);
+            let started = std::time::Instant::now();
+
+            let result = crate::install(&updates, &config, &()).unwrap();
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                result.failed.len(),
+                1,
+                "the hung extraction did not fail exactly its own component: {result:?}"
+            );
+            let failure = &result.failed[0];
+            assert_eq!(failure.component.name, "Slow", "{}", failure.message);
+            assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
+            assert_eq!(failure.message, "bsdtar timed out after 1 s");
+            assert_eq!(
+                result.succeeded.len(),
+                1,
+                "the run did not go on to the next component: {result:?}"
+            );
+            assert_eq!(result.succeeded[0].name, "Fast");
+            assert_eq!(
+                std::fs::read_to_string(&slow.path).unwrap(),
+                "old",
+                "the failed component's file changed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&fast.path).unwrap(),
+                "new",
+                "the next component was not installed"
+            );
+            assert!(
+                elapsed < within_bound(1),
+                "the run did not go on past the hung extraction: {elapsed:?}"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("bsdtar"), SLOW_EXTRACTION_BSDTAR);
+        for sub in ["home", "data", "config", "cache", "runtime", "tmp"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        write_archive(&root.join("Slow.colors.tar"), &[("Slow.colors", "new")]);
+        write_archive(&root.join("Fast.colors.tar"), &[("Fast.colors", "new")]);
+        let slow_body =
+            String::from_utf8(std::fs::read(root.join("Slow.colors.tar")).unwrap()).unwrap();
+        let fast_body =
+            String::from_utf8(std::fs::read(root.join("Fast.colors.tar")).unwrap()).unwrap();
+        let (base, _) = crate::testutil::serve(move |target| {
+            if target.ends_with("/dl/Slow.colors.tar") {
+                crate::testutil::ok(slow_body.clone())
+            } else {
+                crate::testutil::ok(fast_body.clone())
+            }
+        });
+        let tool_pid = root.join("tool-pid");
+        let done = root.join("child-done");
+        let path = |sub: &str| root.join(sub).to_str().unwrap().to_string();
+        let envs = [
+            ("PU_TEST_UNBOUNDED_EXTRACTION", "1".to_string()),
+            ("PU_TEST_BSDTAR_TIMEOUT_MS", "1000".to_string()),
+            (
+                "PU_TEST_REAL_BSDTAR",
+                real_bsdtar().to_str().unwrap().to_string(),
+            ),
+            ("PU_TEST_ROOT", root.to_str().unwrap().to_string()),
+            ("PU_TEST_EXTRACT_STORE_URL", base),
+            ("PU_TEST_BSDTAR_PID", tool_pid.to_str().unwrap().to_string()),
+            ("PU_TEST_CHILD_DONE", done.to_str().unwrap().to_string()),
+            ("HOME", path("home")),
+            ("XDG_DATA_HOME", path("data")),
+            ("XDG_CONFIG_HOME", path("config")),
+            ("XDG_CACHE_HOME", path("cache")),
+            ("XDG_RUNTIME_DIR", path("runtime")),
+            ("XDG_DATA_DIRS", path("data")),
+            ("TMPDIR", path("tmp")),
+        ];
+        let refs: Vec<(&str, &str)> = envs
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+
+        let output = run_child(UNBOUNDED_EXTRACTION_CHILD, &bin, &refs);
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !recorded_still_running(&tool_pid),
+            "a fake bsdtar outlived the bound and is still running"
+        );
+    }
+
+    const CLOSED_STDOUT_CHILD: &str = "installer::download::tests::a_listing_that_closes_its_stdout_and_hangs_is_refused_at_the_bound";
+
+    /// A fake `bsdtar` that prints one listing line, closes its stdout and
+    /// sleeps: the read ends at once while the child holds on past the bound.
+    const CLOSED_STDOUT_BSDTAR: &str = r#"#!/bin/sh
+if [ "$1" = "-t" ]; then
+  echo "-rw-r--r--  0 0 0 4 Nov  2 10:00 f"
+  exec 1>&-
+  echo $$ > "$PU_TEST_BSDTAR_PID"
+  exec sleep 10
+fi
+exec "$PU_TEST_REAL_BSDTAR" "$@"
+"#;
+
+    #[test]
+    fn a_listing_that_closes_its_stdout_and_hangs_is_refused_at_the_bound() {
+        if std::env::var_os("PU_TEST_CLOSED_STDOUT").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let archive = root.join("package.tar");
+            let dest = root.join("out");
+            let started = std::time::Instant::now();
+
+            let refusal = extract_archive(&archive, &dest).unwrap_err();
+            let elapsed = started.elapsed();
+
+            assert_eq!(refusal.kind, FailureKind::Extract, "{}", refusal.message);
+            assert_eq!(refusal.message, "bsdtar timed out after 1 s");
+            assert!(
+                elapsed < within_bound(1),
+                "a listing that outlived its stdout held the call: {elapsed:?}"
+            );
+            assert!(!dest.exists(), "a hung listing still extracted the archive");
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("bsdtar"), CLOSED_STDOUT_BSDTAR);
+        write_archive(
+            &root.join("package.tar"),
+            &[("Fake.colors", "[General]\nName=Fake\n")],
+        );
+        let tool_pid = root.join("tool-pid");
+        let done = root.join("child-done");
+
+        let output = run_child(
+            CLOSED_STDOUT_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_CLOSED_STDOUT", "1"),
+                ("PU_TEST_BSDTAR_TIMEOUT_MS", "1000"),
+                ("PU_TEST_REAL_BSDTAR", real_bsdtar().to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_BSDTAR_PID", tool_pid.to_str().unwrap()),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+            ],
+        );
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !recorded_still_running(&tool_pid),
+            "a fake bsdtar outlived the bound and is still running"
+        );
+    }
+
+    const STALE_STDERR_CHILD: &str = "installer::download::tests::a_stderr_reader_that_outlives_the_listing_does_not_hold_the_call";
+
+    /// A fake `bsdtar` whose listing forks a helper holding stderr open for
+    /// longer than the bound, then lists through the real tool: the listing
+    /// succeeds, but its stderr pipe outlives the tool that opened it.
+    const STALE_STDERR_BSDTAR: &str = r#"#!/bin/sh
+if [ "$1" = "-t" ]; then
+  sh -c 'echo $$ > "$PU_TEST_BSDTAR_HELPER_PID"; exec sleep 12 >/dev/null' &
+  exec "$PU_TEST_REAL_BSDTAR" "$@"
+fi
+exec "$PU_TEST_REAL_BSDTAR" "$@"
+"#;
+
+    /// Stops the process the fake recorded, and fails when it outlives the
+    /// test.
+    fn stop_recorded(pid_file: &Path) {
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap_or_else(|e| panic!("no pid recorded at {}: {e}", pid_file.display()))
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        for _ in 0..100 {
+            if !process_running(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("a fake helper outlived the test");
+    }
+
+    #[test]
+    fn a_stderr_reader_that_outlives_the_listing_does_not_hold_the_call() {
+        if std::env::var_os("PU_TEST_STALE_STDERR").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let archive = root.join("package.tar");
+            let dest = root.join("out");
+            let started = std::time::Instant::now();
+
+            extract_archive(&archive, &dest).expect("a listed archive was refused");
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < within_bound(1),
+                "a stderr reader that outlived the listing held the call: {elapsed:?}"
+            );
+            assert!(
+                dest.join("Fake.colors").exists(),
+                "the listed archive was not extracted"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("bsdtar"), STALE_STDERR_BSDTAR);
+        write_archive(
+            &root.join("package.tar"),
+            &[("Fake.colors", "[General]\nName=Fake\n")],
+        );
+        let helper_pid = root.join("helper-pid");
+        let done = root.join("child-done");
+
+        let output = run_child(
+            STALE_STDERR_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_STALE_STDERR", "1"),
+                ("PU_TEST_BSDTAR_TIMEOUT_MS", "1000"),
+                ("PU_TEST_REAL_BSDTAR", real_bsdtar().to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_BSDTAR_HELPER_PID", helper_pid.to_str().unwrap()),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+            ],
+        );
+
+        let survived = recorded_still_running(&helper_pid);
+        stop_recorded(&helper_pid);
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            survived,
+            "the stderr holder did not outlive the call, so the fixture tests nothing"
+        );
+    }
+
+    const GROUP_LEAVING_LISTING_CHILD: &str =
+        "installer::download::tests::a_listing_child_the_group_kill_misses_does_not_hold_the_call";
+
+    /// A fake `bsdtar` that moves itself into its parent's process group, out
+    /// of the group kill's reach, and keeps its stdout and stderr open, so only
+    /// the wait for it could hold the call.
+    const GROUP_LEAVING_LISTING_BSDTAR: &str = r#"#!/bin/sh
+if [ "$1" = "-t" ]; then
+  exec perl -e 'setpgrp(0, getpgrp(getppid())) or die; open(my $f, ">", $ENV{PU_TEST_BSDTAR_PID}) or die; print $f "$$\n"; close($f); sleep 30'
+fi
+exec "$PU_TEST_REAL_BSDTAR" "$@"
+"#;
+
+    #[test]
+    fn a_listing_child_the_group_kill_misses_does_not_hold_the_call() {
+        if std::env::var_os("PU_TEST_GROUP_LEAVING_LISTING").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let archive = root.join("package.tar");
+            let dest = root.join("out");
+            let started = std::time::Instant::now();
+
+            let refusal = extract_archive(&archive, &dest).unwrap_err();
+            let elapsed = started.elapsed();
+
+            // The 1 s timeout, the reap bound and the grace, plus slack for a
+            // loaded machine; the stub sleeps 30 s.
+            let bound = within_bound(1) + super::super::install::REAP_BOUND;
+            assert_eq!(refusal.kind, FailureKind::Extract, "{}", refusal.message);
+            assert_eq!(refusal.message, "bsdtar timed out after 1 s");
+            assert!(
+                elapsed < bound,
+                "the wait after the SIGKILL held the call: {elapsed:?}"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("bsdtar"), GROUP_LEAVING_LISTING_BSDTAR);
+        write_archive(&root.join("package.tar"), &[("Fake.colors", "x")]);
+        let tool_pid = root.join("tool-pid");
+        let done = root.join("child-done");
+
+        let output = run_child(
+            GROUP_LEAVING_LISTING_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_GROUP_LEAVING_LISTING", "1"),
+                ("PU_TEST_BSDTAR_TIMEOUT_MS", "1000"),
+                ("PU_TEST_REAL_BSDTAR", real_bsdtar().to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_BSDTAR_PID", tool_pid.to_str().unwrap()),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+            ],
+        );
+
+        let survived = recorded_still_running(&tool_pid);
+        stop_recorded(&tool_pid);
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            survived,
+            "the group-leaving child did not outlive the call, so the fixture tests nothing"
         );
     }
 }

@@ -882,13 +882,13 @@ const KPACKAGETOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// How long a killed `kpackagetool6` and its process group get to exit before
 /// they are killed outright, and how long its pipe readers and the group probe
 /// may take to answer.
-const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(super) const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long the child gets to be reaped after the `SIGKILL`. A child the
 /// signal cannot reach (a `sudo` the user may not signal) lives as long as its
 /// command does, so waiting for it would hold the run and its lock until the
 /// tool exits.
-const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+pub(super) const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn kpackagetool_timeout() -> std::time::Duration {
     // A unit test cannot wait out the production deadline, so it may shorten it.
@@ -930,7 +930,7 @@ fn kpackagetool_cmd(kpackage_type: &str, global: bool) -> (std::process::Command
 
 /// How a timed-out command's child relates to the tool it runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Route {
+pub(super) enum Route {
     /// The child is the tool, running as this process's user.
     Direct,
     /// The child is the elevation command, which runs the tool as root and
@@ -1021,7 +1021,9 @@ impl Observed {
 }
 
 /// Drains one of a child's pipes on its own thread.
-fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+pub(super) fn spawn_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = pipe.read_to_end(&mut buf);
@@ -1034,7 +1036,7 @@ fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandl
 /// A reader ends when every holder of its write end dies. A process that
 /// outlived the kill keeps one open, so a plain join could hold the run; this
 /// returns `false` instead.
-fn join_readers_bounded(
+pub(super) fn join_readers_bounded(
     readers: Vec<std::thread::JoinHandle<Vec<u8>>>,
     deadline: std::time::Instant,
 ) -> (Vec<Vec<u8>>, bool) {
@@ -1068,7 +1070,7 @@ fn probe_group(group: Pid, deadline: std::time::Instant) -> Probe {
 
 /// Polls `child` until it is reaped or `bound` passes; `Ok(false)` when it was
 /// not.
-fn reap_within(
+pub(super) fn reap_within(
     child: &mut std::process::Child,
     bound: std::time::Duration,
 ) -> std::io::Result<bool> {
@@ -1140,7 +1142,7 @@ fn observe_kill(
 /// that survived the grace would otherwise keep the run waiting. A killed run
 /// sets `process_may_still_run` unless [`Observed::verdict`] finds the tool
 /// gone.
-fn run_with_timeout(
+pub(super) fn run_with_timeout(
     command: &mut std::process::Command,
     route: Route,
     timeout: std::time::Duration,
@@ -1649,7 +1651,7 @@ pub(super) fn install_raw_file(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::installer) mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1981,7 +1983,7 @@ mod tests {
         );
     }
 
-    fn write_script(path: &Path, body: &str) {
+    pub(in crate::installer) fn write_script(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -1996,7 +1998,11 @@ mod tests {
 
     /// Runs this test binary with only `test_name` in it, under an environment
     /// cleared down to `PATH` (led by `bin`) and the fixture's own variables.
-    fn run_child(test_name: &str, bin: &Path, envs: &[(&str, &str)]) -> std::process::Output {
+    pub(in crate::installer) fn run_child(
+        test_name: &str,
+        bin: &Path,
+        envs: &[(&str, &str)],
+    ) -> std::process::Output {
         let path = OsString::from(format!(
             "{}:{}",
             bin.display(),
@@ -3112,7 +3118,7 @@ exit 0
         "#!/bin/sh\necho $$ > \"$PU_TEST_TOOL_PID\"\nexec sleep 30\n";
 
     /// Whether `pid` names a process that has not exited; a zombie has.
-    fn process_running(pid: i32) -> bool {
+    pub(in crate::installer) fn process_running(pid: i32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
             stat.rsplit_once(") ")
                 .is_some_and(|(_, rest)| !rest.starts_with('Z'))
