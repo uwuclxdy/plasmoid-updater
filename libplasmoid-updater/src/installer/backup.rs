@@ -1701,7 +1701,8 @@ pub(in crate::installer) mod tests {
         let sudo = bin.join("sudo");
         std::fs::write(
             &sudo,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexec \"$@\"\n",
+            "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\n\
+             printf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexec \"$@\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1821,7 +1822,10 @@ pub(in crate::installer) mod tests {
         let sudo = bin.join("sudo");
         std::fs::write(
             &sudo,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\n{tail}"),
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\n\
+                 printf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\n{tail}"
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2462,7 +2466,8 @@ pub(in crate::installer) mod tests {
         let fake_sudo = bin.join("sudo");
         std::fs::write(
             &fake_sudo,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\n\
+             printf '%s\\n' \"$*\" >> \"$PU_TEST_SUDO_LOG\"\nexit 0\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();

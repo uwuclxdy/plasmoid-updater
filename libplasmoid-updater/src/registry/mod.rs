@@ -1571,7 +1571,8 @@ mod tests {
         fs::write(
             &sudo,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\n\
+                 printf '%s\\n' \"$*\" >> '{log}'\n\
                  case \"$1\" in tee) shift; exec tee \"$@\";; esac\nexec \"$@\"\n",
                 log = root.join("sudo.log").display()
             ),

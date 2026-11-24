@@ -883,9 +883,10 @@ pub(super) fn verify_package_plugin_id(
 /// that blocks would otherwise hold the update lock for as long as it waits.
 const KPACKAGETOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// How long a killed `kpackagetool6` and its process group get to exit before
-/// they are killed outright, and how long its pipe readers and the group probe
-/// may take to answer.
+/// How long a killed child and its process group get to exit before they are
+/// killed outright, and how long a pipe reader or the group probe may take to
+/// answer: the bound the timeout path and the privileged command helpers give
+/// every pipe they wait on.
 pub(super) const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long the child gets to be reaped after the `SIGKILL`. A child the
@@ -1035,6 +1036,38 @@ pub(super) fn spawn_reader<R: Read + Send + 'static>(
     })
 }
 
+/// Joins `threads`, giving them until `deadline` to finish.
+///
+/// A thread still running at `deadline` is left detached and `false` is
+/// returned: the caller decides what its absence means. A panicked thread
+/// joins to its type's default, so the joined values keep their order.
+///
+/// The stdin writer in `privilege::write_via_sudo_tee` is the one detached
+/// thread that can outlive the command it wrote to: a pipe holder this user may
+/// not signal keeps the write end open, so the writer waits for the holder's
+/// life, holding its copy of the content. A pipe reader a give-up abandons is
+/// left the same way, holding its buffer. Accepted: the call has already failed
+/// at the bound, and both die with the process.
+pub(super) fn join_bounded<T: Default + Send + 'static>(
+    threads: Vec<std::thread::JoinHandle<T>>,
+    deadline: std::time::Instant,
+) -> (Vec<T>, bool) {
+    loop {
+        if threads.iter().all(std::thread::JoinHandle::is_finished) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return (Vec::new(), false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let joined = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap_or_default())
+        .collect();
+    (joined, true)
+}
+
 /// Joins the pipe readers, giving them until `deadline` to finish.
 ///
 /// A reader ends when every holder of its write end dies. A process that
@@ -1044,20 +1077,7 @@ pub(super) fn join_readers_bounded(
     readers: Vec<std::thread::JoinHandle<Vec<u8>>>,
     deadline: std::time::Instant,
 ) -> (Vec<Vec<u8>>, bool) {
-    loop {
-        if readers.iter().all(std::thread::JoinHandle::is_finished) {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            return (Vec::new(), false);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let drained = readers
-        .into_iter()
-        .map(|reader| reader.join().unwrap_or_default())
-        .collect();
-    (drained, true)
+    join_bounded(readers, deadline)
 }
 
 /// Probes `group` with signal 0 until it answers `ESRCH` or `deadline`
@@ -1112,6 +1132,31 @@ fn terminate_group(child: &mut std::process::Child, group: Pid) -> Reaped {
     }
 }
 
+/// Ends what is left in `group` and answers the child's exit status when it
+/// can be reaped within [`REAP_BOUND`].
+///
+/// A give-up leaves no member of the group running, except one this user may
+/// not signal and one that left the group. The `SIGKILL` goes only when a
+/// signal-0 probe answers that the group still holds a process: a child the
+/// caller already reaped hands its pid — the group's id — back for reuse, and
+/// a group that emptied in the meantime must not pass the signal to a stranger
+/// that took the id. A group that still holds one is this child's; a group that
+/// emptied and had its id taken by a new leader between the probe and the kill
+/// is not detected. A member this user may not signal answers `EPERM` and
+/// stays, as it does on the timeout path.
+pub(super) fn end_leftover_group(
+    child: &mut std::process::Child,
+    group: Pid,
+) -> Option<std::process::ExitStatus> {
+    if Probe::from_answer(killpg(group, None)) == Probe::Alive {
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+    match reap_within(child, REAP_BOUND) {
+        Ok(true) => child.wait().ok(),
+        _ => None,
+    }
+}
+
 /// Kills the timed-out child's group and gathers what [`Observed::verdict`]
 /// judges. `wait_failed` marks a child whose wait already failed, which no
 /// later reap makes a positive check.
@@ -1160,7 +1205,7 @@ pub(super) fn run_with_timeout(
         .process_group(0)
         .spawn()
         .map_err(|e| install_failure(format!("failed to run {tool}: {e}")))?;
-    let group = Pid::from_raw(child.id() as i32);
+    let group = Pid::from_raw(child.id().cast_signed());
     let mut readers: Vec<std::thread::JoinHandle<Vec<u8>>> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         readers.push(spawn_reader(stdout));
@@ -1176,6 +1221,7 @@ pub(super) fn run_with_timeout(
                 let (drained, finished) =
                     join_readers_bounded(readers, std::time::Instant::now() + KILL_GRACE);
                 if !finished {
+                    let _ = end_leftover_group(&mut child, group);
                     let mut failure =
                         install_failure(format!("{tool} exited but kept its output pipes open"));
                     failure.process_may_still_run = true;
@@ -2184,6 +2230,7 @@ exit 0
     /// The fake `sudo` logs every argv and refuses only `mv --exchange`, with
     /// the `mv` stderr the test wrote to `PU_TEST_MV_STDERR`.
     const REFUSED_EXCHANGE_SUDO: &str = r#"#!/bin/sh
+if [ "$1" = -n ]; then shift; fi
 for arg in "$@"; do printf '%s\n' "$arg" >> "$PU_TEST_REFUSED_LOG"; done
 printf '\n' >> "$PU_TEST_REFUSED_LOG"
 if [ "$1" = env ] && [ "$3" = mv ] && [ "$4" = --exchange ]; then
@@ -2331,6 +2378,7 @@ exit 0
     }
 
     const SYSTEM_SWAP_SUDO: &str = r#"#!/bin/sh
+if [ "$1" = -n ]; then shift; fi
 for arg in "$@"; do printf '%s\n' "$arg" >> "$PU_TEST_SWAP_LOG"; done
 printf '\n' >> "$PU_TEST_SWAP_LOG"
 exit 0
@@ -3277,7 +3325,8 @@ exit 0
     /// A fake `sudo` that runs its command in a new session, as sudo's
     /// `use_pty` does, and outlives `SIGTERM` without passing it on: the
     /// command stays out of the process group the timeout signals.
-    const DETACHING_SUDO: &str = "#!/bin/sh\ntrap '' TERM\nsetsid \"$@\" &\nwait\n";
+    const DETACHING_SUDO: &str =
+        "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\ntrap '' TERM\nsetsid \"$@\" &\nwait\n";
 
     /// A fake `kpackagetool6` that records its pid and outlives the timeout.
     const RECORDED_SLEEPING_KPACKAGETOOL: &str =
@@ -3422,6 +3471,130 @@ exit 0
         );
     }
 
+    /// A tool that exits while a process of its group still holds the output
+    /// pipes leaves no process behind: the give-up ends the group before it
+    /// reports the kept pipes.
+    #[test]
+    fn a_tool_that_exits_with_a_pipe_holder_ends_its_group() {
+        if std::env::var_os("PU_TEST_KEPT_PIPES_CHILD").is_some() {
+            let mut command = std::process::Command::new("kept-pipes-tool");
+            let started = std::time::Instant::now();
+            let failure = run_with_timeout(
+                &mut command,
+                Route::Direct,
+                std::time::Duration::from_secs(30),
+                "kept-pipes-tool",
+            )
+            .expect_err("the tool exits while its holder keeps the pipes");
+            let elapsed = started.elapsed();
+            std::fs::write(
+                std::env::var_os("PU_TEST_KEPT_PIPES_ELAPSED").unwrap(),
+                elapsed.as_secs_f64().to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                std::env::var_os("PU_TEST_KEPT_PIPES_RESULT").unwrap(),
+                format!("{}|{}", failure.message, failure.process_may_still_run),
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Exits at once while a background process inherits both output pipes
+        // and outlives it.
+        write_script(
+            &bin.join("kept-pipes-tool"),
+            "#!/bin/sh\nsleep 30 &\necho $! > \"$PU_TEST_KEPT_PIPES_PID\"\nexit 0\n",
+        );
+        let pid_path = dir.path().join("holder.pid");
+        let elapsed_path = dir.path().join("elapsed");
+        let result = dir.path().join("result");
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "installer::install::tests::a_tool_that_exits_with_a_pipe_holder_ends_its_group",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_KEPT_PIPES_CHILD", "1")
+            .env("PU_TEST_KEPT_PIPES_PID", &pid_path)
+            .env("PU_TEST_KEPT_PIPES_ELAPSED", &elapsed_path)
+            .env("PU_TEST_KEPT_PIPES_RESULT", &result)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let finished = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        if !finished {
+            let _ = killpg(Pid::from_raw(child.id().cast_signed()), Signal::SIGKILL);
+        }
+        let status = child.wait().unwrap();
+        let mut child_stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            drop(pipe.read_to_string(&mut child_stderr));
+        }
+        let holder: i32 = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The give-up must leave nothing behind. Measure it, then clean up
+        // whatever it left, so a red assertion below leaves no process behind.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while process_running(holder) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let survived = process_running(holder);
+        let _ = nix::sys::signal::kill(Pid::from_raw(holder), Signal::SIGKILL);
+        assert!(
+            finished,
+            "the run did not finish within 20 s\n--- child stderr\n{child_stderr}"
+        );
+        assert!(
+            status.success(),
+            "child run failed ({status})\n--- child stderr\n{child_stderr}"
+        );
+        // The holder leg runs before the elapsed and line legs so it binds the
+        // give-up's group kill on its own.
+        assert!(!survived, "the pipe holder {holder} survived the give-up");
+        let elapsed: f64 = std::fs::read_to_string(&elapsed_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let bound = KILL_GRACE + std::time::Duration::from_secs(2);
+        assert!(
+            elapsed < bound.as_secs_f64(),
+            "the give-up waited for the pipe holder: {elapsed:.3} s"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&result).unwrap(),
+            "kept-pipes-tool exited but kept its output pipes open|true",
+            "the give-up did not report the kept pipes as possibly running"
+        );
+    }
+
     #[test]
     fn the_verdict_counts_a_tool_gone_only_on_a_positive_check() {
         use Probe::{Alive, Denied, Empty, Unknown};
@@ -3481,7 +3654,8 @@ exit 0
 
     /// A fake `sudo` that outlives `SIGTERM` and becomes its command, so only
     /// the `SIGKILL` ends it, and the group is empty once it is reaped.
-    const KILLED_SUDO: &str = "#!/bin/sh\ntrap '' TERM\nexec \"$@\"\n";
+    const KILLED_SUDO: &str =
+        "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\ntrap '' TERM\nexec \"$@\"\n";
 
     /// A `sudo` that needed the `SIGKILL` proves nothing about its command, even
     /// when the group probe then finds the group empty and both pipes closed.
