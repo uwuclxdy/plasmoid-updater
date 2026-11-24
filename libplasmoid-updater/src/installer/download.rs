@@ -351,6 +351,12 @@ fn listing_timeout(timeout: Duration) -> ComponentFailure {
     )
 }
 
+/// The exact refusal `bsdtar -t` prints for a file libarchive bids no archive
+/// format on. A single-file component's download can be the component file
+/// itself only when its listing fails with exactly this answer; every other
+/// listing failure is an extract failure.
+const UNRECOGNIZED_FORMAT: &str = "bsdtar: Error opening archive: Unrecognized archive format";
+
 /// Lists `archive_path`, capping what its lines add up to.
 ///
 /// The tool runs in a process group of its own, and the whole group is killed
@@ -359,6 +365,10 @@ fn listing_timeout(timeout: Duration) -> ComponentFailure {
 /// descendant that left the group holds a copy of it. So the lines are read on
 /// a thread of their own, and the caller waits for each only until the
 /// deadline.
+///
+/// A file `bsdtar` bids no archive format on is refused with
+/// [`ComponentFailure::unrecognized_format`] set, so a caller can tell that
+/// answer from every other listing failure.
 fn list_archive(archive_path: &Path, timeout: Duration) -> Result<(), ComponentFailure> {
     let mut budget = ListingBudget::new();
     let mut child = Command::new("bsdtar")
@@ -466,12 +476,17 @@ fn list_archive(archive_path: &Path, timeout: Duration) -> Result<(), ComponentF
     });
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
-        let detail = if stderr.trim().is_empty() {
-            crate::error::command_failure("bsdtar", &status)
-        } else {
-            stderr.trim().to_string()
-        };
-        return Err(ComponentFailure::new(FailureKind::Extract, detail));
+        let detail = stderr.trim();
+        let mut failure = ComponentFailure::new(
+            FailureKind::Extract,
+            if detail.is_empty() {
+                crate::error::command_failure("bsdtar", &status)
+            } else {
+                detail.to_string()
+            },
+        );
+        failure.unrecognized_format = detail == UNRECOGNIZED_FORMAT;
+        return Err(failure);
     }
     Ok(())
 }
