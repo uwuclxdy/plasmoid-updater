@@ -503,7 +503,7 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), Co
     fs::create_dir_all(dest).map_err(|e| ComponentFailure::io(FailureKind::Extract, dest, e))?;
 
     let mut command = Command::new("bsdtar");
-    command.stdin(Stdio::null()).args([
+    command.args([
         "-xf",
         &archive_path.to_string_lossy(),
         "-C",

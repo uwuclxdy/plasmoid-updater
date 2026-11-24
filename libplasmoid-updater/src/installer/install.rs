@@ -1136,12 +1136,13 @@ fn observe_kill(
 /// Runs `command` in its own process group, killing the whole group once
 /// `timeout` has passed.
 ///
-/// Stdout and stderr are drained while the tool runs, so a child that fills a
-/// pipe cannot block the wait; a killed group closes its pipes and both
-/// readers finish. The readers are joined with a bound, because a descendant
-/// that survived the grace would otherwise keep the run waiting. A killed run
-/// sets `process_may_still_run` unless [`Observed::verdict`] finds the tool
-/// gone.
+/// The child is given a null stdin whatever its caller set on the command, so
+/// the tool never reads the caller's stdin. Stdout and stderr are drained while
+/// the tool runs, so a child that fills a pipe cannot block the wait; a killed
+/// group closes its pipes and both readers finish. The readers are joined with
+/// a bound, because a descendant that survived the grace would otherwise keep
+/// the run waiting. A killed run sets `process_may_still_run` unless
+/// [`Observed::verdict`] finds the tool gone.
 pub(super) fn run_with_timeout(
     command: &mut std::process::Command,
     route: Route,
@@ -1149,6 +1150,7 @@ pub(super) fn run_with_timeout(
     tool: &str,
 ) -> Result<std::process::Output, ComponentFailure> {
     let mut child = command
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0)
@@ -3102,6 +3104,41 @@ exit 0
             output.status,
             done.exists(),
             String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// [`run_with_timeout`] gives its child a null stdin whatever its caller
+    /// set on the command, so a tool never waits on the caller's stdin.
+    #[test]
+    fn run_with_timeout_gives_its_child_a_null_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fd0 = dir.path().join("fd-0");
+        write_script(
+            &bin.join("kpackagetool6"),
+            "#!/bin/sh\nreadlink /proc/self/fd/0 > \"$PU_TEST_FD0\"\nexit 0\n",
+        );
+        let caller_stdin = dir.path().join("caller-stdin");
+        std::fs::write(&caller_stdin, b"the caller's stdin").unwrap();
+
+        let mut command = std::process::Command::new(bin.join("kpackagetool6"));
+        command
+            .env("PU_TEST_FD0", &fd0)
+            .stdin(std::fs::File::open(&caller_stdin).unwrap());
+        let output = run_with_timeout(
+            &mut command,
+            Route::Direct,
+            std::time::Duration::from_secs(5),
+            "kpackagetool6",
+        )
+        .unwrap();
+
+        assert!(output.status.success(), "{:?}", output.status);
+        assert_eq!(
+            std::fs::read_to_string(&fd0).unwrap().trim(),
+            "/dev/null",
+            "the child read the caller's stdin"
         );
     }
 

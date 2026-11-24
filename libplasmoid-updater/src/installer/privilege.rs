@@ -302,24 +302,39 @@ pub(crate) fn write_file_as_root(path: &Path, content: &[u8]) -> Result<(), Comp
 }
 
 /// Writes content through `sudo tee`, keeping it off the command line.
+///
+/// stderr is captured rather than inherited, so sudo's own words (a refusal, a
+/// missing tty) land in the failure message instead of over the progress rows;
+/// stdout is discarded because `tee` echoes the content back. The stderr pipe
+/// is drained while the content is written: sudo or a child of it may fill the
+/// pipe before it reads its stdin, and each side would then wait for a reader
+/// that never comes. The reader is joined with a bound, because a process sudo
+/// left running would otherwise keep the write waiting for as long as it
+/// lives.
 fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailure> {
     use std::io::Write;
     let mut child = Command::new("sudo")
-        .args(["tee", &path.to_string_lossy()])
+        .arg("tee")
+        .arg(path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
             ComponentFailure::new(FailureKind::Install, format!("failed to run sudo tee: {e}"))
         })?;
 
+    let stderr_reader = child.stderr.take().map(super::install::spawn_reader);
+
+    // Taking the handle closes stdin when it drops, so `tee` sees EOF even when
+    // the write fails.
     #[expect(
         clippy::expect_used,
         reason = "stdin was spawned with Stdio::piped(), so the pipe handle always exists"
     )]
     let write_result = child
         .stdin
-        .as_mut()
+        .take()
         .expect("stdin was piped")
         .write_all(content);
 
@@ -328,11 +343,20 @@ fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailur
     let status = child
         .wait()
         .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
+    let (drained, _) = super::install::join_readers_bounded(
+        stderr_reader.into_iter().collect(),
+        std::time::Instant::now() + super::install::KILL_GRACE,
+    );
+    let captured = drained.into_iter().next().unwrap_or_default();
     if !status.success() {
-        return Err(ComponentFailure::new(
-            FailureKind::Install,
-            "sudo tee failed",
-        ));
+        let stderr = String::from_utf8_lossy(&captured);
+        let detail = stderr.trim();
+        let message = if detail.is_empty() {
+            "sudo tee failed".to_string()
+        } else {
+            format!("sudo tee failed: {detail}")
+        };
+        return Err(ComponentFailure::new(FailureKind::Install, message));
     }
     write_result.map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?;
     Ok(())
@@ -479,6 +503,10 @@ pub(crate) fn remove_dir_as_root(path: &Path) -> Result<(), ComponentFailure> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::io::Read as _;
+    use std::os::fd::AsFd as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -493,6 +521,336 @@ mod tests {
         let missing = dir.path().join("gone");
         let removed = remove_file_as_root(&missing);
         assert!(removed.is_ok(), "{removed:?}");
+    }
+
+    /// A refused `sudo tee` neither prints over the terminal its child would
+    /// inherit nor loses sudo's own words: the child's stderr is captured into
+    /// the failure message. A pty stands in for the user's terminal, so an
+    /// inherited fd 2 is what would put sudo's text on it.
+    #[test]
+    fn a_refused_sudo_tee_keeps_sudo_text_off_the_terminal() {
+        if is_root() {
+            return; // root writes with fs::write and never runs sudo
+        }
+
+        if std::env::var_os("PU_TEST_TEE_CHILD").is_some() {
+            let target = PathBuf::from(std::env::var("PU_TEST_TEE_TARGET").unwrap());
+            let failed = write_file_as_root(&target, b"payload")
+                .expect_err("the fake sudo refuses the write");
+            assert!(
+                failed.message.contains("sudo tee failed"),
+                "the failure lost its own words: {}",
+                failed.message
+            );
+            assert!(
+                failed.message.contains("sudo: a password is required"),
+                "the failure lost sudo's words: {}",
+                failed.message
+            );
+            std::fs::write(
+                std::env::var_os("PU_TEST_TEE_RESULT").unwrap(),
+                failed.message,
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nprintf 'sudo: a password is required\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let target = dir.path().join("tee-target");
+        let result = dir.path().join("failure");
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        let pty = nix::pty::openpty(None, None).unwrap();
+        // glibc's `openpty` hands back descriptors without close-on-exec
+        // (measured 2026-11-24 on glibc 2.44: both fds come back with
+        // `FD_CLOEXEC` clear): a sibling test's child would inherit the slave,
+        // keep the master's reader from seeing EOF, and stall this test until
+        // that child exits.
+        for fd in [pty.master.as_fd(), pty.slave.as_fd()] {
+            nix::fcntl::fcntl(
+                fd,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let mut master = std::fs::File::from(pty.master);
+        let terminal = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while let Ok(n) = master.read(&mut buffer) {
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..n]);
+            }
+            bytes
+        });
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "installer::privilege::tests::a_refused_sudo_tee_keeps_sudo_text_off_the_terminal",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_TEE_CHILD", "1")
+            .env("PU_TEST_TEE_TARGET", &target)
+            .env("PU_TEST_TEE_RESULT", &result)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(pty.slave));
+        let mut child = command.spawn().unwrap();
+        // `Command` keeps its own copy of the slave fd; it must close before
+        // the reader can see the end of the pty.
+        drop(command);
+        let status = child.wait().unwrap();
+        let terminal = terminal.join().unwrap();
+
+        assert!(
+            status.success(),
+            "child run failed ({}); terminal: {}",
+            status,
+            String::from_utf8_lossy(&terminal)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&terminal),
+            "",
+            "sudo's text reached the terminal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&result).unwrap(),
+            "sudo tee failed: sudo: a password is required"
+        );
+    }
+
+    /// A fake `sudo` that floods stderr before reading its stdin neither
+    /// deadlocks the write nor loses the flood: stderr is drained while the
+    /// content is written. Without the drain each side fills its pipe and
+    /// waits for a reader that never comes.
+    #[test]
+    fn a_sudo_tee_stderr_flood_does_not_block_the_write() {
+        if is_root() {
+            return; // root writes with fs::write and never runs sudo
+        }
+
+        if std::env::var_os("PU_TEST_TEE_FLOOD_CHILD").is_some() {
+            let target = PathBuf::from(std::env::var("PU_TEST_TEE_FLOOD_TARGET").unwrap());
+            let content = vec![b'x'; 300_000];
+            let failed =
+                write_file_as_root(&target, &content).expect_err("the fake sudo refuses the write");
+            std::fs::write(
+                std::env::var_os("PU_TEST_TEE_FLOOD_RESULT").unwrap(),
+                failed.message,
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        // More than a pipe buffer to stderr before it reads the content.
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' e >&2\ncat >/dev/null\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let target = dir.path().join("tee-target");
+        let result = dir.path().join("failure");
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "installer::privilege::tests::a_sudo_tee_stderr_flood_does_not_block_the_write",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_TEE_FLOOD_CHILD", "1")
+            .env("PU_TEST_TEE_FLOOD_TARGET", &target)
+            .env("PU_TEST_TEE_FLOOD_RESULT", &result)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let bound = std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + bound;
+        let finished = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        if !finished {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let status = child.wait().unwrap();
+        let mut child_stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            drop(pipe.read_to_string(&mut child_stderr));
+        }
+        assert!(
+            finished,
+            "the write did not finish within {bound:?}: a full stderr pipe and the content awaited each other\n--- child stderr\n{child_stderr}"
+        );
+        assert!(
+            status.success(),
+            "child run failed ({status})\n--- child stderr\n{child_stderr}"
+        );
+        let message = std::fs::read_to_string(&result).unwrap();
+        let prefix = "sudo tee failed: ";
+        assert!(
+            message.starts_with(prefix)
+                && message.len() == prefix.len() + 200_000
+                && message[prefix.len()..].bytes().all(|byte| byte == b'e'),
+            "the failure did not carry sudo's whole flood: {} bytes, head {:?}",
+            message.len(),
+            String::from_utf8_lossy(message.as_bytes().get(..40).unwrap_or_default())
+        );
+    }
+
+    /// A fake `sudo` that leaves a background process holding its stderr does
+    /// not keep the write waiting: the reader is joined with the same bound as
+    /// every other reader in the installer.
+    #[test]
+    fn a_sudo_tee_stderr_holder_does_not_hold_the_write() {
+        if is_root() {
+            return; // root writes with fs::write and never runs sudo
+        }
+
+        if std::env::var_os("PU_TEST_TEE_HOLDER_CHILD").is_some() {
+            let target = PathBuf::from(std::env::var("PU_TEST_TEE_HOLDER_TARGET").unwrap());
+            let started = std::time::Instant::now();
+            let failed = write_file_as_root(&target, b"payload")
+                .expect_err("the fake sudo refuses the write");
+            let elapsed = started.elapsed();
+            std::fs::write(
+                std::env::var_os("PU_TEST_TEE_HOLDER_ELAPSED").unwrap(),
+                elapsed.as_secs_f64().to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                std::env::var_os("PU_TEST_TEE_HOLDER_RESULT").unwrap(),
+                failed.message,
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        // The background process inherits the stderr pipe and outlives sudo,
+        // by more than the bound below, so a plain join cannot pass.
+        let holder_secs = crate::installer::install::KILL_GRACE.as_secs() + 4;
+        std::fs::write(
+            &fake_sudo,
+            format!("#!/bin/sh\nsleep {holder_secs} &\ncat >/dev/null\nexit 1\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let target = dir.path().join("tee-target");
+        let elapsed_path = dir.path().join("elapsed");
+        let result = dir.path().join("failure");
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "installer::privilege::tests::a_sudo_tee_stderr_holder_does_not_hold_the_write",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_TEE_HOLDER_CHILD", "1")
+            .env("PU_TEST_TEE_HOLDER_TARGET", &target)
+            .env("PU_TEST_TEE_HOLDER_ELAPSED", &elapsed_path)
+            .env("PU_TEST_TEE_HOLDER_RESULT", &result)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let finished = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        if !finished {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let status = child.wait().unwrap();
+        let mut child_stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            drop(pipe.read_to_string(&mut child_stderr));
+        }
+        assert!(
+            finished,
+            "the child run did not finish within 15 s\n--- child stderr\n{child_stderr}"
+        );
+        assert!(
+            status.success(),
+            "child run failed ({status})\n--- child stderr\n{child_stderr}"
+        );
+        let elapsed: f64 = std::fs::read_to_string(&elapsed_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let bound = crate::installer::install::KILL_GRACE + std::time::Duration::from_secs(2);
+        assert!(
+            elapsed < bound.as_secs_f64(),
+            "the write waited for a process holding sudo's stderr: {elapsed:.3} s"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&result).unwrap(),
+            "sudo tee failed",
+            "the failure did not name sudo's failed exit"
+        );
     }
 
     /// Builds a fake `sudo` that records its arguments and refuses, then runs
