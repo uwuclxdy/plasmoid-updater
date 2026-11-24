@@ -6,6 +6,7 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::{OsStr, OsString},
     fs,
     io::{ErrorKind, Read},
     os::unix::process::CommandExt as _,
@@ -26,6 +27,10 @@ use crate::{
 
 const COLOR_SCHEME_EXTENSIONS: &[&str] = &[".colors", ".colorscheme"];
 const IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp", ".svg"];
+
+/// The reason a download in no enabled image format cannot be named: only a
+/// crate that turns on more of `imagesize`'s formats can reach this.
+const UNSUPPORTED_IMAGE: &str = "not a PNG, JPEG or WebP image";
 
 /// Suffixes of the hidden sibling paths the installer writes beside a
 /// component: the tree being built, and the tree being replaced.
@@ -189,7 +194,6 @@ fn strip_bom(content: &str) -> &str {
 // --- Utility Functions ---
 
 fn temp_sibling(path: &Path, suffix: &str) -> PathBuf {
-    use std::ffi::OsString;
     let name = path.file_name().unwrap_or_default();
     let mut temp_name = OsString::from(".");
     temp_name.push(name);
@@ -1521,6 +1525,131 @@ fn find_wallpaper_source(extract_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The one image an unpacked wallpaper download holds, when the extract root
+/// holds nothing else. An archive holding a second entry takes the package
+/// path instead, so no entry it holds beside the image is dropped unseen.
+pub(super) fn loose_wallpaper_image(extract_dir: &Path) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(extract_dir).ok()?;
+    entries.next()?.ok()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    find_wallpaper_source(extract_dir).filter(|source| is_regular_file(source))
+}
+
+/// Whether the component is a wallpaper installed as a directory, the shape
+/// that decides whether a download holding one image rebuilds that directory.
+pub(super) fn is_directory_wallpaper(component: &InstalledComponent) -> bool {
+    component.component_type == ComponentType::Wallpaper && is_directory(&component.path)
+}
+
+/// Builds at `tree` the directory the wallpaper installed at `installed`
+/// becomes when its store entry serves the one image at `image`, which the
+/// store names `image_name`. `image` is moved into `tree`; the installed
+/// directory is only read.
+///
+/// A package directory (one holding `metadata.json`, `metadata.desktop` or
+/// `contents/`) keeps its metadata files, `metadata.json` carrying
+/// `new_version` and `metadata.desktop` byte for byte, and holds the image at
+/// `contents/images/<W>x<H>.<ext>`, the name Plasma's own wallpaper packages
+/// give their images; an SVG has no pixel size and keeps its own name there.
+/// Any other directory ends holding only the image under its own name. Every
+/// other file the directory held goes, as with any directory update.
+pub(super) fn rebuild_wallpaper_dir(
+    image: &Path,
+    image_name: &OsStr,
+    installed: &Path,
+    new_version: &str,
+    tree: &Path,
+) -> Result<(), ComponentFailure> {
+    let metadata: Vec<&str> = ["metadata.json", "metadata.desktop"]
+        .into_iter()
+        .filter(|name| is_regular_file(&installed.join(name)))
+        .collect();
+    let target = if metadata.is_empty() && !is_directory(&installed.join("contents")) {
+        tree.join(image_file_name(image_name)?)
+    } else {
+        tree.join("contents/images")
+            .join(package_image_name(image, image_name)?)
+    };
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, parent, e))?;
+    }
+    fs::rename(image, &target)
+        .map_err(|e| ComponentFailure::io(FailureKind::Install, &target, e))?;
+    for name in metadata {
+        let source = installed.join(name);
+        let kept = tree.join(name);
+        // A fresh file rather than `fs::copy`, which would carry over a
+        // read-only mode the version patch then cannot write through.
+        let mut reader = fs::File::open(&source)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, &source, e))?;
+        let mut writer = fs::File::create(&kept)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, &kept, e))?;
+        std::io::copy(&mut reader, &mut writer)
+            .map_err(|e| ComponentFailure::io(FailureKind::Install, &kept, e))?;
+        if name == "metadata.json"
+            && let Err(e) = patch_metadata(&kept, ComponentType::Wallpaper, new_version)
+        {
+            log::warn!(target: "patch", "failed to update installed metadata: {}", e.message);
+        }
+    }
+    Ok(())
+}
+
+/// `image_name` as a file name of its own: one that is empty, `.` or `..`,
+/// holds a path separator or holds a NUL cannot name a file in the wallpaper's
+/// directory.
+fn image_file_name(image_name: &OsStr) -> Result<&OsStr, ComponentFailure> {
+    Path::new(image_name)
+        .file_name()
+        .filter(|name| *name == image_name && !name.as_encoded_bytes().contains(&0))
+        .ok_or_else(|| {
+            let shown = image_name.to_string_lossy();
+            install_failure(format!(
+                "downloaded image has no file name to put in the wallpaper folder ({shown:?})"
+            ))
+        })
+}
+
+/// The name a package directory gives the image: `<W>x<H>.<ext>` from its
+/// header, or its own name for an SVG. The name is judged first, so a decoded
+/// name that is no file name fails with the no-file-name text whatever the
+/// image's format.
+fn package_image_name(image: &Path, image_name: &OsStr) -> Result<OsString, ComponentFailure> {
+    let name = image_file_name(image_name)?;
+    if Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
+        return Ok(name.to_os_string());
+    }
+    let (size, extension) = pixel_size(image).map_err(|why| {
+        let shown = image_name.to_string_lossy();
+        install_failure(format!(
+            "cannot read the pixel size of downloaded image {shown:?} to name it in the wallpaper folder ({why})"
+        ))
+    })?;
+    Ok(format!("{}x{}.{extension}", size.width, size.height).into())
+}
+
+/// An image's pixel size and the extension its format takes, read from its
+/// header alone.
+fn pixel_size(image: &Path) -> Result<(imagesize::ImageSize, &'static str), String> {
+    let mut reader = std::io::BufReader::new(fs::File::open(image).map_err(|e| e.to_string())?);
+    let kind = imagesize::reader_type(&mut reader).map_err(|e| e.to_string())?;
+    let extension = match kind {
+        imagesize::ImageType::Png => "png",
+        imagesize::ImageType::Jpeg => "jpg",
+        imagesize::ImageType::Webp => "webp",
+        // Another crate in the build can turn on more of imagesize's formats.
+        _ => return Err(UNSUPPORTED_IMAGE.to_string()),
+    };
+    let size = kind.reader_size(&mut reader).map_err(|e| e.to_string())?;
+    Ok((size, extension))
+}
+
 // --- Direct Installation Methods ---
 
 /// The file or directory a direct install copies into the component's path,
@@ -1621,7 +1750,7 @@ fn install_index_theme(source_dir: &Path, dest_dir: &Path) -> Result<(), Compone
     Ok(())
 }
 
-fn install_wallpaper(source: &Path, dest: &Path) -> Result<(), ComponentFailure> {
+pub(super) fn install_wallpaper(source: &Path, dest: &Path) -> Result<(), ComponentFailure> {
     if source.is_file() {
         atomic_install_file(source, dest)?;
         log::debug!(target: "install", "copied wallpaper to {}", dest.display());
@@ -4116,5 +4245,36 @@ exec sleep 30
             done.exists(),
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    /// The arm that returns the unsupported-format reason is unreachable while
+    /// only PNG, JPEG and WebP are enabled, so its bytes can only be pinned
+    /// here.
+    #[test]
+    fn the_unsupported_image_reason_keeps_its_wording() {
+        assert_eq!(UNSUPPORTED_IMAGE, "not a PNG, JPEG or WebP image");
+    }
+
+    #[test]
+    fn image_file_name_refuses_a_name_that_is_no_file_name() {
+        assert_eq!(
+            image_file_name(OsStr::new("forest.png")).unwrap(),
+            OsStr::new("forest.png")
+        );
+        for name in ["", ".", "..", "a/b.png", "a\0b.png", "/"] {
+            let failure = image_file_name(OsStr::new(name)).expect_err(name);
+            assert_eq!(
+                failure.kind,
+                FailureKind::Install,
+                "{name:?} failed with the wrong kind"
+            );
+            assert_eq!(
+                failure.message,
+                format!(
+                    "downloaded image has no file name to put in the wallpaper folder ({name:?})"
+                ),
+                "{name:?}"
+            );
+        }
     }
 }

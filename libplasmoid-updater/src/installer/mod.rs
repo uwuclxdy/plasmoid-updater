@@ -14,6 +14,7 @@ pub(crate) mod privilege;
 mod record;
 
 use std::{
+    ffi::OsStr,
     fs,
     io::Read as _,
     path::{Path, PathBuf},
@@ -188,7 +189,14 @@ pub(crate) fn update_component(
     let component = &update.installed;
     let temp = download::create_temp_dir()?;
     let downloaded = download::download_package(update, client, temp.path(), reporter)?;
-    let unpacked = unpack_download(&downloaded, component, &update.latest_version, temp.path())?;
+    let served_name = download::served_file_name(&update.download_url);
+    let unpacked = unpack_download(
+        &downloaded,
+        &served_name,
+        component,
+        &update.latest_version,
+        temp.path(),
+    )?;
 
     let slot = install_slot.acquire();
     let prior = record::settle_prior(sites, component, &slot)?;
@@ -197,7 +205,11 @@ pub(crate) fn update_component(
 
     match execute_installation(&unpacked, component, &slot) {
         Ok(()) => {
-            patch_installed_metadata(update, &slot);
+            // A rebuilt wallpaper's kept metadata got its version in the
+            // run's temp dir, and its `metadata.desktop` stays as it was.
+            if !matches!(unpacked, Unpacked::RebuiltWallpaper(_)) {
+                patch_installed_metadata(update, &slot);
+            }
             record.landed(sites, &slot)?;
             write_registry_entry(update, &slot)?;
             Ok(verify_installed_version(update, &slot))
@@ -231,6 +243,9 @@ fn validate_selected_update(update: &AvailableUpdate) -> Result<(), ComponentFai
 enum Unpacked {
     /// A single-file component's download that is the component file itself.
     RawFile(PathBuf),
+    /// The directory a wallpaper installed as one becomes around the single
+    /// image its download holds, its kept metadata already patched.
+    RebuiltWallpaper(PathBuf),
     /// The file or directory a direct install copies into the component's path.
     Direct(install::DirectSource),
     /// A package without a direct fallback, its metadata patched for the new
@@ -251,13 +266,25 @@ enum Unpacked {
 
 /// Decides what the download installs, extracting and checking an archive and
 /// resolving what the component's type installs by, writing only
-/// `temp_path`.
+/// `temp_path`. `served_name` is the file name the store served the download
+/// under.
+///
+/// A wallpaper installed as a directory whose download is one image, raw or
+/// the only thing its archive holds, is rebuilt here around that image (see
+/// [`install::rebuild_wallpaper_dir`]): the installed shape decides, so the
+/// update lands on the path the desktop config and the install record name.
 fn unpack_download(
     downloaded_path: &Path,
+    served_name: &str,
     component: &InstalledComponent,
     new_version: &str,
     temp_path: &Path,
 ) -> Result<Unpacked, ComponentFailure> {
+    let rebuild = |image: &Path, image_name: &OsStr| {
+        let tree = temp_path.join(format!("rebuilt-{}", component.directory_name));
+        install::rebuild_wallpaper_dir(image, image_name, &component.path, new_version, &tree)
+            .map(|()| Unpacked::RebuiltWallpaper(tree))
+    };
     let is_single_file_type = matches!(
         component.component_type,
         ComponentType::ColorScheme | ComponentType::Wallpaper,
@@ -277,6 +304,9 @@ fn unpack_download(
         && failure.unrecognized_format
         && !has_archive_magic(downloaded_path)
     {
+        if install::is_directory_wallpaper(component) {
+            return rebuild(downloaded_path, OsStr::new(served_name));
+        }
         return Ok(Unpacked::RawFile(downloaded_path.to_path_buf()));
     }
     // The archive is spent either way; removing it now frees its space while
@@ -297,6 +327,14 @@ fn unpack_download(
     // named first, so its refusal names the file rather than the link in it.
     install::verify_extracted_package(&extract_dir)?;
     install::verify_package_tree(&extract_dir, component.component_type)?;
+    // A loose image carries no plugin id to compare; the rebuilt directory
+    // keeps the installed metadata, and with it the installed id.
+    if install::is_directory_wallpaper(component)
+        && let Some(image) = install::loose_wallpaper_image(&extract_dir)
+        && let Some(image_name) = image.file_name()
+    {
+        return rebuild(&image, image_name);
+    }
     install::verify_package_plugin_id(&extract_dir, component)?;
     match component.component_type.kpackage_type() {
         None => Ok(Unpacked::Direct(install::resolve_direct_source(
@@ -340,6 +378,7 @@ fn execute_installation(
 ) -> Result<(), ComponentFailure> {
     match unpacked {
         Unpacked::RawFile(file) => install::install_raw_file(file, component),
+        Unpacked::RebuiltWallpaper(tree) => install::install_wallpaper(tree, &component.path),
         Unpacked::Direct(source) => install::install_direct(source, component),
         Unpacked::Package(package_dir) => install::install_prepared_package(package_dir, component),
         Unpacked::Fallback { tree, package } => {
@@ -730,7 +769,7 @@ mod tests {
     /// Installs `download` as the `component`, expecting `bsdtar`'s refusal to
     /// make it the component file itself.
     fn install_raw_download(download: &Path, component: &InstalledComponent, temp: &Path) {
-        let unpacked = unpack_download(download, component, "2.0", temp).unwrap();
+        let unpacked = unpack_download(download, "download", component, "2.0", temp).unwrap();
         assert!(
             matches!(unpacked, Unpacked::RawFile(_)),
             "the download was not taken as the component file itself"
@@ -763,7 +802,7 @@ mod tests {
         std::fs::create_dir_all(&temp).unwrap();
 
         let component = color_scheme(&dest);
-        let unpacked = unpack_download(&archive, &component, "2.0", &temp).unwrap();
+        let unpacked = unpack_download(&archive, "download", &component, "2.0", &temp).unwrap();
         let slot = InstallSlot::new();
         execute_installation(&unpacked, &component, &slot.acquire()).unwrap();
 
@@ -786,7 +825,7 @@ mod tests {
         std::fs::create_dir_all(&temp).unwrap();
 
         let component = color_scheme(&dest);
-        let unpacked = unpack_download(&archive, &component, "2.0", &temp).unwrap();
+        let unpacked = unpack_download(&archive, "download", &component, "2.0", &temp).unwrap();
         let slot = InstallSlot::new();
         execute_installation(&unpacked, &component, &slot.acquire()).unwrap();
 
@@ -855,7 +894,7 @@ mod tests {
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
-        let failure = unpack_download(&download, &color_scheme(&dest), "2.0", &temp)
+        let failure = unpack_download(&download, "download", &color_scheme(&dest), "2.0", &temp)
             .expect_err("an empty download installed as a component file");
 
         assert_eq!(
@@ -887,6 +926,7 @@ exit 1
 
             let failure = unpack_download(
                 &root.join("download"),
+                "download",
                 &component,
                 "2.0",
                 &root.join("work"),
@@ -956,6 +996,7 @@ exit 0
 
             let failure = unpack_download(
                 &root.join("download"),
+                "download",
                 &component,
                 "2.0",
                 &root.join("work"),
@@ -1041,7 +1082,7 @@ exit 0
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
-        let result = unpack_download(&archive, &color_scheme(&dest), "2.0", &temp);
+        let result = unpack_download(&archive, "download", &color_scheme(&dest), "2.0", &temp);
 
         let failure = result.expect_err("a corrupt archive installed");
         assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
@@ -1096,7 +1137,7 @@ exit 0
             let temp = root.path().join(format!("work-{len}"));
             std::fs::create_dir_all(&temp).unwrap();
 
-            let failure = unpack_download(&archive, &color_scheme(&dest), "2.0", &temp)
+            let failure = unpack_download(&archive, "download", &color_scheme(&dest), "2.0", &temp)
                 .expect_err("a truncated tar installed as the component file");
 
             assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
@@ -1127,7 +1168,7 @@ exit 0
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
-        let failure = unpack_download(&archive, &color_scheme(&dest), "2.0", &temp)
+        let failure = unpack_download(&archive, "download", &color_scheme(&dest), "2.0", &temp)
             .expect_err("a tar with a broken header checksum installed as the component file");
 
         assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
@@ -1149,7 +1190,7 @@ exit 0
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
-        let failure = unpack_download(&archive, &color_scheme(&dest), "2.0", &temp)
+        let failure = unpack_download(&archive, "download", &color_scheme(&dest), "2.0", &temp)
             .expect_err("a gzip of text installed as the component file");
 
         assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
@@ -1170,7 +1211,7 @@ exit 0
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
-        let failure = unpack_download(&download, &wallpaper(&dest), "2.0", &temp)
+        let failure = unpack_download(&download, "download", &wallpaper(&dest), "2.0", &temp)
             .expect_err("an empty download installed as a component file");
 
         assert_eq!(failure.message, "no wallpaper found in archive");

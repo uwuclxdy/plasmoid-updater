@@ -84,10 +84,11 @@ jobs:
           sudo apt-get update && sudo apt-get install -y mold
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
       # update and install refuse to start without bsdtar on PATH, and update
-      # extracts with it; ubuntu ships it in libarchive-tools.
-      - name: test dependencies (bsdtar)
+      # extracts with it; ubuntu ships it in libarchive-tools. The
+      # fault-injection tests need strace to inject a failure and a kill.
+      - name: test dependencies (bsdtar, strace)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libarchive-tools
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools strace
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-llvm-cov

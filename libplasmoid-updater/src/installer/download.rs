@@ -171,6 +171,63 @@ fn download_limit(checksum: Option<&str>, advertised: Option<u64>) -> u64 {
     }
 }
 
+/// The file name the store serves a download under: the last path segment of
+/// its URL, its `?query` and `#fragment` dropped and its `%xx` escapes
+/// decoded; a URL naming no path segment names nothing. The name need not be
+/// a file name; the install step refuses it where it would name the
+/// component's own file.
+pub(super) fn served_file_name(url: &str) -> String {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    let path = match url[..end].split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("", |slash| &rest[slash..]),
+        None => &url[..end],
+    };
+    decode_percent(path.rsplit_once('/').map_or(path, |(_, name)| name))
+}
+
+/// The last path segment of `url` as the store spelled it, for a temp file
+/// whose name nothing else reads.
+fn raw_served_name(url: &str) -> &str {
+    url.rsplit_once('/').map_or(url, |(_, name)| name)
+}
+
+/// `name` with every `%xx` escape decoded; an escape that is not two hex
+/// digits stays as it is, and decoded bytes that are not UTF-8 become a
+/// replacement character.
+fn decode_percent(name: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = name.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = if bytes[index] == b'%' && index + 2 < bytes.len() {
+            hex(bytes[index + 1])
+                .zip(hex(bytes[index + 2]))
+                .map(|(high, low)| high * 16 + low)
+        } else {
+            None
+        };
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Downloads a package with optional checksum verification, emitting
 /// [`Event::Downloading`] through `reporter` as chunks arrive: the event's
 /// `name` is the component's display name and its `id` the installed path.
@@ -190,7 +247,9 @@ pub(crate) fn download_package(
 ) -> Result<PathBuf, ComponentFailure> {
     let component = &update.installed;
     let url = &update.download_url;
-    let file_name = url.rsplit('/').next().unwrap_or("package.tar.gz");
+    // The temp file only needs a name no parallel download shares; the
+    // component's own name is decoded where it is used.
+    let file_name = raw_served_name(url);
 
     let dest = temp_path.join(format!("{}_{file_name}", component.directory_name));
     let limit = download_limit(update.checksum.as_deref(), update.download_size);
@@ -1733,5 +1792,30 @@ exec "$PU_TEST_REAL_BSDTAR" "$@"
             survived,
             "the group-leaving child did not outlive the call, so the fixture tests nothing"
         );
+    }
+
+    #[test]
+    fn served_file_name_drops_the_query_and_decodes_escapes() {
+        let cases = [
+            ("http://host/dl/forest.png", "forest.png"),
+            ("http://host/dl/forest.png?dl=1", "forest.png"),
+            ("http://host/dl/forest.png#frag", "forest.png"),
+            ("http://host/dl/forest.png?dl=1#frag", "forest.png"),
+            ("http://host/dl/Forest%20Night.png", "Forest Night.png"),
+            ("http://host/dl/caf%C3%A9.png", "caf\u{e9}.png"),
+            ("http://host/dl/a%2Fb.png", "a/b.png"),
+            ("http://host/dl/a%2fb.png", "a/b.png"),
+            ("http://host/dl/a%00b.png", "a\0b.png"),
+            ("http://host/dl/a%zz.png", "a%zz.png"),
+            ("http://host/dl/a%2.png", "a%2.png"),
+            ("http://host/dl/forest%2", "forest%2"),
+            ("http://host/dl/forest%", "forest%"),
+            ("http://host/dl/", ""),
+            ("http://host", ""),
+            ("http://host?dl=1", ""),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(super::served_file_name(url), expected, "{url}");
+        }
     }
 }
