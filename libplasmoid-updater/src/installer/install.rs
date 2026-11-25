@@ -1649,8 +1649,8 @@ pub(super) fn rebuild_wallpaper_dir(
 /// name, or the name the store served the download under.
 ///
 /// A served name whose `%xx` escapes do not decode to UTF-8 names no file, and
-/// `Served` carries it as the store spelled it, which is how the refusal names
-/// it; an arm that names its image by its pixel size never reads it.
+/// `Served` carries it as the store spelled it, which is how a failure line
+/// names it.
 #[derive(Clone, Copy)]
 pub(super) enum ImageName<'a> {
     /// The store's served file name, decoded, or its spelling when its escapes
@@ -1698,8 +1698,9 @@ impl<'a> ImageName<'a> {
 
 /// The name a package directory gives the image: `<W>x<H>.<ext>` read from its
 /// header, or an SVG's own name, the one image format whose name a package
-/// keeps. Only that name is read, so a name that cannot be a file name is
-/// refused only when no pixel size can name the image instead.
+/// keeps. A name that cannot be a file name is refused only when the image's
+/// bytes name no raster format: a header that names one, or a header too short
+/// to read that opens with a raster's signature, decides the failure itself.
 fn package_image_name(
     image: &Path,
     image_name: ImageName<'_>,
@@ -1712,8 +1713,8 @@ fn package_image_name(
     }
     match pixel_size(image) {
         Ok((size, extension)) => Ok(format!("{}x{}.{extension}", size.width, size.height).into()),
-        Err(_) if name.is_none() => Err(image_name.no_file_name()),
-        Err(why) => Err(image_name.size_failure(&why)),
+        Err(SizeFailure::NoFormat(_)) if name.is_none() => Err(image_name.no_file_name()),
+        Err(failure) => Err(image_name.size_failure(&failure.why())),
     }
 }
 
@@ -1733,19 +1734,68 @@ fn has_svg_extension(name: &OsStr) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
 }
 
+/// Why an image's pixel size could not be read.
+enum SizeFailure {
+    /// The header matches no supported format, or is too short to read and opens
+    /// with no raster's signature, leaving the image's name as the only thing
+    /// that could still say what it is.
+    NoFormat(String),
+    /// The image itself decides: a header too short to read that opens with a
+    /// raster's signature, one naming a format whose size cannot be read, or a
+    /// file that cannot be opened or read.
+    Unreadable(String),
+}
+
+impl SizeFailure {
+    /// The reader's own account of the failure.
+    fn why(self) -> String {
+        match self {
+            Self::NoFormat(why) | Self::Unreadable(why) => why,
+        }
+    }
+}
+
 /// An image's pixel size and the extension its format takes, read from its
 /// header alone.
-fn pixel_size(image: &Path) -> Result<(imagesize::ImageSize, &'static str), String> {
-    let mut reader = std::io::BufReader::new(fs::File::open(image).map_err(|e| e.to_string())?);
-    let kind = imagesize::reader_type(&mut reader).map_err(|e| e.to_string())?;
+fn pixel_size(image: &Path) -> Result<(imagesize::ImageSize, &'static str), SizeFailure> {
+    let mut reader = std::io::BufReader::new(
+        fs::File::open(image).map_err(|e| SizeFailure::Unreadable(e.to_string()))?,
+    );
+    let kind = match imagesize::reader_type(&mut reader) {
+        Ok(kind) => kind,
+        Err(error @ imagesize::ImageError::NotSupported) => {
+            return Err(SizeFailure::NoFormat(error.to_string()));
+        }
+        Err(imagesize::ImageError::IoError(error))
+            if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+        {
+            // imagesize 0.15.0 (Cargo.lock) fills a 12-byte header before it
+            // tries any format, so a shorter body's own signature has to decide:
+            // one opening with a raster signature is a raster whose size is
+            // missing, and anything else leaves the name as the only thing that
+            // could say what it is.
+            let bytes = fs::read(image).map_err(|e| SizeFailure::Unreadable(e.to_string()))?;
+            let mut header = [0; 12];
+            for (slot, byte) in header.iter_mut().zip(bytes) {
+                *slot = byte;
+            }
+            return Err(match imagesize::image_type(&header) {
+                Ok(_) => SizeFailure::Unreadable(error.to_string()),
+                Err(_) => SizeFailure::NoFormat(error.to_string()),
+            });
+        }
+        Err(error) => return Err(SizeFailure::Unreadable(error.to_string())),
+    };
     let extension = match kind {
         imagesize::ImageType::Png => "png",
         imagesize::ImageType::Jpeg => "jpg",
         imagesize::ImageType::Webp => "webp",
         // Another crate in the build can turn on more of imagesize's formats.
-        _ => return Err(UNSUPPORTED_IMAGE.to_string()),
+        _ => return Err(SizeFailure::Unreadable(UNSUPPORTED_IMAGE.to_string())),
     };
-    let size = kind.reader_size(&mut reader).map_err(|e| e.to_string())?;
+    let size = kind
+        .reader_size(&mut reader)
+        .map_err(|e| SizeFailure::Unreadable(e.to_string()))?;
     Ok((size, extension))
 }
 

@@ -48,6 +48,18 @@ const WEBP_5X4: &[u8] = b"\x52\x49\x46\x46\x1e\x00\x00\x00\x57\x45\x42\x50\x56\x
 const SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"1\"><rect width=\"2\" height=\"1\" fill=\"#0a0\"/></svg>\n";
 /// A PNG cut after its signature: no header to read a size from.
 const CUT_PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// A PNG cut after its IHDR chunk's length and type, before the width and
+/// height fields: a format the size reader matches, with no size to read.
+const PNG_WITHOUT_SIZE: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR";
+/// An SVG shorter than the 12-byte header the size reader fills first: no
+/// raster signature either, so only an SVG's name can say what it is.
+const TINY_SVG: &[u8] = b"<svg></svg>";
+/// A WebP cut one byte before its `WEBP` tag: under 12 bytes, so no reader
+/// matches its format.
+const CUT_WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEB";
+/// A JPEG cut after its start-of-image marker: three bytes of a raster
+/// signature and nothing to read a size from.
+const JPEG_START: &[u8] = b"\xFF\xD8\xFF";
 const DESKTOP: &str = "[Desktop Entry]\nName=Fake Forest\nX-KDE-PluginInfo-Name=FakeForest\nX-KDE-PluginInfo-Version=1.0\n";
 const RECORD_SUFFIX: &str = ".plasmoid-updater-backup";
 
@@ -591,7 +603,12 @@ fn a_directory_wallpaper_served_another_widgets_package_is_refused() {
 #[test]
 fn a_desktop_only_package_keeps_its_metadata_desktop_byte_for_byte() {
     if let Some(child) = common::child() {
-        updates_in_place(child, WALLPAPER_DIR);
+        start_capture();
+        updates_in_place_checking(
+            child,
+            WALLPAPER_DIR,
+            assert_capture_holds_no_metadata_patch_warning,
+        );
         return;
     }
     let sandbox = Sandbox::new();
@@ -656,7 +673,12 @@ fn a_metadata_only_package_gets_the_image_under_contents_images() {
 #[test]
 fn a_desktop_only_package_without_contents_keeps_its_desktop_file() {
     if let Some(child) = common::child() {
-        updates_in_place(child, WALLPAPER_DIR);
+        start_capture();
+        updates_in_place_checking(
+            child,
+            WALLPAPER_DIR,
+            assert_capture_holds_no_metadata_patch_warning,
+        );
         return;
     }
     let sandbox = Sandbox::new();
@@ -1000,6 +1022,209 @@ fn an_image_whose_size_cannot_be_read_fails_before_any_backup() {
     );
 }
 
+/// A package directory names a raster image by its pixel size, so a name whose
+/// escapes do not decode to UTF-8 does not hide the image's own failure: a cut
+/// PNG fails with the pixel-size line, naming the name as served.
+#[test]
+fn a_cut_png_under_an_undecodable_name_fails_at_its_pixel_size() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "cannot read the pixel size of downloaded image \"%FF.png\" to name it in the wallpaper folder (failed to fill whole buffer)",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_cut_png_under_an_undecodable_name_fails_at_its_pixel_size",
+        &start_store("%FF.png", CUT_PNG.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
+/// The same under a link that names no file: the image's header decides, so a
+/// cut PNG still fails with the pixel-size line.
+#[test]
+fn a_cut_png_under_a_nameless_link_fails_at_its_pixel_size() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "cannot read the pixel size of downloaded image \"\" to name it in the wallpaper folder (failed to fill whole buffer)",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_cut_png_under_a_nameless_link_fails_at_its_pixel_size",
+        &start_store("", CUT_PNG.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
+/// A PNG whose header the size reader matches but whose body ends before its
+/// width and height is still a raster, so a link that names no file fails at
+/// the pixel size: the format was recognised, and only its size is missing.
+#[test]
+fn a_png_cut_before_its_size_under_a_nameless_link_fails_at_its_pixel_size() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "cannot read the pixel size of downloaded image \"\" to name it in the wallpaper folder (failed to fill whole buffer)",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_png_cut_before_its_size_under_a_nameless_link_fails_at_its_pixel_size",
+        &start_store("", PNG_WITHOUT_SIZE.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
+/// A WebP cut before its `WEBP` tag is too short for the size reader's matcher,
+/// so it opens with no raster signature: a link that names no file keeps the
+/// no-file-name failure.
+#[test]
+fn a_cut_webp_under_a_nameless_link_names_no_file() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "downloaded image has no file name to put in the wallpaper folder (\"\")",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_cut_webp_under_a_nameless_link_names_no_file",
+        &start_store("", CUT_WEBP.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
+/// A JPEG cut after its start marker opens with a raster signature, so a link
+/// that names no file fails at the pixel size: the bytes say raster, and the
+/// name says nothing.
+#[test]
+fn a_jpeg_start_under_a_nameless_link_fails_at_its_pixel_size() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "cannot read the pixel size of downloaded image \"\" to name it in the wallpaper folder (failed to fill whole buffer)",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_jpeg_start_under_a_nameless_link_fails_at_its_pixel_size",
+        &start_store("", JPEG_START.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
+/// A package directory served bytes no reader knows, under a name that could be
+/// a file name, fails at its pixel size: the name cannot say the image is an
+/// SVG, so the line names the header's failure.
+#[test]
+fn a_package_directory_served_an_unknown_image_fails_at_its_pixel_size() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "cannot read the pixel size of downloaded image \"forest.png\" to name it in the wallpaper folder (Could not decode image)",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_package_directory_served_an_unknown_image_fails_at_its_pixel_size",
+        &start_store("forest.png", SVG.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
 /// A package directory with `contents/` but no metadata file gets the image
 /// under `contents/images/` and no metadata the store never shipped.
 #[test]
@@ -1191,8 +1416,111 @@ fn a_nameless_svg_for_a_package_names_no_file() {
     );
 }
 
+/// A body too short to read that opens with no raster signature is no format
+/// the bytes can name, so a link that names no file keeps the no-file-name
+/// failure rather than blaming the pixel size.
+#[test]
+fn a_tiny_svg_under_a_nameless_link_names_no_file() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "downloaded image has no file name to put in the wallpaper folder (\"\")",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_tiny_svg_under_a_nameless_link_names_no_file",
+        &start_store("", TINY_SVG.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
+/// The same under a name whose escapes do not decode to UTF-8: the short body
+/// names no raster format, so the failure is the name's to decide, and this
+/// name names no file.
+#[test]
+fn a_tiny_svg_under_an_undecodable_name_names_no_file() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "downloaded image has no file name to put in the wallpaper folder (\"%FF.svg\")",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_tiny_svg_under_an_undecodable_name_names_no_file",
+        &start_store("%FF.svg", TINY_SVG.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
+/// A short body that opens with no raster signature and a usable name fails at
+/// the pixel size, naming that name: a .png name cannot make the body an SVG,
+/// so the name decides nothing here.
+#[test]
+fn a_tiny_svg_under_a_png_name_fails_at_its_pixel_size() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "cannot read the pixel size of downloaded image \"forest.png\" to name it in the wallpaper folder (failed to fill whole buffer)",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = install_package(&sandbox);
+    let before = snapshot(&dir);
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_tiny_svg_under_a_png_name_fails_at_its_pixel_size",
+        &start_store("forest.png", TINY_SVG.to_vec()),
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().ino(),
+        inode,
+        "the directory was replaced"
+    );
+    assert_eq!(snapshot(&dir), before, "the directory changed");
+    let backups = backups_named(&sandbox, WALLPAPER_DIR);
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
 /// A package directory names a raster image by its pixel size, so a link that
-/// names no file updates it: nothing on that arm reads the served name.
+/// names no file updates it: on that arm the served name only says whether the
+/// image is an SVG.
 #[test]
 fn a_nameless_download_updates_a_package_directory() {
     if let Some(child) = common::child() {

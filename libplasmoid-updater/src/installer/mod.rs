@@ -214,7 +214,10 @@ pub(crate) fn update_component(
                     kept_json: true, ..
                 } => patch_rebuilt_metadata(component, &update.latest_version, &slot),
                 Unpacked::RebuiltWallpaper { .. } => {}
-                _ => patch_installed_metadata(update, &slot),
+                Unpacked::RawFile(_)
+                | Unpacked::Direct(_)
+                | Unpacked::Package(_)
+                | Unpacked::Fallback { .. } => patch_installed_metadata(update, &slot),
             }
             record.landed(sites, &slot)?;
             write_registry_entry(update, &slot)?;
