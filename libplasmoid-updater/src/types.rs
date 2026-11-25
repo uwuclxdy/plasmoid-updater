@@ -627,7 +627,12 @@ pub enum FailureKind {
     Checksum,
     /// Extracting the downloaded archive failed.
     Extract,
-    /// Installing the extracted files (kpackagetool6, direct copy) failed.
+    /// The install did not complete: the download does not install as the
+    /// component (such as an empty download, one holding nothing of the
+    /// component's type, or a refused package), or a step installing it
+    /// failed (such as creating its temp directory, preparing the download
+    /// there, kpackagetool6, the direct copy, its backup or its install
+    /// record).
     Install,
     /// The install failed and restoring the backup failed too, so the
     /// component may be left in a partial state.

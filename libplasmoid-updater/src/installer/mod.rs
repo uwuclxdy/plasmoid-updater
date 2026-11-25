@@ -298,9 +298,10 @@ fn unpack_download(
         component.component_type,
         ComponentType::ColorScheme | ComponentType::Wallpaper,
     );
-    // A zero-byte download is neither the component file nor an archive:
-    // `bsdtar` lists it as an empty archive, so the single-file lookups would
-    // name it one. It fails here, before anything is extracted or backed up.
+    // A zero-byte download is neither the component file nor an archive, yet
+    // `bsdtar` lists it as an archive holding nothing (measured 2026-11-25 on
+    // libarchive 3.8.11: exit 0, no output), so every later check would read
+    // it as one.
     if is_single_file_type
         && fs::metadata(downloaded_path)
             .map_err(|e| ComponentFailure::io(FailureKind::Extract, downloaded_path, e))?

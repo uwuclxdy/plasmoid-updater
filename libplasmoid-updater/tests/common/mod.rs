@@ -372,7 +372,7 @@ pub struct Listing {
     /// members, `(relative path, contents)`, in place of the default archive.
     pub scheme_files: Option<&'static [(&'static str, &'static str)]>,
     /// When set, the color scheme's download serves these bytes in place of
-    /// the archive `scheme_files` describes.
+    /// the default archive or the one `scheme_files` describes.
     pub scheme_download: Option<&'static [u8]>,
     /// When set, the widget download is a Plasma widget package whose
     /// `KPlugin.Id` is this value, named and versioned as `widget` says.

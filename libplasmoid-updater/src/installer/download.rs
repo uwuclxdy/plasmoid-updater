@@ -456,7 +456,7 @@ fn list_archive(archive_path: &Path, timeout: Duration) -> Result<(), ComponentF
         let _ = child.wait();
         return Err(ComponentFailure::new(
             FailureKind::Extract,
-            "bsdtar produced no listing stream".to_string(),
+            "bsdtar produced no listing stream",
         ));
     };
     let stderr_reader = child.stderr.take().map(spawn_reader);
