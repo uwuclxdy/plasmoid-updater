@@ -267,7 +267,8 @@ enum Unpacked {
 /// Decides what the download installs, extracting and checking an archive and
 /// resolving what the component's type installs by, writing only
 /// `temp_path`. `served_name` is the file name the store served the download
-/// under.
+/// under. A single-file component's zero-byte download fails here, naming what
+/// the store served, before anything is extracted or backed up.
 ///
 /// A wallpaper installed as a directory whose download is one image, raw or
 /// the only thing its archive holds, is rebuilt here around that image (see
@@ -289,6 +290,20 @@ fn unpack_download(
         component.component_type,
         ComponentType::ColorScheme | ComponentType::Wallpaper,
     );
+    // A zero-byte download is neither the component file nor an archive:
+    // `bsdtar` lists it as an empty archive, so the single-file lookups would
+    // name it one. It fails here, before anything is extracted or backed up.
+    if is_single_file_type
+        && fs::metadata(downloaded_path)
+            .map_err(|e| ComponentFailure::io(FailureKind::Extract, downloaded_path, e))?
+            .len()
+            == 0
+    {
+        return Err(ComponentFailure::new(
+            FailureKind::Install,
+            "the store served an empty file",
+        ));
+    }
     let extract_dir = temp_path.join(format!("extract-{}", component.directory_name));
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)
@@ -297,8 +312,9 @@ fn unpack_download(
     let extracted = download::extract_archive(downloaded_path, &extract_dir);
     // A single-file component's download is the component file itself only
     // when `bsdtar` names no archive format for it and the file carries no
-    // archive signature: a damaged archive is refused by both, so it fails as
-    // an extract failure instead of being installed as the component file.
+    // archive signature: `bsdtar` names none for a truncated or header-damaged
+    // archive either, so its signature makes it fail as an extract failure
+    // instead of being installed as the component file.
     if is_single_file_type
         && let Err(failure) = &extracted
         && failure.unrecognized_format
@@ -881,31 +897,52 @@ mod tests {
         );
     }
 
-    /// An empty file lists as an archive holding nothing, so it fails the
-    /// single-file component instead of installing an empty component file.
+    /// An archive holding no members, which `bsdtar` lists empty.
+    fn empty_tar(dir: &Path) -> PathBuf {
+        let archive = dir.join("empty.tar");
+        let status = std::process::Command::new("tar")
+            .args(["--create", "--file"])
+            .arg(&archive)
+            .args(["--files-from", "/dev/null"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "tar failed building the empty fixture");
+        archive
+    }
+
+    /// A zero-byte download is neither the component file nor an archive: it
+    /// fails with the line naming what the store served.
     #[test]
     fn an_empty_download_fails_the_color_scheme() {
         let root = tempfile::tempdir().unwrap();
         let download = root.path().join("download");
         std::fs::write(&download, b"").unwrap();
         let dest = root.path().join("installed/FakeScheme.colors");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
         let failure = unpack_download(&download, "download", &color_scheme(&dest), "2.0", &temp)
             .expect_err("an empty download installed as a component file");
 
-        assert_eq!(
-            failure.message, "no color scheme file found in archive",
-            "{}",
-            failure.message
-        );
-        assert_eq!(
-            std::fs::read_to_string(&dest).unwrap(),
-            "[Colors:View]\n# old\n"
-        );
+        assert_eq!(failure.kind, FailureKind::Install, "{}", failure.message);
+        assert_eq!(failure.message, "the store served an empty file");
+    }
+
+    /// An archive that lists empty keeps the lookup's own line: only a
+    /// zero-byte download is named as the store's empty file.
+    #[test]
+    fn an_empty_archive_fails_the_color_scheme_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = empty_tar(root.path());
+        let dest = root.path().join("installed/FakeScheme.colors");
+        let temp = root.path().join("work");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let failure = unpack_download(&archive, "download", &color_scheme(&dest), "2.0", &temp)
+            .expect_err("an empty archive installed as the component file");
+
+        assert_eq!(failure.kind, FailureKind::Install, "{}", failure.message);
+        assert_eq!(failure.message, "no color scheme file found in archive");
     }
 
     const NEAR_MISS_LISTING_CHILD: &str =
@@ -940,10 +977,6 @@ exit 1
                 failure.message,
                 "bsdtar: Error opening archive: Unrecognized archive format; retry"
             );
-            assert_eq!(
-                std::fs::read_to_string(&component.path).unwrap(),
-                "[Colors:View]\n# old\n"
-            );
             std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
             return;
         }
@@ -954,9 +987,6 @@ exit 1
         std::fs::create_dir_all(&bin).unwrap();
         write_script(&bin.join("bsdtar"), NEAR_MISS_LISTING_BSDTAR);
         std::fs::write(root.join("download"), "[General]\nName=Raw\n").unwrap();
-        let dest = root.join("installed/FakeScheme.colors");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
         std::fs::create_dir_all(root.join("work")).unwrap();
         let done = root.join("child-done");
 
@@ -1005,10 +1035,6 @@ exit 0
 
             assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
             assert_eq!(failure.message, "bsdtar timed out after 1 s");
-            assert_eq!(
-                std::fs::read_to_string(&component.path).unwrap(),
-                "[Colors:View]\n# old\n"
-            );
             std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
             return;
         }
@@ -1019,9 +1045,6 @@ exit 0
         std::fs::create_dir_all(&bin).unwrap();
         write_script(&bin.join("bsdtar"), TIMED_OUT_LISTING_BSDTAR);
         std::fs::write(root.join("download"), "[General]\nName=Raw\n").unwrap();
-        let dest = root.join("installed/FakeScheme.colors");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
         std::fs::create_dir_all(root.join("work")).unwrap();
         let done = root.join("child-done");
 
@@ -1077,8 +1100,6 @@ exit 0
         let root = tempfile::tempdir().unwrap();
         let archive = truncated_gzip(root.path());
         let dest = root.path().join("installed/FakeScheme.colors");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
@@ -1086,10 +1107,6 @@ exit 0
 
         let failure = result.expect_err("a corrupt archive installed");
         assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
-        assert_eq!(
-            std::fs::read_to_string(&dest).unwrap(),
-            "[Colors:View]\n# old\n"
-        );
     }
 
     /// Builds a gzip stream of `content` at `dir/text.gz`.
@@ -1112,7 +1129,7 @@ exit 0
     /// signature, so it is an archive and fails the component instead of
     /// installing its bytes as the component file.
     #[test]
-    fn a_truncated_ustar_tar_fails_the_extract_untouched() {
+    fn a_truncated_ustar_tar_fails_the_extract() {
         let root = tempfile::tempdir().unwrap();
         let full = tar_holding(
             root.path(),
@@ -1121,6 +1138,7 @@ exit 0
             "[Colors:View]\n# new\n",
         );
         let bytes = std::fs::read(&full).unwrap();
+        let dest = root.path().join("installed/FakeScheme.colors");
         for len in [300usize, 511] {
             assert!(
                 bytes.len() > len,
@@ -1129,11 +1147,6 @@ exit 0
             );
             let archive = root.path().join(format!("cut-{len}.tar"));
             std::fs::write(&archive, &bytes[..len]).unwrap();
-            let dest = root
-                .path()
-                .join(format!("installed/{len}/FakeScheme.colors"));
-            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-            std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
             let temp = root.path().join(format!("work-{len}"));
             std::fs::create_dir_all(&temp).unwrap();
 
@@ -1141,17 +1154,13 @@ exit 0
                 .expect_err("a truncated tar installed as the component file");
 
             assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
-            assert_eq!(
-                std::fs::read_to_string(&dest).unwrap(),
-                "[Colors:View]\n# old\n"
-            );
         }
     }
 
     /// Byte 148 carries the header checksum: changing it leaves the tar's own
     /// signature in place.
     #[test]
-    fn a_tar_with_a_broken_header_checksum_fails_the_extract_untouched() {
+    fn a_tar_with_a_broken_header_checksum_fails_the_extract() {
         let root = tempfile::tempdir().unwrap();
         let archive = tar_holding(
             root.path(),
@@ -1163,8 +1172,6 @@ exit 0
         bytes[148] ^= 0xff;
         std::fs::write(&archive, &bytes).unwrap();
         let dest = root.path().join("installed/FakeScheme.colors");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
@@ -1172,21 +1179,15 @@ exit 0
             .expect_err("a tar with a broken header checksum installed as the component file");
 
         assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
-        assert_eq!(
-            std::fs::read_to_string(&dest).unwrap(),
-            "[Colors:View]\n# old\n"
-        );
     }
 
     /// A gzip of text holds no archive inside, so `bsdtar` refuses it as it
     /// refuses a raw file; its gzip signature still makes it an archive.
     #[test]
-    fn a_gzip_of_text_fails_the_extract_untouched() {
+    fn a_gzip_of_text_fails_the_extract() {
         let root = tempfile::tempdir().unwrap();
         let archive = gzip_of(root.path(), "[General]\nName=Multi\nColorCount=2\n");
         let dest = root.path().join("installed/FakeScheme.colors");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&dest, "[Colors:View]\n# old\n").unwrap();
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
@@ -1194,10 +1195,6 @@ exit 0
             .expect_err("a gzip of text installed as the component file");
 
         assert_eq!(failure.kind, FailureKind::Extract, "{}", failure.message);
-        assert_eq!(
-            std::fs::read_to_string(&dest).unwrap(),
-            "[Colors:View]\n# old\n"
-        );
     }
 
     #[test]
@@ -1206,16 +1203,97 @@ exit 0
         let download = root.path().join("download");
         std::fs::write(&download, b"").unwrap();
         let dest = root.path().join("installed/FakeWallpaper.png");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&dest, b"old image").unwrap();
         let temp = root.path().join("work");
         std::fs::create_dir_all(&temp).unwrap();
 
         let failure = unpack_download(&download, "download", &wallpaper(&dest), "2.0", &temp)
             .expect_err("an empty download installed as a component file");
 
+        assert_eq!(failure.kind, FailureKind::Install, "{}", failure.message);
+        assert_eq!(failure.message, "the store served an empty file");
+    }
+
+    #[test]
+    fn an_empty_archive_fails_the_wallpaper_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = empty_tar(root.path());
+        let dest = root.path().join("installed/FakeWallpaper.png");
+        let temp = root.path().join("work");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let failure = unpack_download(&archive, "download", &wallpaper(&dest), "2.0", &temp)
+            .expect_err("an empty archive installed as the component file");
+
+        assert_eq!(failure.kind, FailureKind::Install, "{}", failure.message);
         assert_eq!(failure.message, "no wallpaper found in archive");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"old image");
+    }
+
+    /// Only the single-file types name a zero-byte download as the store's
+    /// empty file: every other type keeps its own lookup's line.
+    #[test]
+    fn an_empty_download_keeps_an_icon_theme_lookup_line() {
+        let root = tempfile::tempdir().unwrap();
+        let download = root.path().join("download");
+        std::fs::write(&download, b"").unwrap();
+        let component = InstalledComponent {
+            name: "Fake Icons".to_string(),
+            directory_name: "FakeIcons".to_string(),
+            version: "1.0".to_string(),
+            component_type: ComponentType::IconTheme,
+            path: root.path().join("installed/FakeIcons"),
+            is_system: false,
+            release_date: String::new(),
+        };
+        let temp = root.path().join("work");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let failure = unpack_download(&download, "download", &component, "2.0", &temp)
+            .expect_err("an empty download installed as a component file");
+
+        assert_eq!(failure.kind, FailureKind::Install, "{}", failure.message);
+        assert_eq!(failure.message, "no theme (index.theme) found in archive");
+    }
+
+    /// `bsdtar`'s unrecognized-format answer makes a download the component
+    /// file only for a single-file type: every other type fails the extract.
+    #[test]
+    fn an_unrecognized_download_fails_the_extract_for_every_other_type() {
+        for &component_type in ComponentType::all() {
+            if matches!(
+                component_type,
+                ComponentType::ColorScheme | ComponentType::Wallpaper
+            ) {
+                continue;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let download = root.path().join("download");
+            std::fs::write(&download, "[General]\nName=Raw\n").unwrap();
+            let temp = root.path().join("work");
+            std::fs::create_dir_all(&temp).unwrap();
+            let component = InstalledComponent {
+                name: "Fake".to_string(),
+                directory_name: "Fake".to_string(),
+                version: "1.0".to_string(),
+                component_type,
+                path: root.path().join("installed/Fake"),
+                is_system: false,
+                release_date: String::new(),
+            };
+
+            let failure = unpack_download(&download, "download", &component, "2.0", &temp)
+                .expect_err("an unrecognized download was taken as the component itself");
+
+            assert_eq!(
+                failure.kind,
+                FailureKind::Extract,
+                "{component_type:?}: {}",
+                failure.message
+            );
+            assert_eq!(
+                failure.message, "bsdtar: Error opening archive: Unrecognized archive format",
+                "{component_type:?}"
+            );
+        }
     }
 
     fn system_scheme_update(path: PathBuf, latest: &str, content_id: u64) -> AvailableUpdate {

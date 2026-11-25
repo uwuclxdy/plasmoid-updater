@@ -670,6 +670,47 @@ fn a_color_scheme_archive_without_a_scheme_file_takes_no_backup_and_restores_not
     );
 }
 
+/// A color scheme whose store serves a zero-byte download: the component
+/// fails naming what the store served, before any write.
+#[test]
+fn an_empty_scheme_download_takes_no_backup_and_restores_nothing() {
+    if let Some(child) = common::child() {
+        assert_one_failure(
+            child,
+            FailureKind::Install,
+            Some("the store served an empty file"),
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let scheme = sandbox.scheme_path();
+    let inode = std::fs::metadata(&scheme).unwrap().ino();
+    let store = FakeStore::start(Listing {
+        scheme_download: Some(b""),
+        ..Listing::default()
+    });
+    sandbox.run_child(
+        "an_empty_scheme_download_takes_no_backup_and_restores_nothing",
+        store.url(),
+    );
+    assert_eq!(
+        std::fs::metadata(&scheme).unwrap().ino(),
+        inode,
+        "the color scheme file was replaced"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&scheme).unwrap(),
+        common::OLD_CONTENT,
+        "the installed color scheme changed"
+    );
+    let backups = backups_named(&sandbox, common::SCHEME_FILE);
+    assert!(
+        backups.is_empty(),
+        "the color scheme was backed up: {backups:?}"
+    );
+}
+
 /// An icon theme (a direct install of one directory) whose store archive
 /// carries no `index.theme`: the install-path lookup fails before any write.
 #[test]

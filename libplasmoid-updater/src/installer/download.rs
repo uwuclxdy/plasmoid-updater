@@ -447,7 +447,7 @@ fn list_archive(archive_path: &Path, timeout: Duration) -> Result<(), ComponentF
         .map_err(|e| {
             ComponentFailure::new(FailureKind::Extract, format!("failed to run bsdtar: {e}"))
         })?;
-    let group = Pid::from_raw(child.id() as i32);
+    let group = Pid::from_raw(child.id().cast_signed());
 
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();

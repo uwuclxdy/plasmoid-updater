@@ -371,6 +371,9 @@ pub struct Listing {
     /// When set, the color scheme's download is a `.tar.gz` of these archive
     /// members, `(relative path, contents)`, in place of the default archive.
     pub scheme_files: Option<&'static [(&'static str, &'static str)]>,
+    /// When set, the color scheme's download serves these bytes in place of
+    /// the archive `scheme_files` describes.
+    pub scheme_download: Option<&'static [u8]>,
     /// When set, the widget download is a Plasma widget package whose
     /// `KPlugin.Id` is this value, named and versioned as `widget` says.
     pub widget_package_id: Option<&'static str>,
@@ -422,6 +425,7 @@ impl Default for Listing {
             size_kb_override: None,
             download_padding: 0,
             scheme_files: None,
+            scheme_download: None,
             widget_package_id: None,
             widget_metadata_symlink: false,
             widget_package_link: false,
@@ -444,8 +448,10 @@ pub struct FakeStore {
 impl FakeStore {
     pub fn start(listing: Listing) -> Self {
         let mut archive = listing
-            .scheme_files
-            .map_or_else(scheme_archive, files_archive);
+            .scheme_download
+            .map(<[u8]>::to_vec)
+            .or_else(|| listing.scheme_files.map(files_archive))
+            .unwrap_or_else(scheme_archive);
         let size_kb = listing
             .size_kb_override
             .unwrap_or_else(|| archive.len().div_ceil(1024) as u64);
