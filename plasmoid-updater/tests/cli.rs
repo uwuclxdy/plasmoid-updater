@@ -624,7 +624,7 @@ fn fake_sudo_dir(sandbox: &Sandbox) -> std::path::PathBuf {
     std::fs::write(
         &sudo,
         format!(
-            "#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\necho \"$*\" >> '{}'\nexit 1\n",
             bin.join("sudo-calls").display()
         ),
     )

@@ -1815,6 +1815,16 @@ pub(in crate::installer) mod tests {
     /// `PATH` that logs its arguments, then runs `tail`, and a fresh fixture
     /// root in `PU_BACKUP_ROOT`.
     pub(in crate::installer) fn run_sudo_child(module: &str, test: &str, tail: &str) -> SudoChild {
+        run_sudo_child_with_env(module, test, tail, &[])
+    }
+
+    /// [`run_sudo_child`], with `env` set in the child as well.
+    pub(in crate::installer) fn run_sudo_child_with_env(
+        module: &str,
+        test: &str,
+        tail: &str,
+        env: &[(&str, &str)],
+    ) -> SudoChild {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let bin = root.join("bin");
@@ -1851,6 +1861,7 @@ pub(in crate::installer) mod tests {
             .env("PU_TEST_SUDO_LOG", &log_path)
             .env("PU_BACKUP_CHILD_TEST", test)
             .env("PU_BACKUP_ROOT", &root)
+            .envs(env.iter().copied())
             .output()
             .unwrap();
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();

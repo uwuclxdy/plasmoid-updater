@@ -890,7 +890,8 @@ fn settle_record(sites: &RecordSites, record: &Path) -> std::io::Result<Option<R
 pub(super) enum Open {
     /// No record: nothing to back up, or none could be written.
     None,
-    /// The record this install wrote.
+    /// The record this install wrote, or one a write that gave up while its
+    /// process may still run can land after the give-up.
     Written(PathBuf),
     /// A lost record the install runs over, left as it is.
     Lost(PathBuf),
@@ -899,7 +900,9 @@ pub(super) enum Open {
 impl Open {
     /// Opens the component's record for the install about to run, after
     /// `backup` was taken and before any install step; a record that cannot
-    /// be written leaves the install unprotected, with one warning.
+    /// be written leaves the install unprotected, with one warning. A write
+    /// that gave up while its process may still run keeps the record tracked,
+    /// so the landed install removes whatever that process writes.
     pub(super) fn write(
         sites: &RecordSites,
         component: &InstalledComponent,
@@ -916,13 +919,18 @@ impl Open {
         };
         match write_record(sites, &record, &component.path, backup) {
             Ok(()) => Self::Written(record),
-            Err(err) => {
+            Err(failure) => {
+                let err = &failure.message;
                 log::warn!(
                     target: "record",
                     "{:?}: installing it unprotected: no install record could be written ({err}), so if this run is killed mid-install, no later run can restore it",
                     component.name
                 );
-                Self::None
+                if failure.process_may_still_run {
+                    Self::Written(record)
+                } else {
+                    Self::None
+                }
             }
         }
     }
@@ -969,33 +977,36 @@ impl Open {
 }
 
 /// Writes `record` naming `backup`, only where a reader looks and only bytes
-/// [`judge`] accepts; the error is the message the unprotected warning names.
+/// [`judge`] accepts; the error's message is the one the unprotected warning
+/// names, and its `process_may_still_run` says the record may still appear.
 fn write_record(
     sites: &RecordSites,
     record: &Path,
     component: &Path,
     backup: &Path,
-) -> Result<(), String> {
+) -> Result<(), ComponentFailure> {
     let mut bytes = absolute_normalized(backup).into_os_string().into_vec();
     bytes.push(b'\n');
     if !sites.covers(component) || judge(record, &bytes, &sites.base).is_err() {
-        return Err(format!("{} cannot be recorded", backup.display()));
+        return Err(ComponentFailure::new(
+            FailureKind::Install,
+            format!("{} cannot be recorded", backup.display()),
+        ));
     }
     if sites.system {
         let written = privilege::write_file_as_root(record, &bytes)
             .and_then(|()| privilege::set_mode_as_root(record, RECORD_MODE));
         if let Err(failure) = written {
             sites.remove(record);
-            return Err(failure.message);
+            return Err(failure);
         }
         return Ok(());
     }
-    let io_message =
-        |e: std::io::Error| ComponentFailure::io(FailureKind::Install, record, e).message;
+    let io_failure = |e: std::io::Error| ComponentFailure::io(FailureKind::Install, record, e);
     match fs::remove_file(record) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(io_message(e)),
+        Err(e) => return Err(io_failure(e)),
     }
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -1003,12 +1014,12 @@ fn write_record(
         .custom_flags(nix::libc::O_NOFOLLOW)
         .mode(RECORD_MODE)
         .open(record)
-        .map_err(io_message)?;
+        .map_err(io_failure)?;
     let written = file.write_all(&bytes).and_then(|()| file.sync_all());
     if let Err(e) = written {
         drop(file);
         sites.remove(record);
-        return Err(io_message(e));
+        return Err(io_failure(e));
     }
     Ok(())
 }
@@ -1705,7 +1716,7 @@ mod tests {
 
         let component = schemes.join("S.colors");
         let written = write_record(&sites, &record_path(&component), &component, &spelled);
-        assert_eq!(written, Ok(()));
+        assert!(matches!(written, Ok(())), "{written:?}");
         assert_eq!(
             std::fs::read(record_path(&component)).unwrap(),
             line(&backup)
@@ -2003,6 +2014,120 @@ mod tests {
             ]
         );
         assert!(!record.exists());
+    }
+
+    /// A record write given up while its `tee` may still run keeps the record
+    /// tracked: a `tee` that lands the record after the give-up has it removed
+    /// once the install's files land, so no later repair restores the backup
+    /// it names over them. The install still runs with the one unprotected
+    /// warning.
+    #[test]
+    fn a_record_a_given_up_tee_lands_late_goes_when_the_files_land() {
+        const TEST: &str = "a_record_a_given_up_tee_lands_late_goes_when_the_files_land";
+        if privilege::is_root() {
+            return;
+        }
+        if let Some(root) = super::super::backup::tests::backup_child_root(TEST) {
+            super::super::backup::tests::assert_fake_sudo(&root);
+            let sites = sites(&root, true);
+            let schemes = root.join("schemes");
+            std::fs::create_dir_all(&schemes).unwrap();
+            let backup = root.join("base/2020-01-01T00-00-00/color-schemes/S.colors");
+            let component = schemes.join("S.colors");
+            let slot = super::super::InstallSlot::new();
+            let guard = slot.acquire();
+            let installed =
+                InstalledComponent::new("S", "S.colors", ComponentType::ColorScheme, &component)
+                    .with_system(true);
+
+            let lines = crate::testutil::logs::captured_logs_while(|| {
+                let open = Open::write(&sites, &installed, Some(&backup), Prior::None, &guard);
+                // The late `tee` lands the record only now, after the give-up.
+                std::fs::write(root.join("go"), b"").unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !root.join("landed").exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                assert_eq!(
+                    std::fs::read(record_path(&component)).ok(),
+                    Some(line(&backup)),
+                    "the late tee never landed the record"
+                );
+                open.landed(&sites, &guard)
+                    .unwrap_or_else(|failure| panic!("{failure:?}"));
+            });
+            assert!(
+                !record_path(&component).exists(),
+                "the landed install left the record a late tee wrote"
+            );
+            assert_eq!(
+                lines,
+                [
+                    "record: \"S\": installing it unprotected: no install record could be written (sudo tee timed out after 1 s), so if this run is killed mid-install, no later run can restore it"
+                ]
+            );
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+        // The `tee` leaves sudo's group with the content and lands the record
+        // when the test says so; sudo itself outlives the run bound.
+        let child = super::super::backup::tests::run_sudo_child_with_env(
+            "installer::record::tests",
+            TEST,
+            "case \"$1\" in\n\
+             tee)\n\
+             exec 3<&0\n\
+             setsid sh -c 'cat > \"$PU_BACKUP_ROOT/tee.part\"; \
+             while [ ! -e \"$PU_BACKUP_ROOT/go\" ]; do sleep 0.05; done; \
+             mv \"$PU_BACKUP_ROOT/tee.part\" \"$0\"; : > \"$PU_BACKUP_ROOT/landed\"' \"$2\" \
+             <&3 3<&- >/dev/null 2>&1 &\n\
+             echo $! > \"$PU_BACKUP_ROOT/tee.pid\"\n\
+             exec sleep 30 3<&- ;;\n\
+             *) exec \"$@\" ;;\n\
+             esac\n",
+            &[("PU_TEST_PRIVILEGED_TIMEOUT_MS", "1000")],
+        );
+        let tee_pid = child.root.join("tee.pid");
+        let late_tee = std::fs::read_to_string(&tee_pid)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let late_tee_gone = late_tee.is_none_or(|pid| {
+            loop {
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                    == Err(nix::errno::Errno::ESRCH)
+                {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+        if let Some(pid) = late_tee {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert!(late_tee.is_some(), "the fake never started its late tee");
+        assert!(late_tee_gone, "the late tee {late_tee:?} is still running");
+        let record = record_path(&child.root.join("schemes/S.colors"));
+        assert_eq!(
+            child.log.lines().collect::<Vec<_>>(),
+            [
+                format!("tee {}", record.display()),
+                format!("rm -f {}", record.display()),
+                format!("rm -f {}", record.display()),
+            ]
+        );
     }
 
     /// A current component's lost record goes only in a root run under

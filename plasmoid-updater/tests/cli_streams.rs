@@ -911,7 +911,7 @@ fn logging_sudo(sandbox: &Sandbox, log: &std::path::Path, status: i32) -> std::p
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit {status}\n",
+            "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\nprintf '%s\\n' \"$*\" >> '{}'\nexit {status}\n",
             log.display()
         ),
     )

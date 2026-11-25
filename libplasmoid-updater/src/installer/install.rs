@@ -1042,10 +1042,10 @@ pub(super) fn spawn_reader<R: Read + Send + 'static>(
 /// returned: the caller decides what its absence means. A panicked thread
 /// joins to its type's default, so the joined values keep their order.
 ///
-/// The stdin writer in `privilege::write_via_sudo_tee` is the one detached
-/// thread that can outlive the command it wrote to: a pipe holder this user may
-/// not signal keeps the write end open, so the writer waits for the holder's
-/// life, holding its copy of the content. A pipe reader a give-up abandons is
+/// The stdin writer in `privilege::write_via_sudo_tee` can outlive the command
+/// it wrote to: a pipe holder this user may not signal keeps the read end open
+/// without reading, so the writer waits for the holder's life, holding its copy
+/// of the content. A pipe reader a give-up abandons is
 /// left the same way, holding its buffer. Accepted: the call has already failed
 /// at the bound, and both die with the process.
 pub(super) fn join_bounded<T: Default + Send + 'static>(

@@ -5,6 +5,7 @@ use std::{
     os::unix::{fs::PermissionsExt as _, process::CommandExt as _},
     path::Path,
     process::Command,
+    time::{Duration, Instant},
 };
 
 use super::ComponentFailure;
@@ -26,6 +27,29 @@ pub(crate) fn needs_sudo(path: &Path) -> bool {
 }
 
 // --- Privileged Command Execution ---
+
+/// How long a privileged command may run, from its spawn to its exit.
+///
+/// Well above the pipe grace, so a `sudo` slow to start (a policy or PAM
+/// lookup waiting on the network) still runs its command, and finite, so a
+/// command stuck on a hung filesystem cannot hold the install slot and the
+/// update lock for good. It equals the extraction bound; a command that needs
+/// longer fails.
+const PRIVILEGED_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn privileged_timeout() -> Duration {
+    // A unit test cannot wait out the production bound, so it may shorten it.
+    #[cfg(test)]
+    {
+        if let Some(millis) = std::env::var("PU_TEST_PRIVILEGED_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            return Duration::from_millis(millis);
+        }
+    }
+    PRIVILEGED_TIMEOUT
+}
 
 /// A `sudo` that never prompts.
 ///
@@ -55,8 +79,9 @@ fn run_sudo_os(args: &[&OsStr]) -> Result<(), ComponentFailure> {
 /// Runs a command through sudo, reading its standard output, every argument
 /// kept as an `OsStr` so a non-UTF-8 path survives the crossing.
 ///
-/// Its output pipes are bounded by [`run_reading_bounded`]: a process sudo left
-/// holding one cannot keep the call waiting.
+/// Its run and its output pipes are bounded by [`run_reading_bounded`]: neither
+/// a stuck command nor a process sudo left holding a pipe can keep the call
+/// waiting.
 pub(crate) fn run_sudo_reading_os(args: &[&OsStr]) -> Result<String, ComponentFailure> {
     let output = run_reading_bounded(sudo().args(args), "sudo")?;
 
@@ -71,20 +96,23 @@ pub(crate) fn run_sudo_reading_os(args: &[&OsStr]) -> Result<String, ComponentFa
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Runs `command` to its own exit while draining its output pipes, and gives
-/// a process it left holding one [`super::install::KILL_GRACE`] to close it.
+/// Runs `command` to its own exit within [`PRIVILEGED_TIMEOUT`] while draining
+/// its output pipes, and gives a process it left holding one
+/// [`super::install::KILL_GRACE`] to close it.
 ///
-/// [`Command::output`] waits for both pipes to reach EOF with no limit, so a
-/// process the command started that holds one, without reading or closing it,
-/// stalls the call for as long as it lives. The command's own run keeps no
-/// deadline — a slow copy is the command's business — and only the pipes are
-/// bounded. A pipe still held at the deadline ends the command's group through
+/// [`Command::output`] waits for the command and for both pipes to reach EOF
+/// with no limit, so a command stuck on a hung filesystem, or a process it
+/// started that holds a pipe without reading or closing it, stalls the call
+/// for as long as it lives. The bound runs from the spawn: a command still
+/// running at it is given up as [`give_up`] does. A pipe still held at the
+/// grace past the exit ends the command's group through
 /// [`super::install::end_leftover_group`], and the failure says the pipes
 /// stayed open.
 fn run_reading_bounded(
     command: &mut Command,
     tool: &str,
 ) -> Result<std::process::Output, ComponentFailure> {
+    let bound = privileged_timeout();
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -94,6 +122,7 @@ fn run_reading_bounded(
         .map_err(|e| {
             ComponentFailure::new(FailureKind::Install, format!("failed to run {tool}: {e}"))
         })?;
+    let deadline = Instant::now() + bound;
     let group = nix::unistd::Pid::from_raw(child.id().cast_signed());
     let mut readers = Vec::new();
     if let Some(stdout) = child.stdout.take() {
@@ -102,13 +131,19 @@ fn run_reading_bounded(
     if let Some(stderr) = child.stderr.take() {
         readers.push(super::install::spawn_reader(stderr));
     }
-    let status = child.wait().map_err(|e| {
-        ComponentFailure::new(FailureKind::Install, format!("failed to run {tool}: {e}"))
-    })?;
-    let (drained, readers_finished) = super::install::join_readers_bounded(
-        readers,
-        std::time::Instant::now() + super::install::KILL_GRACE,
-    );
+    let status = match reap_by(&mut child, deadline) {
+        Ok(Some(status)) => status,
+        Ok(None) => return Err(give_up(&mut child, group, readers, tool, bound)),
+        Err(e) => {
+            return Err(wait_failed(
+                &mut child,
+                group,
+                ComponentFailure::new(FailureKind::Install, format!("failed to run {tool}: {e}")),
+            ));
+        }
+    };
+    let (drained, readers_finished) =
+        super::install::join_readers_bounded(readers, Instant::now() + super::install::KILL_GRACE);
     if !readers_finished {
         let _ = super::install::end_leftover_group(&mut child, group);
         let mut failure = ComponentFailure::new(
@@ -124,6 +159,65 @@ fn run_reading_bounded(
         stdout: drained.next().unwrap_or_default(),
         stderr: drained.next().unwrap_or_default(),
     })
+}
+
+/// Waits for `child` until `deadline`: its exit status, or `None` when it is
+/// still running then.
+fn reap_by(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    if super::install::reap_within(child, deadline.saturating_duration_since(Instant::now()))? {
+        child.wait().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The failure of a privileged command, or of the write into one, still
+/// running at `bound`.
+///
+/// The line keeps the installer's existing `{tool} timed out after {} s` form.
+/// It counts as possibly running: the give-up has no positive check that sudo
+/// and what it started are gone.
+fn timed_out(tool: &str, bound: Duration) -> ComponentFailure {
+    let mut failure = ComponentFailure::new(
+        FailureKind::Install,
+        format!("{tool} timed out after {} s", bound.as_secs()),
+    );
+    failure.process_may_still_run = true;
+    failure
+}
+
+/// Ends sudo's group and gives up a command still running at `bound`.
+///
+/// The line names the bound alone, not sudo's partial words. The abandoned pipe
+/// readers hold their buffers until their pipes close.
+fn give_up(
+    child: &mut std::process::Child,
+    group: nix::unistd::Pid,
+    readers: Vec<std::thread::JoinHandle<Vec<u8>>>,
+    tool: &str,
+    bound: Duration,
+) -> ComponentFailure {
+    let _ = super::install::end_leftover_group(child, group);
+    drop(super::install::join_readers_bounded(
+        readers,
+        Instant::now() + super::install::KILL_GRACE,
+    ));
+    timed_out(tool, bound)
+}
+
+/// Ends sudo's group after waiting for it failed, and counts what it started
+/// as possibly running: a failed wait shows nothing gone.
+fn wait_failed(
+    child: &mut std::process::Child,
+    group: nix::unistd::Pid,
+    mut failure: ComponentFailure,
+) -> ComponentFailure {
+    let _ = super::install::end_leftover_group(child, group);
+    failure.process_may_still_run = true;
+    failure
 }
 
 /// Creates a `Command` that is prefixed with sudo if not root.
@@ -374,43 +468,6 @@ pub(crate) fn write_file_as_root(path: &Path, content: &[u8]) -> Result<(), Comp
     }
 }
 
-/// The failure of a write that cannot finish within
-/// [`super::install::KILL_GRACE`].
-///
-/// The line keeps the installer's existing `{tool} timed out after {} s` form.
-/// It counts as possibly running: the give-up has no positive check that sudo
-/// and what it started are gone.
-fn sudo_tee_timeout() -> ComponentFailure {
-    let mut failure = ComponentFailure::new(
-        FailureKind::Install,
-        format!(
-            "sudo tee timed out after {} s",
-            super::install::KILL_GRACE.as_secs()
-        ),
-    );
-    failure.process_may_still_run = true;
-    failure
-}
-
-/// Ends sudo's group and gives up a write that cannot finish within
-/// [`super::install::KILL_GRACE`].
-///
-/// The line names the bound alone, not sudo's partial words, and counts the
-/// write's processes as possibly running. The abandoned pipe readers hold their
-/// buffers until their pipes close.
-fn give_up_sudo_tee(
-    child: &mut std::process::Child,
-    group: nix::unistd::Pid,
-    stderr_reader: Option<std::thread::JoinHandle<Vec<u8>>>,
-) -> ComponentFailure {
-    let _ = super::install::end_leftover_group(child, group);
-    drop(super::install::join_readers_bounded(
-        stderr_reader.into_iter().collect(),
-        std::time::Instant::now() + super::install::KILL_GRACE,
-    ));
-    sudo_tee_timeout()
-}
-
 /// Writes content through `sudo tee`, keeping it off the command line.
 ///
 /// stderr is captured rather than inherited, so sudo's own words (a refusal, a
@@ -418,16 +475,18 @@ fn give_up_sudo_tee(
 /// stdout is discarded because `tee` echoes the content back. The stderr pipe
 /// is drained while the content is written: sudo or a child of it may fill the
 /// pipe before it reads its stdin, and each side would then wait for a reader
-/// that never comes. The child's exit and its stderr pipe are then waited on
-/// with a bound of their own — the content goes in from a thread joined within
-/// [`super::install::KILL_GRACE`], the child's exit gets the same grace, and
-/// the stderr reader is joined within it — because a process sudo left running
-/// can hold the pipe open, and a `tee` that took the content can still block
-/// afterwards. A give-up on any of them ends sudo's group through
+/// that never comes. The run is bounded by [`PRIVILEGED_TIMEOUT`] from the
+/// spawn, a `tee` stuck after taking the content included, and is given up as
+/// [`give_up`] does. After sudo's exit, the content's thread and the stderr
+/// reader each get [`super::install::KILL_GRACE`], because a process sudo left
+/// running can hold either pipe open; a write still blocked then fails with
+/// sudo's failed exit or, after an exit of 0, as timed out after that grace. A
+/// give-up on either pipe ends sudo's group through
 /// [`super::install::end_leftover_group`], which names the members it cannot
 /// reach.
 fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailure> {
     use std::io::Write as _;
+    let bound = privileged_timeout();
     let mut child = sudo()
         .arg("tee")
         .arg(path)
@@ -439,6 +498,7 @@ fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailur
         .map_err(|e| {
             ComponentFailure::new(FailureKind::Install, format!("failed to run sudo tee: {e}"))
         })?;
+    let deadline = Instant::now() + bound;
     let group = nix::unistd::Pid::from_raw(child.id().cast_signed());
 
     let stderr_reader = child.stderr.take().map(super::install::spawn_reader);
@@ -452,40 +512,38 @@ fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailur
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let content = content.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&content).err());
-    let (written, write_finished) = super::install::join_bounded(
-        vec![writer],
-        std::time::Instant::now() + super::install::KILL_GRACE,
-    );
 
-    let status = if write_finished {
-        // The content is in, but the child may still block after taking it (a
-        // stalled filesystem under the target): its exit gets the same grace
-        // as a pipe wait. Reaping it even when the write failed keeps a
-        // nonzero exit (e.g. a refused sudo) a better error than the broken
-        // pipe the write sees.
-        match super::install::reap_within(&mut child, super::install::KILL_GRACE) {
-            Ok(true) => child
-                .wait()
-                .map_err(|e| ComponentFailure::io(FailureKind::Install, path, e))?,
-            Err(e) => return Err(ComponentFailure::io(FailureKind::Install, path, e)),
-            Ok(false) => return Err(give_up_sudo_tee(&mut child, group, stderr_reader)),
+    // Reaping the child even when the write failed keeps a nonzero exit (e.g.
+    // a refused sudo) a better error than the broken pipe the write sees.
+    let status = match reap_by(&mut child, deadline) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Err(give_up(
+                &mut child,
+                group,
+                stderr_reader.into_iter().collect(),
+                "sudo tee",
+                bound,
+            ));
         }
-    } else {
-        match child.try_wait() {
-            // The child ended on its own after the content stopped flowing:
-            // its exit still says more than the bound does.
-            Ok(Some(status)) => {
-                let _ = super::install::end_leftover_group(&mut child, group);
-                status
-            }
-            // Still running at the bound: it produced no exit of its own, so
-            // the write is reported as the bound, counted as possibly running.
-            _ => return Err(give_up_sudo_tee(&mut child, group, stderr_reader)),
+        Err(e) => {
+            return Err(wait_failed(
+                &mut child,
+                group,
+                ComponentFailure::io(FailureKind::Install, path, e),
+            ));
         }
     };
+    let (written, write_finished) =
+        super::install::join_bounded(vec![writer], Instant::now() + super::install::KILL_GRACE);
+    if !write_finished {
+        // sudo ended, but a process it left holds stdin without reading, so
+        // the group goes; a failed exit still says more than the grace does.
+        let _ = super::install::end_leftover_group(&mut child, group);
+    }
     let (drained, stderr_finished) = super::install::join_readers_bounded(
         stderr_reader.into_iter().collect(),
-        std::time::Instant::now() + super::install::KILL_GRACE,
+        Instant::now() + super::install::KILL_GRACE,
     );
     if !stderr_finished {
         // The drain gave up with the holder still on the pipe, so what sudo
@@ -504,7 +562,7 @@ fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailur
         return Err(ComponentFailure::new(FailureKind::Install, message));
     }
     if !write_finished {
-        return Err(sudo_tee_timeout());
+        return Err(timed_out("sudo tee", super::install::KILL_GRACE));
     }
     written
         .into_iter()
@@ -1274,6 +1332,7 @@ mod tests {
             ])
             .env_clear()
             .env("PATH", path)
+            .env("PU_TEST_PRIVILEGED_TIMEOUT_MS", "5000")
             .env("PU_TEST_TEE_RUNNING_CHILD", "1")
             .env("PU_TEST_TEE_RUNNING_TARGET", &target)
             .env("PU_TEST_TEE_RUNNING_PID", &pid_path)
@@ -1343,8 +1402,8 @@ mod tests {
     }
 
     /// A `sudo tee` that takes the whole content and then blocks — a stalled
-    /// filesystem under the target — is bounded too: the child's exit gets the
-    /// same grace as the write, and the give-up reports the bound.
+    /// filesystem under the target — is bounded too: the run bound covers the
+    /// child's exit, and the give-up reports the bound.
     #[test]
     fn a_sudo_tee_that_blocks_after_the_content_times_out() {
         if is_root() {
@@ -1404,6 +1463,7 @@ mod tests {
             ])
             .env_clear()
             .env("PATH", path)
+            .env("PU_TEST_PRIVILEGED_TIMEOUT_MS", "5000")
             .env("PU_TEST_TEE_SLOW_CHILD", "1")
             .env("PU_TEST_TEE_SLOW_TARGET", &target)
             .env("PU_TEST_TEE_SLOW_WRITTEN", &written)
@@ -1798,6 +1858,377 @@ mod tests {
         assert!(
             holder_gone,
             "the fake's stdin holder is still running after the write returned"
+        );
+    }
+
+    /// What a privileged call returned, as one line a parent can compare.
+    fn outcome(result: Result<String, ComponentFailure>) -> String {
+        match result {
+            Ok(text) => format!("ok: {text}"),
+            Err(failure) => format!(
+                "error: {}|{}",
+                failure.message, failure.process_may_still_run
+            ),
+        }
+    }
+
+    /// Polls `child` for `bound`, killing its group when it is still running
+    /// then; whether it finished, and its exit status.
+    fn wait_child(
+        child: &mut std::process::Child,
+        bound: std::time::Duration,
+    ) -> (bool, std::process::ExitStatus) {
+        let deadline = std::time::Instant::now() + bound;
+        let finished = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        if !finished {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child.id().cast_signed()),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        (finished, child.wait().unwrap())
+    }
+
+    /// A `sudo` slow to start — a policy or PAM lookup waiting on the network
+    /// — still runs its command: the run bound sits well above the pipe grace,
+    /// for an elevated read and a write alike.
+    #[test]
+    fn a_sudo_slow_to_start_still_runs_its_command() {
+        if is_root() {
+            return; // root runs the command directly and never runs sudo
+        }
+
+        if std::env::var_os("PU_TEST_SLOW_START_CHILD").is_some() {
+            let dir = PathBuf::from(std::env::var("PU_TEST_SLOW_START_DIR").unwrap());
+            let (read, written) = std::thread::scope(|scope| {
+                let read = scope
+                    .spawn(|| run_sudo_reading_os(&[OsStr::new("echo"), OsStr::new("started")]));
+                let written = write_file_as_root(&dir.join("tee-target"), b"payload");
+                (read.join().unwrap(), written)
+            });
+            std::fs::write(
+                dir.join("result"),
+                format!(
+                    "{}\n{}",
+                    outcome(read),
+                    outcome(written.map(|()| String::new()))
+                ),
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        // Past the pipe grace before it runs the command.
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\n\
+             echo $$ > \"$PU_TEST_SLOW_START_DIR/sudo-$1.pid\"\nsleep 6\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::privilege::tests::a_sudo_slow_to_start_still_runs_its_command",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_SLOW_START_CHILD", "1")
+            .env("PU_TEST_SLOW_START_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let (finished, status) = wait_child(&mut child, std::time::Duration::from_secs(30));
+        let mut child_stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            drop(pipe.read_to_string(&mut child_stderr));
+        }
+        // Each fake runs in a group of its own, out of the child's.
+        for name in ["echo", "tee"] {
+            kill_recorded_pid(&dir.path().join(format!("sudo-{name}.pid")));
+        }
+        assert!(
+            finished && status.success(),
+            "child run failed ({status}, finished: {finished})\n--- child stderr\n{child_stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("result")).unwrap(),
+            "ok: started\n\nok: ",
+            "a sudo slow to start was given up before it ran its command"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tee-target")).unwrap(),
+            "payload"
+        );
+    }
+
+    /// A privileged command still running at the run bound is ended with its
+    /// group and fails as timed out, counted as possibly running: an elevated
+    /// read, an exchange and a write alike.
+    #[test]
+    fn a_privileged_command_past_the_run_bound_is_ended() {
+        if is_root() {
+            return; // root runs the command directly and never runs sudo
+        }
+
+        if std::env::var_os("PU_TEST_RUN_BOUND_CHILD").is_some() {
+            let dir = PathBuf::from(std::env::var("PU_TEST_RUN_BOUND_DIR").unwrap());
+            let mut lines = Vec::new();
+            let mut elapsed = Vec::new();
+            let started = std::time::Instant::now();
+            lines.push(outcome(run_sudo_reading_os(&[OsStr::new("true")])));
+            elapsed.push(started.elapsed());
+            let started = std::time::Instant::now();
+            lines.push(outcome(
+                sudo_exchange(&dir.join("a"), &dir.join("b")).map(|done| done.to_string()),
+            ));
+            elapsed.push(started.elapsed());
+            let started = std::time::Instant::now();
+            lines.push(outcome(
+                write_file_as_root(&dir.join("tee-target"), b"payload").map(|()| String::new()),
+            ));
+            elapsed.push(started.elapsed());
+            std::fs::write(dir.join("result"), lines.join("\n")).unwrap();
+            std::fs::write(
+                dir.join("elapsed"),
+                elapsed
+                    .iter()
+                    .map(|took| took.as_secs_f64().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        // Never runs the command and never exits on its own.
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\n\
+             echo $$ > \"$PU_TEST_RUN_BOUND_DIR/sudo-$1.pid\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::privilege::tests::a_privileged_command_past_the_run_bound_is_ended",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_PRIVILEGED_TIMEOUT_MS", "1000")
+            .env("PU_TEST_RUN_BOUND_CHILD", "1")
+            .env("PU_TEST_RUN_BOUND_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let (finished, status) = wait_child(&mut child, std::time::Duration::from_secs(25));
+        let mut child_stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            drop(pipe.read_to_string(&mut child_stderr));
+        }
+        // `true` is the read's command, `env` the exchange's, `tee` the write's.
+        let pid_files: Vec<PathBuf> = ["true", "env", "tee"]
+            .iter()
+            .map(|name| dir.path().join(format!("sudo-{name}.pid")))
+            .collect();
+        let recorded: Vec<Option<i32>> = pid_files
+            .iter()
+            .map(|pid_file| recorded_pid(pid_file))
+            .collect();
+        let left: Vec<i32> = recorded
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|pid| !gone_within(*pid, std::time::Duration::from_secs(3)))
+            .collect();
+        for pid_file in &pid_files {
+            kill_recorded_pid(pid_file);
+        }
+        assert!(
+            finished && status.success(),
+            "child run failed ({status}, finished: {finished})\n--- child stderr\n{child_stderr}"
+        );
+        assert!(
+            recorded.iter().all(Option::is_some),
+            "a fake sudo never recorded its pid: {recorded:?}"
+        );
+        assert_eq!(left, Vec::<i32>::new(), "a fake sudo outlived the give-up");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("result")).unwrap(),
+            "error: sudo timed out after 1 s|true\n\
+             error: sudo mv timed out after 1 s|true\n\
+             error: sudo tee timed out after 1 s|true",
+            "a command past the run bound was not reported as the bound"
+        );
+        let limit = std::time::Duration::from_secs(2) + crate::installer::install::REAP_BOUND;
+        for took in std::fs::read_to_string(dir.path().join("elapsed"))
+            .unwrap()
+            .lines()
+        {
+            let took: f64 = took.parse().unwrap();
+            assert!(
+                took < limit.as_secs_f64(),
+                "a give-up took {took:.3} s past a 1 s bound"
+            );
+        }
+    }
+
+    /// A failed wait for `sudo` ends sudo's group and counts the command as
+    /// possibly running, for an elevated read and a write alike: the wait
+    /// showed nothing gone. A child of a process that ignores SIGCHLD is
+    /// reaped by the kernel the moment it exits, so the call's own wait meets
+    /// ECHILD.
+    #[test]
+    fn a_privileged_command_whose_wait_fails_ends_its_group() {
+        if is_root() {
+            return; // root runs the command directly and never runs sudo
+        }
+
+        if std::env::var_os("PU_TEST_TEE_WAIT_CHILD").is_some() {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let ignored = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigIgn:"))
+                .map(|mask| u64::from_str_radix(mask.trim(), 16).unwrap())
+                .unwrap();
+            assert_ne!(
+                ignored & (1 << (nix::libc::SIGCHLD - 1)),
+                0,
+                "the fixture's SIGCHLD is not ignored, so the wait cannot fail"
+            );
+            let dir = PathBuf::from(std::env::var("PU_TEST_TEE_WAIT_DIR").unwrap());
+            let read = run_sudo_reading_os(&[OsStr::new("true")]);
+            let written = write_file_as_root(&dir.join("tee-target"), b"payload");
+            std::fs::write(
+                dir.join("result"),
+                format!(
+                    "{}\n{}",
+                    outcome(read),
+                    outcome(written.map(|()| String::new()))
+                ),
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        // Takes its stdin and exits, leaving a holder in its group with every
+        // pipe closed, so only the group kill can end it.
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\ncat >/dev/null\n\
+             sleep 30 >/dev/null 2>&1 &\necho $! > \"$PU_TEST_TEE_WAIT_DIR/holder-$1.pid\"\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        // bash keeps a signal `trap ''` ignores ignored across `exec`; dash
+        // does not (measured 2026-11-25: SigIgn after `exec` lacks SIGCHLD).
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg("trap '' CHLD; exec \"$0\" \"$@\"")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::privilege::tests::a_privileged_command_whose_wait_fails_ends_its_group",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_TEE_WAIT_CHILD", "1")
+            .env("PU_TEST_TEE_WAIT_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let (finished, status) = wait_child(&mut child, std::time::Duration::from_secs(15));
+        let mut child_stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            drop(pipe.read_to_string(&mut child_stderr));
+        }
+        // `true` is the read's command, `tee` the write's.
+        let holder_files: Vec<PathBuf> = ["true", "tee"]
+            .iter()
+            .map(|name| dir.path().join(format!("holder-{name}.pid")))
+            .collect();
+        let holders: Vec<Option<i32>> = holder_files
+            .iter()
+            .map(|holder_file| recorded_pid(holder_file))
+            .collect();
+        let left: Vec<i32> = holders
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|pid| !gone_within(*pid, std::time::Duration::from_secs(3)))
+            .collect();
+        for holder_file in &holder_files {
+            kill_recorded_pid(holder_file);
+        }
+        assert!(
+            finished && status.success(),
+            "child run failed ({status}, finished: {finished})\n--- child stderr\n{child_stderr}"
+        );
+        assert!(
+            holders.iter().all(Option::is_some),
+            "the fake never started a holder: {holders:?}"
+        );
+        assert_eq!(left, Vec::<i32>::new(), "a holder outlived the failed wait");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("result")).unwrap(),
+            format!(
+                "error: failed to run sudo: No child processes (os error 10)|true\n\
+                 error: {}: No child processes (os error 10)|true",
+                dir.path().join("tee-target").display()
+            ),
+            "a failed wait was not reported as possibly running"
         );
     }
 
