@@ -176,10 +176,12 @@ fn download_limit(checksum: Option<&str>, advertised: Option<u64>) -> u64 {
 
 /// The file name the store serves a download under: the last path segment of
 /// its URL, its `?query` and `#fragment` dropped and its `%xx` escapes
-/// decoded; a URL naming no path segment names nothing. The name need not be
-/// a file name; the install step refuses it where it would name the
-/// component's own file.
-pub(super) fn served_file_name(url: &str) -> String {
+/// decoded; a URL naming no path segment names nothing. `Err` carries the
+/// segment as the store spelled it when its escapes do not decode to UTF-8: a
+/// name the install refuses wherever it would put it in the tree. The name
+/// need not be a file name; the install step refuses it where it would name
+/// the component's own file.
+pub(super) fn served_file_name(url: &str) -> Result<String, String> {
     let end = url.find(['?', '#']).unwrap_or(url.len());
     let path = match url[..end].split_once("://") {
         Some((_, rest)) => rest.find('/').map_or("", |slash| &rest[slash..]),
@@ -188,16 +190,16 @@ pub(super) fn served_file_name(url: &str) -> String {
     decode_percent(path.rsplit_once('/').map_or(path, |(_, name)| name))
 }
 
-/// The last path segment of `url` as the store spelled it, for a temp file
-/// whose name nothing else reads.
+/// The text after the last '/' in `url`, query included, as the store spelled
+/// it, for a temp file whose name nothing else reads.
 fn raw_served_name(url: &str) -> &str {
     url.rsplit_once('/').map_or(url, |(_, name)| name)
 }
 
 /// `name` with every `%xx` escape decoded; an escape that is not two hex
-/// digits stays as it is, and decoded bytes that are not UTF-8 become a
-/// replacement character.
-fn decode_percent(name: &str) -> String {
+/// digits stays as it is. `Err` is `name` itself when the decoded bytes are
+/// not UTF-8.
+fn decode_percent(name: &str) -> Result<String, String> {
     fn hex(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
@@ -228,7 +230,7 @@ fn decode_percent(name: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&decoded).into_owned()
+    String::from_utf8(decoded).map_err(|_| name.to_string())
 }
 
 /// Downloads a package with optional checksum verification, emitting
@@ -1839,7 +1841,19 @@ exec "$PU_TEST_REAL_BSDTAR" "$@"
             ("http://host?dl=1", ""),
         ];
         for (url, expected) in cases {
-            assert_eq!(super::served_file_name(url), expected, "{url}");
+            assert_eq!(
+                super::served_file_name(url),
+                Ok(expected.to_string()),
+                "{url}"
+            );
         }
+        assert_eq!(
+            super::served_file_name("http://host/dl/%FF.png"),
+            Err("%FF.png".to_string())
+        );
+        assert_eq!(
+            super::served_file_name("http://host/dl/%C3.png"),
+            Err("%C3.png".to_string())
+        );
     }
 }

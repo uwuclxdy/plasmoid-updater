@@ -81,6 +81,33 @@ impl Log for Capture {
 
 static CAPTURE: Capture = Capture;
 
+/// The line the child logs once its capture is installed: a capture that
+/// recorded nothing cannot pass a check for lines it must not hold.
+const CAPTURE_ON: &str = "test: capture on";
+
+/// Installs the child's log capture and logs [`CAPTURE_ON`] through it.
+fn start_capture() {
+    log::set_logger(&CAPTURE).unwrap();
+    log::set_max_level(LevelFilter::Trace);
+    log::debug!(target: "test", "capture on");
+}
+
+/// Asserts the child's capture recorded [`CAPTURE_ON`], and no metadata patch
+/// warning: the rebuilt folder kept no metadata to patch.
+fn assert_capture_holds_no_metadata_patch_warning() {
+    let lines = LINES.lock().unwrap();
+    assert!(
+        lines.iter().any(|line| line == CAPTURE_ON),
+        "the capture recorded no line of the update: {lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("patch: failed to update installed metadata: ")),
+        "a patch warned about a metadata file the rebuild did not keep: {lines:#?}"
+    );
+}
+
 // --- the fake store ---
 
 /// A store answering the wallpaper's per-id lookup with an entry whose one
@@ -316,8 +343,10 @@ fn child_wallpaper(name: &str) -> PathBuf {
 
 /// The child's run for a wallpaper at `name` that updates: the check offers
 /// it, the update lands it verified at the scanned path, and a second check
-/// offers nothing while discovery still lists it at the new version.
-fn updates_in_place(child: common::Child, name: &str) {
+/// offers nothing while discovery still lists it at the new version. `also`
+/// runs on the child's own legs before it marks the body complete, so its
+/// failure names a body that did not finish.
+fn updates_in_place_checking(child: common::Child, name: &str, also: impl FnOnce()) {
     let config = config(&child.store_url);
     let found = check(&config, &()).unwrap();
     assert_eq!(found.available_updates.len(), 1, "{found:?}");
@@ -342,7 +371,13 @@ fn updates_in_place(child: common::Child, name: &str) {
     assert_eq!(installed.len(), 1, "{installed:?}");
     assert_eq!(installed[0].path, scanned.path, "{installed:?}");
     assert_eq!(installed[0].version, NEW_VERSION, "{installed:?}");
+    also();
     child.done();
+}
+
+/// The child's run for a wallpaper at `name` that updates in place.
+fn updates_in_place(child: common::Child, name: &str) {
+    updates_in_place_checking(child, name, || {});
 }
 
 /// The child's run for an update that fails the wallpaper: one failure of
@@ -656,7 +691,12 @@ fn a_desktop_only_package_without_contents_keeps_its_desktop_file() {
 #[test]
 fn a_plain_folder_of_images_ends_holding_only_the_new_image() {
     if let Some(child) = common::child() {
-        updates_in_place(child, "Sweet");
+        start_capture();
+        updates_in_place_checking(
+            child,
+            "Sweet",
+            assert_capture_holds_no_metadata_patch_warning,
+        );
         return;
     }
     let sandbox = Sandbox::new();
@@ -675,6 +715,68 @@ fn a_plain_folder_of_images_ends_holding_only_the_new_image() {
         "the plain folder"
     );
     assert_eq!(entries(&dir), ["forest.png"]);
+    assert_registry_names(&sandbox, &dir);
+}
+
+/// A plain folder takes the served image as is, so a raw file the store serves
+/// as `metadata.json` lands as that image: its bytes stay exactly as served,
+/// and the run warns about no metadata patch.
+#[test]
+fn a_plain_folder_served_a_metadata_json_image_keeps_the_served_bytes() {
+    if let Some(child) = common::child() {
+        start_capture();
+        updates_in_place_checking(
+            child,
+            "Sweet",
+            assert_capture_holds_no_metadata_patch_warning,
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = wallpapers(&sandbox).join("Sweet");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.jpg"), "old-a").unwrap();
+    register(&sandbox, &format!("{}/*", dir.display()));
+    sandbox.run_child(
+        "a_plain_folder_served_a_metadata_json_image_keeps_the_served_bytes",
+        &start_store("metadata.json", PNG_2X1.to_vec()),
+    );
+    assert_eq!(
+        snapshot(&dir),
+        BTreeMap::from([("metadata.json".to_string(), PNG_2X1.to_vec())]),
+        "the plain folder"
+    );
+    assert_registry_names(&sandbox, &dir);
+}
+
+/// A plain folder keeps a served JSON document named `metadata.json` byte for
+/// byte: the folder kept no installed metadata, so there is nothing to patch.
+#[test]
+fn a_plain_folder_served_a_metadata_json_document_keeps_the_served_bytes() {
+    const SERVED: &[u8] = br#"{"KPlugin":{"Version":"1.0"}}"#;
+    if let Some(child) = common::child() {
+        start_capture();
+        updates_in_place_checking(
+            child,
+            "Sweet",
+            assert_capture_holds_no_metadata_patch_warning,
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = wallpapers(&sandbox).join("Sweet");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.jpg"), "old-a").unwrap();
+    register(&sandbox, &format!("{}/*", dir.display()));
+    sandbox.run_child(
+        "a_plain_folder_served_a_metadata_json_document_keeps_the_served_bytes",
+        &start_store("metadata.json", SERVED.to_vec()),
+    );
+    assert_eq!(
+        snapshot(&dir),
+        BTreeMap::from([("metadata.json".to_string(), SERVED.to_vec())]),
+        "the plain folder"
+    );
     assert_registry_names(&sandbox, &dir);
 }
 
@@ -993,6 +1095,11 @@ fn an_unparsable_metadata_json_is_kept_as_is_with_a_warning() {
             warned[0].contains("metadata.json") && warned[0].contains("failed to parse"),
             "{lines:#?}"
         );
+        let installed = child_wallpaper(WALLPAPER_DIR).join("metadata.json");
+        assert!(
+            warned[0].contains(&installed.display().to_string()),
+            "the warning names no installed file: {lines:#?}"
+        );
         child.done();
         return;
     }
@@ -1051,8 +1158,8 @@ fn a_nameless_download_fails_a_plain_folder_before_any_backup() {
 }
 
 /// A package directory served an SVG whose link names no file fails with the
-/// no-file-name text, not the pixel-size one: the name is judged before the
-/// format is, as for every other arm.
+/// no-file-name text, not the pixel-size one: an SVG has no pixel size to name
+/// it by, and a name that is no file name names nothing.
 #[test]
 fn a_nameless_svg_for_a_package_names_no_file() {
     if let Some(child) = common::child() {
@@ -1082,6 +1189,42 @@ fn a_nameless_svg_for_a_package_names_no_file() {
         backups.is_empty(),
         "the wallpaper was backed up: {backups:?}"
     );
+}
+
+/// A package directory names a raster image by its pixel size, so a link that
+/// names no file updates it: nothing on that arm reads the served name.
+#[test]
+fn a_nameless_download_updates_a_package_directory() {
+    if let Some(child) = common::child() {
+        updates_in_place(child, WALLPAPER_DIR);
+        return;
+    }
+    let sandbox = Sandbox::new();
+    install_package(&sandbox);
+    sandbox.run_child(
+        "a_nameless_download_updates_a_package_directory",
+        &start_store("", PNG_2X1.to_vec()),
+    );
+    assert_rebuilt_package(&sandbox, "contents/images/2x1.png", PNG_2X1);
+    assert_registry_names(&sandbox, &wallpaper_dir(&sandbox));
+}
+
+/// The same for a name whose escapes do not decode to UTF-8: the raster
+/// package arm never puts it in a path.
+#[test]
+fn an_undecodable_download_name_updates_a_package_directory() {
+    if let Some(child) = common::child() {
+        updates_in_place(child, WALLPAPER_DIR);
+        return;
+    }
+    let sandbox = Sandbox::new();
+    install_package(&sandbox);
+    sandbox.run_child(
+        "an_undecodable_download_name_updates_a_package_directory",
+        &start_store("%FF.png", PNG_2X1.to_vec()),
+    );
+    assert_rebuilt_package(&sandbox, "contents/images/2x1.png", PNG_2X1);
+    assert_registry_names(&sandbox, &wallpaper_dir(&sandbox));
 }
 
 /// The download's URL names the image it lands as: `%20` decodes and the
@@ -1166,6 +1309,41 @@ fn a_download_name_holding_a_nul_fails_before_any_backup() {
     sandbox.run_child(
         "a_download_name_holding_a_nul_fails_before_any_backup",
         &start_store("a%00b.png", PNG_2X1.to_vec()),
+    );
+    assert_eq!(std::fs::metadata(&dir).unwrap().ino(), inode);
+    assert_eq!(
+        snapshot(&dir),
+        BTreeMap::from([("a.jpg".to_string(), b"old-a".to_vec())])
+    );
+    let backups = backups_named(&sandbox, "Sweet");
+    assert!(
+        backups.is_empty(),
+        "the wallpaper was backed up: {backups:?}"
+    );
+}
+
+/// A download name whose `%xx` escapes do not decode to UTF-8 names no file:
+/// a plain folder fails before any backup, naming it the way the store served
+/// it.
+#[test]
+fn a_download_name_that_does_not_decode_to_utf8_fails_before_any_backup() {
+    if let Some(child) = common::child() {
+        fails_with(
+            child,
+            FailureKind::Install,
+            "downloaded image has no file name to put in the wallpaper folder (\"%FF.png\")",
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let dir = wallpapers(&sandbox).join("Sweet");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.jpg"), "old-a").unwrap();
+    register(&sandbox, &format!("{}/*", dir.display()));
+    let inode = std::fs::metadata(&dir).unwrap().ino();
+    sandbox.run_child(
+        "a_download_name_that_does_not_decode_to_utf8_fails_before_any_backup",
+        &start_store("%FF.png", PNG_2X1.to_vec()),
     );
     assert_eq!(std::fs::metadata(&dir).unwrap().ino(), inode);
     assert_eq!(

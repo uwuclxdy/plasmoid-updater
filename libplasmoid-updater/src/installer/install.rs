@@ -1590,30 +1590,35 @@ pub(super) fn is_directory_wallpaper(component: &InstalledComponent) -> bool {
 }
 
 /// Builds at `tree` the directory the wallpaper installed at `installed`
-/// becomes when its store entry serves the one image at `image`, which the
-/// store names `image_name`. `image` is moved into `tree`; the installed
-/// directory is only read.
+/// becomes when its store entry serves the one image at `image`, named
+/// `image_name`. `image` is moved into `tree`; the installed directory is only
+/// read.
 ///
 /// A package directory (one holding `metadata.json`, `metadata.desktop` or
-/// `contents/`) keeps its metadata files, `metadata.json` carrying
-/// `new_version` and `metadata.desktop` byte for byte, and holds the image at
+/// `contents/`) keeps its metadata files byte for byte and holds the image at
 /// `contents/images/<W>x<H>.<ext>`, the name Plasma's own wallpaper packages
 /// give their images; an SVG has no pixel size and keeps its own name there.
 /// Any other directory ends holding only the image under its own name. Every
 /// other file the directory held goes, as with any directory update.
+///
+/// Returns whether the tree kept the installed `metadata.json`: only a kept one
+/// is the component's metadata, so only a kept one takes the new version.
 pub(super) fn rebuild_wallpaper_dir(
     image: &Path,
-    image_name: &OsStr,
+    image_name: ImageName<'_>,
     installed: &Path,
-    new_version: &str,
     tree: &Path,
-) -> Result<(), ComponentFailure> {
+) -> Result<bool, ComponentFailure> {
     let metadata: Vec<&str> = ["metadata.json", "metadata.desktop"]
         .into_iter()
         .filter(|name| is_regular_file(&installed.join(name)))
         .collect();
     let target = if metadata.is_empty() && !is_directory(&installed.join("contents")) {
-        tree.join(image_file_name(image_name)?)
+        tree.join(
+            image_name
+                .file_name()
+                .ok_or_else(|| image_name.no_file_name())?,
+        )
     } else {
         tree.join("contents/images")
             .join(package_image_name(image, image_name)?)
@@ -1624,60 +1629,108 @@ pub(super) fn rebuild_wallpaper_dir(
     }
     fs::rename(image, &target)
         .map_err(|e| ComponentFailure::io(FailureKind::Install, &target, e))?;
+    let kept_json = metadata.contains(&"metadata.json");
     for name in metadata {
         let source = installed.join(name);
         let kept = tree.join(name);
         // A fresh file rather than `fs::copy`, which would carry over a
-        // read-only mode the version patch then cannot write through.
+        // read-only mode the version patch cannot write through.
         let mut reader = fs::File::open(&source)
             .map_err(|e| ComponentFailure::io(FailureKind::Install, &source, e))?;
         let mut writer = fs::File::create(&kept)
             .map_err(|e| ComponentFailure::io(FailureKind::Install, &kept, e))?;
         std::io::copy(&mut reader, &mut writer)
             .map_err(|e| ComponentFailure::io(FailureKind::Install, &kept, e))?;
-        if name == "metadata.json"
-            && let Err(e) = patch_metadata(&kept, ComponentType::Wallpaper, new_version)
-        {
-            log::warn!(target: "patch", "failed to update installed metadata: {}", e.message);
+    }
+    Ok(kept_json)
+}
+
+/// The name a rebuilt wallpaper's image lands under: an archive member's own
+/// name, or the name the store served the download under.
+///
+/// A served name whose `%xx` escapes do not decode to UTF-8 names no file, and
+/// `Served` carries it as the store spelled it, which is how the refusal names
+/// it; an arm that names its image by its pixel size never reads it.
+#[derive(Clone, Copy)]
+pub(super) enum ImageName<'a> {
+    /// The store's served file name, decoded, or its spelling when its escapes
+    /// do not decode to UTF-8.
+    Served(Result<&'a str, &'a str>),
+    /// An archive member's own name.
+    Member(&'a OsStr),
+}
+
+impl<'a> ImageName<'a> {
+    /// The name as a file name of its own, when it is one.
+    fn file_name(&self) -> Option<&'a OsStr> {
+        match self {
+            Self::Served(Ok(name)) => own_file_name(OsStr::new(*name)),
+            Self::Served(Err(_)) => None,
+            Self::Member(name) => own_file_name(name),
         }
     }
-    Ok(())
+
+    /// The no-file-name failure, naming the image the way the store served it.
+    fn no_file_name(&self) -> ComponentFailure {
+        install_failure(format!(
+            "downloaded image has no file name to put in the wallpaper folder ({:?})",
+            self.shown()
+        ))
+    }
+
+    /// The failure of a pixel size that cannot name the image.
+    fn size_failure(&self, why: &str) -> ComponentFailure {
+        install_failure(format!(
+            "cannot read the pixel size of downloaded image {:?} to name it in the wallpaper folder ({why})",
+            self.shown()
+        ))
+    }
+
+    /// The image's name for a line that prints it.
+    fn shown(&self) -> String {
+        match self {
+            Self::Served(Ok(name)) => (*name).to_string(),
+            Self::Served(Err(raw)) => (*raw).to_string(),
+            Self::Member(name) => name.to_string_lossy().into_owned(),
+        }
+    }
 }
 
-/// `image_name` as a file name of its own: one that is empty, `.` or `..`,
-/// holds a path separator or holds a NUL cannot name a file in the wallpaper's
-/// directory.
-fn image_file_name(image_name: &OsStr) -> Result<&OsStr, ComponentFailure> {
-    Path::new(image_name)
-        .file_name()
-        .filter(|name| *name == image_name && !name.as_encoded_bytes().contains(&0))
-        .ok_or_else(|| {
-            let shown = image_name.to_string_lossy();
-            install_failure(format!(
-                "downloaded image has no file name to put in the wallpaper folder ({shown:?})"
-            ))
-        })
-}
-
-/// The name a package directory gives the image: `<W>x<H>.<ext>` from its
-/// header, or its own name for an SVG. The name is judged first, so a decoded
-/// name that is no file name fails with the no-file-name text whatever the
-/// image's format.
-fn package_image_name(image: &Path, image_name: &OsStr) -> Result<OsString, ComponentFailure> {
-    let name = image_file_name(image_name)?;
-    if Path::new(name)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+/// The name a package directory gives the image: `<W>x<H>.<ext>` read from its
+/// header, or an SVG's own name, the one image format whose name a package
+/// keeps. Only that name is read, so a name that cannot be a file name is
+/// refused only when no pixel size can name the image instead.
+fn package_image_name(
+    image: &Path,
+    image_name: ImageName<'_>,
+) -> Result<OsString, ComponentFailure> {
+    let name = image_name.file_name();
+    if let Some(name) = name
+        && has_svg_extension(name)
     {
         return Ok(name.to_os_string());
     }
-    let (size, extension) = pixel_size(image).map_err(|why| {
-        let shown = image_name.to_string_lossy();
-        install_failure(format!(
-            "cannot read the pixel size of downloaded image {shown:?} to name it in the wallpaper folder ({why})"
-        ))
-    })?;
-    Ok(format!("{}x{}.{extension}", size.width, size.height).into())
+    match pixel_size(image) {
+        Ok((size, extension)) => Ok(format!("{}x{}.{extension}", size.width, size.height).into()),
+        Err(_) if name.is_none() => Err(image_name.no_file_name()),
+        Err(why) => Err(image_name.size_failure(&why)),
+    }
+}
+
+/// `name` as a file name of its own, when it is one: a name that is empty,
+/// `.` or `..`, or that holds a path separator or a NUL, names no file.
+fn own_file_name(name: &OsStr) -> Option<&OsStr> {
+    Path::new(name)
+        .file_name()
+        .filter(|file_name| *file_name == name && !file_name.as_encoded_bytes().contains(&0))
+}
+
+/// Whether `name` ends in `.svg`, case-insensitive, the one image format a
+/// wallpaper package keeps under its own name.
+fn has_svg_extension(name: &OsStr) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
 }
 
 /// An image's pixel size and the extension its format takes, read from its
@@ -4430,13 +4483,19 @@ exec sleep 30
     }
 
     #[test]
-    fn image_file_name_refuses_a_name_that_is_no_file_name() {
+    fn own_file_name_refuses_a_name_that_is_no_file_name() {
         assert_eq!(
-            image_file_name(OsStr::new("forest.png")).unwrap(),
-            OsStr::new("forest.png")
+            own_file_name(OsStr::new("forest.png")),
+            Some(OsStr::new("forest.png"))
         );
+        assert_eq!(
+            ImageName::Served(Ok("forest.png")).file_name(),
+            Some(OsStr::new("forest.png"))
+        );
+        assert_eq!(ImageName::Served(Err("%FF.png")).file_name(), None);
         for name in ["", ".", "..", "a/b.png", "a\0b.png", "/"] {
-            let failure = image_file_name(OsStr::new(name)).expect_err(name);
+            assert_eq!(own_file_name(OsStr::new(name)), None, "{name:?}");
+            let failure = ImageName::Member(OsStr::new(name)).no_file_name();
             assert_eq!(
                 failure.kind,
                 FailureKind::Install,
@@ -4450,5 +4509,9 @@ exec sleep 30
                 "{name:?}"
             );
         }
+        assert_eq!(
+            ImageName::Served(Err("%FF.png")).no_file_name().message,
+            "downloaded image has no file name to put in the wallpaper folder (\"%FF.png\")"
+        );
     }
 }
