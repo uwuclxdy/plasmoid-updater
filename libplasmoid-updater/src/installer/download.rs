@@ -32,13 +32,15 @@ const DOWNLOAD_BUFFER_SIZE: usize = 8192;
 /// The cap on an unverified download whose entry advertises no known size: none
 /// at all, or an advertised 0 counting as no size.
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
-/// The most an archive may claim to unpack to before extraction is refused.
+/// The most an archive may claim to unpack to before extraction is refused,
+/// and the ceiling on the limit for any download.
 const MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// The most members an archive may hold before extraction is refused.
 const MAX_EXTRACTED_MEMBERS: u64 = 100_000;
-/// How far past twice its advertised size an unverified download may run: the
-/// store under-reports often enough (3 of 21 measurable no-MD5 entries served
-/// more than advertised plus a KiB) that the limit carries a margin.
+/// How far past twice its advertised size an unverified download may run, below
+/// the [`MAX_EXTRACTED_BYTES`] ceiling: the store under-reports often enough (3
+/// of 21 measurable no-MD5 entries served more than advertised plus a KiB) that
+/// the limit carries a margin.
 const ADVERTISED_SIZE_SLACK_BYTES: u64 = 1024 * 1024;
 /// How long a `bsdtar` call (the listing or the extraction) may run before its
 /// process group is killed. Extraction cost follows member count and directory
@@ -158,15 +160,16 @@ fn grant_owner_access(path: &Path) {
 ///
 /// A verified download is bounded by the extraction cap: nothing past it could
 /// be unpacked. An unverified one is bounded by twice the size its entry
-/// advertised plus a margin for the store's under-reporting, and falls back to
-/// [`MAX_DOWNLOAD_BYTES`] when no size is advertised either, an advertised 0
-/// counting as no size.
+/// advertised plus a margin for the store's under-reporting, never above
+/// [`MAX_EXTRACTED_BYTES`], and falls back to [`MAX_DOWNLOAD_BYTES`] when no
+/// size is advertised either, an advertised 0 counting as no size.
 fn download_limit(checksum: Option<&str>, advertised: Option<u64>) -> u64 {
     match (checksum, advertised) {
         (Some(_), _) => MAX_EXTRACTED_BYTES,
         (None, Some(size)) if size > 0 => size
             .saturating_mul(2)
-            .saturating_add(ADVERTISED_SIZE_SLACK_BYTES),
+            .saturating_add(ADVERTISED_SIZE_SLACK_BYTES)
+            .min(MAX_EXTRACTED_BYTES),
         (None, _) => MAX_DOWNLOAD_BYTES,
     }
 }
@@ -233,9 +236,10 @@ fn decode_percent(name: &str) -> String {
 /// `name` is the component's display name and its `id` the installed path.
 ///
 /// A download without an advertised MD5 is logged as unverified and capped at
-/// twice its advertised size plus a margin, or at [`MAX_DOWNLOAD_BYTES`] when
-/// no size is given, an advertised 0 counting as none; a verified one is capped
-/// at [`MAX_EXTRACTED_BYTES`]. Reading past the cap is a download failure.
+/// twice its advertised size plus a margin, never above [`MAX_EXTRACTED_BYTES`],
+/// or at [`MAX_DOWNLOAD_BYTES`] when no size is given, an advertised 0 counting
+/// as none; a verified one is capped at [`MAX_EXTRACTED_BYTES`]. Reading past
+/// the cap is a download failure.
 ///
 /// The component's directory name namespaces the download file, preventing
 /// filename collisions when multiple components download in parallel.
@@ -926,6 +930,26 @@ mod tests {
         assert_eq!(download_limit(None, Some(1000)), 2 * 1000 + 1024 * 1024);
         assert_eq!(download_limit(None, None), MAX_DOWNLOAD_BYTES);
         assert_eq!(download_limit(None, Some(0)), MAX_DOWNLOAD_BYTES);
+    }
+
+    #[test]
+    fn an_unverified_download_advertising_one_and_a_half_gib_is_capped_at_the_extraction_cap() {
+        assert_eq!(
+            download_limit(None, Some(1536 * 1024 * 1024)),
+            MAX_EXTRACTED_BYTES
+        );
+        // Control: just under the ceiling, twice the advertised size plus the slack still rules.
+        assert_eq!(
+            download_limit(None, Some(1_073_217_535)),
+            2 * 1_073_217_535 + 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn an_unverified_download_advertising_the_largest_size_is_capped_at_the_extraction_cap() {
+        assert_eq!(download_limit(None, Some(u64::MAX)), MAX_EXTRACTED_BYTES);
+        // Twice this size wraps to 0, so only a saturating doubling keeps the cap.
+        assert_eq!(download_limit(None, Some(1 << 63)), MAX_EXTRACTED_BYTES);
     }
 
     #[test]
