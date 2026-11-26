@@ -273,8 +273,9 @@ enum Unpacked {
     /// install runs.
     Fallback {
         tree: PathBuf,
-        /// The prepared package root, or the refusal preparing it hit; the
-        /// direct install decides then, and `kpackagetool6` never runs.
+        /// The prepared package root, or the refusal preparing it hit, in
+        /// which case `kpackagetool6` never runs and the direct install
+        /// decides.
         package: Result<PathBuf, ComponentFailure>,
     },
 }
@@ -382,16 +383,10 @@ fn unpack_download(
         Some(_) if component.component_type.has_direct_fallback() => {
             // `kpackagetool6` may write the component before the direct
             // fallback runs, so a package route that refuses on its own does
-            // not fail the update. A package naming no plugin id is one the
-            // tool never installs, so that route is certain to fail for it
-            // too. When no route can install, the pair refuses here, before a
-            // backup exists.
+            // not fail the update. When no route can install, the pair
+            // refuses here, before a backup exists.
             let package = install::prepare_package(&extract_dir, component, new_version);
-            let package_route_refuses = match &package {
-                Err(_) => true,
-                Ok(package) => install::plugin_id(package).is_none(),
-            };
-            if package_route_refuses {
+            if package.is_err() {
                 install::resolve_direct_source(&extract_dir, component)?;
             }
             Ok(Unpacked::Fallback {
@@ -591,7 +586,7 @@ fn verify_installed_version_trusting(
     } else {
         log::warn!(
             target: "verify",
-            "{}: expected version {}, found {}",
+            "{:?}: expected version {:?}, found {}",
             component.name,
             expected,
             actual.as_deref().unwrap_or("(unreadable)"),
@@ -605,6 +600,10 @@ fn verify_installed_version_trusting(
     }
 }
 
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the metadata path is store-controlled: Display prints a newline in it raw"
+)]
 fn read_installed_version_trusting(
     component: &InstalledComponent,
     system_roots: &[PathBuf],
@@ -629,8 +628,8 @@ fn read_installed_version_trusting(
         if !install::metadata_size_ok(&json_path) {
             log::warn!(
                 target: "verify",
-                "ignoring {}: larger than the {}-byte metadata cap",
-                json_path.display(),
+                "ignoring {:?}: larger than the {}-byte metadata cap",
+                json_path.as_os_str(),
                 install::MAX_METADATA_BYTES
             );
         } else if let Ok(content) = fs::read_to_string(&json_path)
@@ -823,20 +822,44 @@ mod tests {
 
     /// Builds a tar of `format` at `dir/package` holding `file`.
     fn tar_holding(dir: &Path, format: &str, file: &str, content: &str) -> PathBuf {
+        tar_holding_files(dir, format, &[(file, content)])
+    }
+
+    /// Builds a tar of `format` at `dir/package` holding `files`, each at its
+    /// relative path.
+    fn tar_holding_files(dir: &Path, format: &str, files: &[(&str, &str)]) -> PathBuf {
         let src = dir.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join(file), content).unwrap();
+        let mut roots = std::collections::BTreeSet::new();
+        for (relative, content) in files {
+            let path = src.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+            if let Some(root) = relative.split('/').next() {
+                roots.insert(root.to_string());
+            }
+        }
         let archive = dir.join("package");
-        let status = std::process::Command::new("tar")
+        let mut command = std::process::Command::new("tar");
+        command
             .args(["--create", "--format", format, "--file"])
             .arg(&archive)
             .arg("--directory")
-            .arg(&src)
-            .arg(file)
-            .status()
-            .unwrap();
+            .arg(&src);
+        for root in &roots {
+            command.arg(root);
+        }
+        let status = command.status().unwrap();
         assert!(status.success(), "tar failed building the fixture");
         archive
+    }
+
+    /// A PlasmaStyle installed at `path`, for the fallback-route tests.
+    fn style(path: &Path) -> InstalledComponent {
+        let mut component = color_scheme(path);
+        component.name = "Probe Style".to_string();
+        component.directory_name = "ProbeStyle".to_string();
+        component.component_type = ComponentType::PlasmaStyle;
+        component
     }
 
     /// Installs `download` as the `component`, expecting `bsdtar`'s refusal to
@@ -1513,6 +1536,302 @@ exit 0
             root.join("done").exists(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A fallback type's id-less package with a resolvable direct source: the
+    /// pre-slot decision already knows the package route refuses, so the tool
+    /// never runs and the direct install decides.
+    #[test]
+    fn an_id_less_fallback_package_keeps_only_the_direct_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tar_holding_files(
+            dir.path(),
+            "ustar",
+            &[
+                (
+                    "metadata.json",
+                    r#"{"KPlugin": {"Name": "Probe Style", "Version": "2.0"}}"#,
+                ),
+                ("colors/colors", "new-colors"),
+            ],
+        );
+        let target = dir.path().join("ProbeStyle");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("metadata.json"),
+            r#"{"KPlugin": {"Name": "Probe Style", "Version": "1.0"}}"#,
+        )
+        .unwrap();
+        let component = style(&target);
+        let temp = dir.path().join("temp");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let unpacked = unpack_download(&archive, Ok("download"), &component, "2.0", &temp).unwrap();
+
+        let Unpacked::Fallback { package, .. } = unpacked else {
+            panic!("the package did not take the fallback route");
+        };
+        let refused = package.expect_err("the package route is one the tool never installs");
+        assert!(
+            refused.message.contains("records no plugin id"),
+            "{}",
+            refused.message
+        );
+    }
+
+    /// The warning for a package that could not be used reprs both the
+    /// component name and the refusal it carries.
+    #[test]
+    fn a_used_directly_fallback_warn_reprs_the_store_text() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(tree.join("colors")).unwrap();
+        std::fs::write(tree.join("colors/colors"), "new-colors").unwrap();
+        let target = root.path().join("component");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut component = style(&target);
+        component.name = "Fallback warn\nWARN fb-name".to_string();
+        let unpacked = Unpacked::Fallback {
+            tree,
+            package: Err(ComponentFailure::new(
+                FailureKind::Install,
+                "refused\nWARN fb-message",
+            )),
+        };
+        let slot = InstallSlot::new();
+        let expected = format!(
+            "{:?}: installing its files directly, the package could not be used: {:?}",
+            component.name, "refused\nWARN fb-message"
+        );
+
+        let lines = captured_logs_while(|| {
+            execute_installation(&unpacked, &component, &slot.acquire()).unwrap();
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the direct-install warning did not repr the store text: {lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("colors/colors")).unwrap(),
+            "new-colors",
+            "the direct install did not run"
+        );
+    }
+
+    /// The warning for a failed package install reprs its message too, which
+    /// can carry a store-controlled path.
+    #[test]
+    fn a_failed_package_install_warn_reprs_its_message() {
+        let root = tempfile::tempdir().unwrap();
+        // The component's parent is a file, so the copy fails with a message
+        // naming that path, and the direct install fails there too.
+        let forged_parent = root.path().join("forged\nWARN fb2-path");
+        std::fs::write(&forged_parent, b"not a directory").unwrap();
+        let target = forged_parent.join("component");
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(tree.join("colors")).unwrap();
+        std::fs::write(tree.join("colors/colors"), "new-colors").unwrap();
+        let package = root.path().join("package/org.test.differs");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.differs"}}"#,
+        )
+        .unwrap();
+        let mut component = style(&target);
+        component.name = "Fallback failed\nWARN fb2-name".to_string();
+        let unpacked = Unpacked::Fallback {
+            tree,
+            package: Ok(package),
+        };
+        let slot = InstallSlot::new();
+        let expected = format!("{:?}: falling back to a direct install: ", component.name);
+
+        let lines = captured_logs_while(|| {
+            drop(execute_installation(&unpacked, &component, &slot.acquire()));
+        });
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&expected) && line.contains("forged\\nWARN fb2-path")),
+            "the fallback warning did not repr the failure message: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("forged\nWARN fb2-path")),
+            "a raw store path reached a log line: {lines:?}"
+        );
+    }
+
+    /// Sddm and Splash packages with no structure this archive can install
+    /// fail their structure lookup inside `unpack_download`, before any slot
+    /// is taken (the message proves which lookup ran).
+    #[test]
+    fn an_sddm_or_splash_package_with_no_structure_fails_before_the_slot() {
+        for component_type in [ComponentType::SddmTheme, ComponentType::SplashScreen] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = tar_holding(dir.path(), "ustar", "README", "no structure here\n");
+            let mut component = style(&dir.path().join("component"));
+            component.component_type = component_type;
+            let temp = dir.path().join("temp");
+            std::fs::create_dir_all(&temp).unwrap();
+
+            let failure =
+                unpack_download(&archive, Ok("download"), &component, "2.0", &temp).unwrap_err();
+
+            assert!(
+                failure.message.ends_with("structure found in archive"),
+                "{component_type:?}: {}",
+                failure.message
+            );
+        }
+    }
+
+    /// An over-cap `metadata.desktop` package on a fallback type takes only
+    /// the direct route: this module cannot read the id the tool would
+    /// address the package by, so preparing the package refuses it before the
+    /// slot and the direct install decides.
+    #[test]
+    fn an_over_cap_desktop_package_takes_only_the_direct_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let desktop = format!(
+            "[Desktop Entry]\nX-KDE-PluginInfo-Name=org.test.style\n#{}",
+            "p".repeat(MAX_METADATA_BYTES as usize)
+        );
+        let archive = tar_holding_files(
+            dir.path(),
+            "ustar",
+            &[
+                ("metadata.desktop", &desktop),
+                ("colors/colors", "new-colors"),
+            ],
+        );
+        let target = dir.path().join("ProbeStyle");
+        std::fs::create_dir_all(&target).unwrap();
+        let component = style(&target);
+        let temp = dir.path().join("temp");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let unpacked = unpack_download(&archive, Ok("download"), &component, "2.0", &temp).unwrap();
+
+        let Unpacked::Fallback { package, .. } = unpacked else {
+            panic!("the package did not take the fallback route");
+        };
+        let refused = package.expect_err("the package route is one the tool cannot address");
+        assert_eq!(
+            refused.message,
+            format!(
+                "{} is larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+                temp.join("extract-ProbeStyle")
+                    .join("metadata.desktop")
+                    .display()
+            )
+        );
+    }
+
+    fn widget_update(path: PathBuf, latest: &str) -> AvailableUpdate {
+        AvailableUpdate::builder(
+            InstalledComponent::new(
+                "Fake Widget".to_string(),
+                "org.test.widget".to_string(),
+                ComponentType::PlasmaWidget,
+                path,
+            )
+            .with_version("1.0"),
+            7,
+            latest,
+        )
+        .download_url("https://example.test/dl")
+        .release_date("2026-02-02")
+        .build()
+    }
+
+    /// A widget update whose installed `metadata.json` is past the cap: the
+    /// version read skips it naming the path, repr'd, so a store-controlled
+    /// component directory name cannot forge a log line.
+    #[test]
+    fn an_installed_metadata_over_the_cap_reprs_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("forged\nWARN verify-pkg");
+        std::fs::create_dir_all(&installed).unwrap();
+        let json = installed.join("metadata.json");
+        std::fs::write(
+            &json,
+            format!(
+                r#"{{"KPlugin": {{"Version": "1.0"}}}}{}"#,
+                " ".repeat(MAX_METADATA_BYTES as usize)
+            ),
+        )
+        .unwrap();
+        let update = widget_update(installed, "2.0");
+        let expected = format!(
+            "verify: ignoring {:?}: larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+            json.as_os_str()
+        );
+
+        let lines = captured_logs_while(|| {
+            drop(verify_installed_version_trusting(
+                &update,
+                &[],
+                &dir.path().join("knewstuff3"),
+                |_| false,
+            ));
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the cap warning did not repr the installed path: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("forged\nWARN verify-pkg")),
+            "a raw store path reached a log line: {lines:?}"
+        );
+    }
+
+    /// The failed version check names the store's version and the component
+    /// name, both repr'd, so neither can forge a log line.
+    #[test]
+    fn a_version_mismatch_warn_reprs_the_store_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed");
+        std::fs::create_dir_all(&installed).unwrap();
+        let mut update = widget_update(installed, "2.0\nWARN verify-version");
+        update.installed.name = "Forged verify\nWARN verify-name".to_string();
+        let expected = format!(
+            "verify: {:?}: expected version {:?}, found (unreadable)",
+            update.installed.name, update.latest_version
+        );
+
+        let lines = captured_logs_while(|| {
+            drop(verify_installed_version_trusting(
+                &update,
+                &[],
+                &dir.path().join("knewstuff3"),
+                |_| false,
+            ));
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the version warning did not repr the store text: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Forged verify\nWARN verify-name")),
+            "a raw store name reached a log line: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("expected version 2.0\nWARN verify-version")),
+            "a raw store version reached a log line: {lines:?}"
         );
     }
 }

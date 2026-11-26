@@ -174,16 +174,31 @@ fn read_metadata_text(path: &Path) -> Result<String, ComponentFailure> {
 
 /// Reads a metadata file for a read-only answer, skipping one past the cap
 /// with a warning: such a caller has no failure row to report it on.
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the path is store-controlled: Display prints a newline in it raw"
+)]
 fn read_metadata_for_query(path: &Path, target: &str) -> Option<String> {
     if !metadata_size_ok(path) {
         log::warn!(
             target: target,
-            "ignoring {}: larger than the {MAX_METADATA_BYTES}-byte metadata cap",
-            path.display()
+            "ignoring {:?}: larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+            path.as_os_str()
         );
         return None;
     }
     fs::read_to_string(path).ok()
+}
+
+/// The first read failure among a package's regular metadata files, so a
+/// refusal names the file this module could not read rather than claiming the
+/// package records no id.
+fn unreadable_metadata(package_dir: &Path) -> Option<ComponentFailure> {
+    ["metadata.json", "metadata.desktop"]
+        .into_iter()
+        .map(|name| package_dir.join(name))
+        .filter(|path| is_regular_file(path))
+        .find_map(|path| read_metadata_text(&path).err())
 }
 
 /// Drops a leading UTF-8 byte-order mark, which Qt accepts and serde rejects.
@@ -577,10 +592,14 @@ pub(super) fn patch_metadata(
                     serde_json::Value::String(new_version.to_string()),
                 );
             }
+            #[expect(
+                clippy::unnecessary_debug_formatting,
+                reason = "the path is store-controlled: Display prints a newline in it raw"
+            )]
             None => log::warn!(
                 target: "patch",
-                "{}: KPlugin is not an object",
-                metadata_path.display()
+                "{:?}: KPlugin is not an object",
+                metadata_path.as_os_str()
             ),
         }
     }
@@ -853,9 +872,10 @@ fn link_target_stays_inside(dir: &Path, target: &Path, root: &Path) -> bool {
 /// installed component, before any install step runs.
 ///
 /// A type whose installed side carries no id is not a widget and skips the
-/// check. Once the installed side has one, a package that yields none (no
-/// metadata, unreadable, unparsable, no id key) is refused as well: skipping
-/// the comparison there is what lets a package install under another id.
+/// check. Once the installed side has one, a package whose metadata this
+/// module cannot read, or whose readable metadata names no id, is refused as
+/// well: skipping the comparison there is what lets a package install under
+/// another id, which `kpackagetool6` reads from the package's own metadata.
 pub(super) fn verify_package_plugin_id(
     extract_dir: &Path,
     component: &InstalledComponent,
@@ -863,18 +883,21 @@ pub(super) fn verify_package_plugin_id(
     let Some(installed_id) = plugin_id(&component.path) else {
         return Ok(());
     };
-    let package_id = find_package_dir(extract_dir).and_then(|dir| plugin_id(&dir));
-    let Some(package_id) = package_id else {
-        return Err(install_failure(format!(
-            "store entry is a different widget: installed {installed_id:?}, the package records no plugin id"
-        )));
-    };
-    if package_id != installed_id {
-        return Err(install_failure(format!(
+    let package_dir = find_package_dir(extract_dir);
+    match package_dir.as_deref().and_then(plugin_id) {
+        Some(package_id) if package_id == installed_id => Ok(()),
+        Some(package_id) => Err(install_failure(format!(
             "store entry is a different widget: installed {installed_id:?}, package {package_id:?}"
-        )));
+        ))),
+        None => Err(package_dir
+            .as_deref()
+            .and_then(unreadable_metadata)
+            .unwrap_or_else(|| {
+                install_failure(format!(
+                    "store entry is a different widget: installed {installed_id:?}, the package records no plugin id"
+                ))
+            })),
     }
-    Ok(())
 }
 
 // --- kpackagetool Installation ---
@@ -1327,7 +1350,7 @@ fn install_via_kpackagetool(
     // installs it.
     log::info!(
         target: "install",
-        "{}: kpackagetool6 does not recognise {}, which is in place; copying the package there",
+        "{:?}: kpackagetool6 does not recognise {}, which is in place; copying the package there",
         component.name,
         component.path.display(),
     );
@@ -1335,8 +1358,8 @@ fn install_via_kpackagetool(
 }
 
 /// Finds a package's root in an extracted tree, patches its metadata for the
-/// new version, and refuses a package `kpackagetool6` cannot address because
-/// it names no plugin id.
+/// new version, and refuses a package whose plugin id this module cannot read,
+/// the id `kpackagetool6` addresses a package by.
 ///
 /// The caller decides what a refusal means: a type without a direct fallback
 /// fails the update there, before its install slot is taken; a type with one
@@ -1363,20 +1386,23 @@ pub(super) fn prepare_package(
     {
         log::warn!(
             target: "patch",
-            "failed to patch metadata.desktop for {}: {}",
+            "failed to patch metadata.desktop for {:?}: {:?}",
             component.name,
             e.message
         );
     }
 
-    // kpackagetool6 addresses a package by its plugin id, and a package with
-    // none is one it never installs. A type with a direct fallback may still
-    // install such a package, so only the type without one refuses here,
-    // where no step has written the component.
-    if !component.component_type.has_direct_fallback() && plugin_id(&package_dir).is_none() {
-        return Err(install_failure(
-            "the package records no plugin id, which kpackagetool6 needs to install it",
-        ));
+    // kpackagetool6 addresses a package by the id it reads from the package's
+    // own metadata, and this module decides backup, registry and the version
+    // check for the installed component it matched. A package whose id this
+    // module cannot read would leave those two addresses apart, so it is
+    // refused here, where no step has written the component.
+    if plugin_id(&package_dir).is_none() {
+        return Err(unreadable_metadata(&package_dir).unwrap_or_else(|| {
+            install_failure(
+                "the package records no plugin id, which kpackagetool6 needs to install it",
+            )
+        }));
     }
 
     Ok(package_dir)
@@ -1397,7 +1423,7 @@ pub(super) fn install_prepared_package(
     {
         log::info!(
             target: "install",
-            "installing {} directly: its directory name differs from the plugin id {:?}",
+            "installing {:?} directly: its directory name differs from the plugin id {:?}",
             component.name,
             package_id,
         );
@@ -1823,9 +1849,9 @@ pub(super) enum DirectSource {
 ///
 /// A lookup that finds nothing fails here, before the install slot is taken,
 /// so its failure takes no backup and restores nothing. The one caller that
-/// runs after a slot is taken is the fallback of a type whose `kpackagetool6`
-/// install failed: the tool may have written the component by then, so a
-/// package its fallback installs is never refused up front.
+/// can fail here after a slot is taken is the fallback of a type whose
+/// `kpackagetool6` install failed: the tool may have written the component by
+/// then, so a package its fallback installs is never refused up front.
 pub(super) fn resolve_direct_source(
     extract_dir: &Path,
     component: &InstalledComponent,
@@ -1936,7 +1962,7 @@ pub(in crate::installer) mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::testutil::logs::{capture_logs, captured_logs};
+    use crate::testutil::logs::{capture_logs, captured_logs, captured_logs_while};
 
     #[test]
     fn atomic_install_file_creates_dest() {
@@ -2857,6 +2883,33 @@ exit 0
         // Either outcome is fine; a panic, which would unwind through the
         // update pool and kill the whole run, is not.
         let _ = patch_metadata(&path, ComponentType::PlasmaWidget, "2.0");
+    }
+
+    /// The not-an-object warning reprs the metadata path, so a store-controlled
+    /// package directory name cannot forge a log line.
+    #[test]
+    fn a_non_object_kplugin_warn_reprs_the_metadata_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("forged\nWARN patch-object");
+        std::fs::create_dir_all(&package).unwrap();
+        let path = package.join("metadata.json");
+        std::fs::write(&path, r#"{"KPlugin": "not an object"}"#).unwrap();
+        let expected = format!("patch: {:?}: KPlugin is not an object", path.as_os_str());
+
+        let lines = captured_logs_while(|| {
+            patch_metadata(&path, ComponentType::PlasmaWidget, "2.0").unwrap();
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the patch warning did not repr the store path: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("forged\nWARN patch-object")),
+            "a raw store path reached a log line: {lines:?}"
+        );
     }
 
     #[test]
@@ -4272,17 +4325,17 @@ exec sleep 30
         if std::env::var_os("PU_TEST_ID_LESS").is_some() {
             let extract = PathBuf::from(std::env::var("PU_TEST_EXTRACT").unwrap());
             let component_dir = PathBuf::from(std::env::var("PU_TEST_COMPONENT").unwrap());
-            // A type with a direct fallback: the package's missing plugin id
-            // is judged after the tool answers, since the fallback may still
-            // install the package.
+            // The tool's answer is judged on its own here: an update refuses
+            // an id-less package before the slot, so this guard is reached
+            // only through the tool route itself.
             let component = theme_component(
                 &component_dir,
                 "org.test.widget",
                 ComponentType::GlobalTheme,
             );
 
-            let package_dir = prepare_package(&extract, &component, "2.0").unwrap();
-            let refusal = install_prepared_package(&package_dir, &component).unwrap_err();
+            let package_dir = extract.join("org.test.widget");
+            let refusal = install_via_kpackagetool(&package_dir, &component, false).unwrap_err();
 
             assert_eq!(refusal.kind, FailureKind::Install);
             assert!(
@@ -4326,6 +4379,84 @@ exec sleep 30
                 ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
                 ("PU_TEST_EXTRACT", extract.to_str().unwrap()),
                 ("PU_TEST_COMPONENT", component.to_str().unwrap()),
+            ],
+        );
+
+        assert!(
+            output.status.success() && done.exists(),
+            "child run failed ({}; body completed: {})\n--- stderr\n{}",
+            output.status,
+            done.exists(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    const NOT_RECOGNISED_CHILD: &str =
+        "installer::install::tests::an_unrecognised_install_warn_reprs_the_component_name";
+
+    /// A `kpackagetool6` answering "not installed" for a package that has a
+    /// plugin id means the installed tree is in place and the package is
+    /// copied over it; that line reprs the component name, so a store name
+    /// cannot forge a log line.
+    #[test]
+    fn an_unrecognised_install_warn_reprs_the_component_name() {
+        if std::env::var_os("PU_TEST_NOT_RECOGNISED").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let mut component =
+                widget_at(&root.join("component/org.test.widget"), "org.test.widget");
+            component.name = "Forged tool\nWARN tool-name".to_string();
+            let package = root.join("package/org.test.widget");
+            let expected = format!(
+                "install: {:?}: kpackagetool6 does not recognise {}",
+                component.name,
+                component.path.display()
+            );
+
+            let lines = captured_logs_while(|| {
+                install_via_kpackagetool(&package, &component, false).unwrap();
+            });
+
+            assert!(
+                lines.iter().any(|line| line.contains(&expected)),
+                "the copy-over line did not repr the component name: {lines:?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("Forged tool\nWARN tool-name")),
+                "a raw store name reached a log line: {lines:?}"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(
+            &bin.join("kpackagetool6"),
+            "#!/bin/sh\necho 'Error: Plugin org.test.widget is not installed.' >&2\nexit 2\n",
+        );
+        let package = dir.path().join("package/org.test.widget");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("contents.txt"), "new\n").unwrap();
+        let component = dir.path().join("component/org.test.widget");
+        std::fs::create_dir_all(&component).unwrap();
+        std::fs::write(component.join("contents.txt"), "old\n").unwrap();
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            NOT_RECOGNISED_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_NOT_RECOGNISED", "1"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_ROOT", dir.path().to_str().unwrap()),
             ],
         );
 
@@ -4562,6 +4693,320 @@ exec sleep 30
         assert_eq!(
             ImageName::Served(Err("%FF.png")).no_file_name().message,
             "downloaded image has no file name to put in the wallpaper folder (\"%FF.png\")"
+        );
+    }
+
+    /// A `metadata.desktop` body naming `id` and larger than the metadata cap.
+    fn oversized_desktop(id: &str) -> String {
+        format!(
+            "[Desktop Entry]\nX-KDE-PluginInfo-Name={id}\n#{}",
+            "p".repeat(MAX_METADATA_BYTES as usize)
+        )
+    }
+
+    /// A legacy package whose `metadata.desktop` is over the read cap: the id
+    /// in it is one `kpackagetool6` reads (measured 2026-11-25: it installed
+    /// and upgraded one), but this module cannot read it, so the refusal
+    /// names the read failure rather than claiming the package records no id.
+    #[test]
+    fn a_metadata_desktop_over_the_cap_is_refused_as_id_less() {
+        let dir = tempfile::tempdir().unwrap();
+        let extract = dir.path().join("extract");
+        let package = extract.join("org.test.widget");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("metadata.desktop"),
+            oversized_desktop("org.test.widget"),
+        )
+        .unwrap();
+        let installed = dir.path().join("installed");
+        std::fs::create_dir_all(&installed).unwrap();
+        let component = widget_at(&installed, "org.test.widget");
+
+        let refusal = prepare_package(&extract, &component, "2.0").unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert_eq!(
+            refusal.message,
+            format!(
+                "{} is larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+                package.join("metadata.desktop").display()
+            )
+        );
+    }
+
+    /// A package whose readable metadata names no id is refused for every
+    /// type: `kpackagetool6` refuses one too (measured 2026-11-25 on 2.0:
+    /// `-i` exits 4; `-u` answers `Plugin metadata is not installed.`, exit 2,
+    /// or deletes an installed directory named `metadata` and exits 4).
+    #[test]
+    fn an_id_less_package_with_readable_metadata_names_no_plugin_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let extract = dir.path().join("extract");
+        let package = extract.join("org.test.style");
+        std::fs::create_dir_all(package.join("colors")).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Name": "No Id"}}"#,
+        )
+        .unwrap();
+        let installed = dir.path().join("installed");
+        std::fs::create_dir_all(&installed).unwrap();
+        let component = theme_component(&installed, "org.test.style", ComponentType::PlasmaStyle);
+
+        let refusal = prepare_package(&extract, &component, "2.0").unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert!(
+            refusal.message.contains("records no plugin id"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    /// The failed desktop patch warning reprs both the component name and the
+    /// store's metadata path, so neither can forge a log line.
+    #[test]
+    fn a_failed_metadata_desktop_patch_reprs_the_store_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let extract = dir.path().join("extract");
+        let package = extract.join("forged\nWARN patch-pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let desktop = package.join("metadata.desktop");
+        std::fs::write(&desktop, oversized_desktop("org.test.style")).unwrap();
+        let component = InstalledComponent {
+            name: "Forged patch\nWARN patch-name".to_string(),
+            ..theme_component(
+                &dir.path().join("installed"),
+                "org.test.style",
+                ComponentType::PlasmaStyle,
+            )
+        };
+        let expected = format!(
+            "failed to patch metadata.desktop for {:?}: {:?}",
+            component.name,
+            format!(
+                "{} is larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+                desktop.display()
+            ),
+        );
+
+        let lines = captured_logs_while(|| {
+            drop(prepare_package(&extract, &component, "2.0"));
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the patch warning did not repr the store text: {lines:?}"
+        );
+    }
+
+    /// The direct-name-mismatch install line reprs the component name, so a
+    /// store name cannot forge a log line.
+    #[test]
+    fn an_install_whose_directory_differs_reprs_the_component_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("package/org.test.realid");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.realid"}}"#,
+        )
+        .unwrap();
+        let dest = dir.path().join("dest");
+        let component = InstalledComponent {
+            name: "Forged install\nWARN info-name".to_string(),
+            ..theme_component(&dest, "org.test.other", ComponentType::PlasmaStyle)
+        };
+        let expected = format!(
+            "installing {:?} directly: its directory name differs from the plugin id {:?}",
+            component.name, "org.test.realid"
+        );
+
+        let lines = captured_logs_while(|| {
+            install_prepared_package(&package, &component).unwrap();
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the install line did not repr the component name: {lines:?}"
+        );
+        assert!(
+            dest.join("metadata.json").exists(),
+            "the package was not copied to the component path"
+        );
+    }
+
+    /// A package whose `metadata.json` is over the read cap against an
+    /// installed id: the installed-id guard cannot read the package's id, so
+    /// it refuses the package before any install step, and no direct install
+    /// can replace the component.
+    #[test]
+    fn an_over_cap_metadata_json_keeps_the_installed_id_check() {
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.test.widget", "org.test.widget");
+        std::fs::write(
+            package.join("metadata.json"),
+            format!(
+                r#"{{"KPlugin": {{"Id": "org.test.widget"}}}}{}"#,
+                " ".repeat(MAX_METADATA_BYTES as usize)
+            ),
+        )
+        .unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert_eq!(
+            refusal.message,
+            format!(
+                "{} is larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+                package.join("metadata.json").display()
+            )
+        );
+    }
+
+    /// An over-cap `metadata.desktop` beside a readable id-less
+    /// `metadata.json`: the tool reads the json, which names no id, so the
+    /// installed-id guard refuses the package.
+    #[test]
+    fn an_over_cap_desktop_beside_an_id_less_json_keeps_the_installed_id_check() {
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.test.widget", "org.test.widget");
+        std::fs::write(
+            package.join("metadata.json"),
+            r#"{"KPlugin": {"Name": "No Id"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("metadata.desktop"),
+            oversized_desktop("org.test.widget"),
+        )
+        .unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        assert_eq!(
+            refusal.message,
+            format!(
+                "{} is larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+                package.join("metadata.desktop").display()
+            )
+        );
+    }
+
+    /// A package whose metadata files are both past the cap names the
+    /// `metadata.json`, the file this module and `kpackagetool6` read first; a
+    /// swapped list would name the desktop instead.
+    #[test]
+    fn a_package_with_both_metadata_files_over_the_cap_names_the_json() {
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.test.widget", "org.test.widget");
+        std::fs::write(
+            package.join("metadata.json"),
+            format!(r#"{{}}{}"#, " ".repeat(MAX_METADATA_BYTES as usize)),
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("metadata.desktop"),
+            oversized_desktop("org.test.widget"),
+        )
+        .unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        assert_eq!(
+            refusal.message,
+            format!(
+                "{} is larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+                package.join("metadata.json").display()
+            )
+        );
+    }
+
+    /// The installed-id guard names an io read failure of the package's
+    /// metadata, never the no-plugin-id line.
+    #[test]
+    fn an_unreadable_package_metadata_keeps_the_installed_id_check() {
+        if privilege::is_root() {
+            return;
+        }
+        let (_installed, extract, component, package) =
+            plugin_id_fixture("org.test.widget", "org.test.widget");
+        let desktop = package.join("metadata.desktop");
+        std::fs::write(
+            &desktop,
+            "[Desktop Entry]\nX-KDE-PluginInfo-Name=org.test.widget\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&desktop, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let refusal = verify_package_plugin_id(extract.path(), &component).unwrap_err();
+
+        let expected = format!(
+            "{}: {}",
+            desktop.display(),
+            std::fs::read_to_string(&desktop).unwrap_err()
+        );
+        assert_eq!(refusal.message, expected);
+    }
+
+    /// A desktop this process cannot read names no id this module can read, so
+    /// a fallback type's package is refused here, naming the read failure, and
+    /// the direct install decides.
+    #[test]
+    fn an_unreadable_metadata_desktop_is_refused_as_id_less() {
+        if privilege::is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let extract = dir.path().join("extract");
+        let package = extract.join("org.test.style");
+        std::fs::create_dir_all(&package).unwrap();
+        let desktop = package.join("metadata.desktop");
+        std::fs::write(
+            &desktop,
+            "[Desktop Entry]\nX-KDE-PluginInfo-Name=org.test.style\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&desktop, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let installed = dir.path().join("installed");
+        std::fs::create_dir_all(&installed).unwrap();
+        let component = theme_component(&installed, "org.test.style", ComponentType::PlasmaStyle);
+
+        let refusal = prepare_package(&extract, &component, "2.0").unwrap_err();
+
+        assert_eq!(refusal.kind, FailureKind::Install);
+        let expected = format!(
+            "{}: {}",
+            desktop.display(),
+            std::fs::read_to_string(&desktop).unwrap_err()
+        );
+        assert_eq!(refusal.message, expected);
+    }
+
+    /// The ignored-over-cap warning reprs the path, so a package directory
+    /// name cannot forge a log line.
+    #[test]
+    fn an_ignored_over_cap_metadata_reprs_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("forged\nWARN ignore-pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let desktop = package.join("metadata.desktop");
+        std::fs::write(&desktop, oversized_desktop("org.test.style")).unwrap();
+        let expected = format!(
+            "ignoring {:?}: larger than the {MAX_METADATA_BYTES}-byte metadata cap",
+            desktop.as_os_str()
+        );
+
+        let lines = captured_logs_while(|| {
+            drop(read_metadata_for_query(&desktop, "install"));
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the ignore warning did not repr the path: {lines:?}"
         );
     }
 }

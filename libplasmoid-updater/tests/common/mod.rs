@@ -888,7 +888,7 @@ fn xml_text(text: &str) -> String {
 
 /// A `.tar.gz` holding `files`, each at its relative path, built with the
 /// system `tar`.
-fn files_archive(files: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn files_archive(files: &[(&str, &str)]) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");
     let mut roots = std::collections::BTreeSet::new();
@@ -917,23 +917,7 @@ fn files_archive(files: &[(&str, &str)]) -> Vec<u8> {
 
 /// A `.tar.gz` holding the new color scheme file, built with the system `tar`.
 fn scheme_archive() -> Vec<u8> {
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join(SCHEME_FILE), NEW_CONTENT).unwrap();
-    let archive = dir.path().join("fake-scheme.tar.gz");
-    let status = Command::new("tar")
-        .arg("--create")
-        .arg("--gzip")
-        .arg("--file")
-        .arg(&archive)
-        .arg("--directory")
-        .arg(&src)
-        .arg(SCHEME_FILE)
-        .status()
-        .unwrap();
-    assert!(status.success(), "tar failed building the fixture archive");
-    std::fs::read(archive).unwrap()
+    files_archive(&[(SCHEME_FILE, NEW_CONTENT)])
 }
 
 /// A `.tar.gz` holding a Plasma widget package directory `<id>/` whose

@@ -176,6 +176,10 @@ fn scan_directory(
 /// reported, so a present component is never dropped without a trace. Only a
 /// regular file is opened: a FIFO, socket or device named `metadata.json` would
 /// otherwise wait for a writer that never comes.
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the metadata path is store-controlled: Display prints a newline in it raw"
+)]
 pub(crate) fn read_metadata(package_dir: &Path) -> Option<PackageMetadata> {
     let json_path = package_dir.join("metadata.json");
     if !crate::installer::is_regular_file(&json_path) {
@@ -195,8 +199,8 @@ pub(crate) fn read_metadata(package_dir: &Path) -> Option<PackageMetadata> {
     if !crate::installer::metadata_size_ok(&json_path) {
         log::warn!(
             target: "discovery",
-            "ignoring {}: larger than the {}-byte metadata cap",
-            json_path.display(),
+            "ignoring {:?}: larger than the {}-byte metadata cap",
+            json_path.as_os_str(),
             crate::installer::MAX_METADATA_BYTES
         );
         return read_metadata_desktop(package_dir);
@@ -216,6 +220,10 @@ pub(crate) fn read_metadata(package_dir: &Path) -> Option<PackageMetadata> {
     read_metadata_desktop(package_dir)
 }
 
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the metadata path is store-controlled: Display prints a newline in it raw"
+)]
 fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
     let path = package_dir.join("metadata.desktop");
     match path.try_exists() {
@@ -237,8 +245,8 @@ fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
     if !crate::installer::metadata_size_ok(&path) {
         log::warn!(
             target: "discovery",
-            "ignoring {}: larger than the {}-byte metadata cap",
-            path.display(),
+            "ignoring {:?}: larger than the {}-byte metadata cap",
+            path.as_os_str(),
             crate::installer::MAX_METADATA_BYTES
         );
         return None;
@@ -271,7 +279,7 @@ fn read_metadata_desktop(package_dir: &Path) -> Option<PackageMetadata> {
 mod tests {
     use super::*;
 
-    use crate::testutil::logs::{capture_logs, captured_warnings_for};
+    use crate::testutil::logs::{capture_logs, captured_logs_while, captured_warnings_for};
 
     #[test]
     fn an_unstattable_entry_is_reported_and_the_scan_continues() {
@@ -359,6 +367,83 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(&path.display().to_string()) && line.contains("cap")),
             "no warning named the capped file: {warnings:?}"
+        );
+    }
+
+    /// An over-cap `metadata.json` is skipped with a warning naming the path,
+    /// repr'd, so a store-controlled package directory name cannot forge a
+    /// log line.
+    #[test]
+    fn an_over_cap_metadata_json_warn_reprs_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("forged\nWARN discovery-json");
+        std::fs::create_dir_all(&package).unwrap();
+        let json = package.join("metadata.json");
+        std::fs::write(
+            &json,
+            format!(
+                r#"{{"KPlugin": {{"Name": "Huge"}}}}{}"#,
+                " ".repeat(2 * 1024 * 1024)
+            ),
+        )
+        .unwrap();
+        let expected = format!(
+            "discovery: ignoring {:?}: larger than the {}-byte metadata cap",
+            json.as_os_str(),
+            crate::installer::MAX_METADATA_BYTES
+        );
+
+        let lines = captured_logs_while(|| {
+            drop(read_metadata(&package));
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the cap warning did not repr the store path: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("forged\nWARN discovery-json")),
+            "a raw store path reached a log line: {lines:?}"
+        );
+    }
+
+    /// An over-cap `metadata.desktop` is skipped with the same warning, repr'd
+    /// the same way.
+    #[test]
+    fn an_over_cap_metadata_desktop_warn_reprs_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("forged\nWARN discovery-desktop");
+        std::fs::create_dir_all(&package).unwrap();
+        let desktop = package.join("metadata.desktop");
+        std::fs::write(
+            &desktop,
+            format!(
+                "[Desktop Entry]\nName=Huge\n#{}",
+                "p".repeat(2 * 1024 * 1024)
+            ),
+        )
+        .unwrap();
+        let expected = format!(
+            "discovery: ignoring {:?}: larger than the {}-byte metadata cap",
+            desktop.as_os_str(),
+            crate::installer::MAX_METADATA_BYTES
+        );
+
+        let lines = captured_logs_while(|| {
+            drop(read_metadata(&package));
+        });
+
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "the cap warning did not repr the store path: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("forged\nWARN discovery-desktop")),
+            "a raw store path reached a log line: {lines:?}"
         );
     }
 

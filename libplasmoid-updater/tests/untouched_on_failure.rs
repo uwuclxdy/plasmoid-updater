@@ -424,6 +424,114 @@ fn an_id_less_package_for_a_fallback_type_takes_no_backup_and_restores_nothing()
     assert!(backups.is_empty(), "the style was backed up: {backups:?}");
 }
 
+/// A PlasmaStyle whose installed side and package name no plugin id and whose
+/// archive holds the theme's `colors/`: the package route is one
+/// `kpackagetool6` never installs, so the direct install runs and the tool
+/// never does.
+#[test]
+fn an_id_less_fallback_package_installs_directly_without_the_tool() {
+    if let Some(child) = common::child() {
+        let result = update(&config(&child.store_url), &Quiet).unwrap();
+        assert!(result.failed.is_empty(), "{result:?}");
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let style = sandbox.data_home().join("plasma/desktoptheme/IdLessDirect");
+    std::fs::create_dir_all(&style).unwrap();
+    std::fs::write(
+        style.join("metadata.json"),
+        r#"{"KPlugin": {"Name": "Id Less Direct", "Version": "1.0"}}"#,
+    )
+    .unwrap();
+    common::write_registry(
+        &sandbox,
+        "plasma-themes.knsregistry",
+        STYLE_CATEGORY,
+        "Id Less Direct",
+        "1.0",
+        &format!("{}/metadata.json", style.display()),
+        Some(424_248),
+    );
+    let tool_marker = sandbox.tmp_dir().join("kpackagetool-ran");
+    sandbox.fake_tool(
+        "kpackagetool6",
+        &format!("printf 'ran\\n' > '{}'\nexit 2\n", tool_marker.display()),
+    );
+    let store = FakeStore::start(Listing {
+        extras: vec![common::ExtraEntry {
+            id: 424_248,
+            name: "Id Less Direct",
+            type_id: STYLE_CATEGORY,
+            version: "2.0",
+            files: &[
+                (
+                    "metadata.json",
+                    r#"{"KPlugin": {"Name": "Id Less Direct", "Version": "2.0"}}"#,
+                ),
+                ("colors/colors", "new-colors"),
+            ],
+        }],
+        ..Listing::default()
+    });
+    sandbox.run_child(
+        "an_id_less_fallback_package_installs_directly_without_the_tool",
+        store.url(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(style.join("colors/colors")).unwrap(),
+        "new-colors",
+        "the direct install did not run"
+    );
+    assert!(
+        !tool_marker.exists(),
+        "kpackagetool6 ran for a package it never installs"
+    );
+}
+
+/// An over-cap `metadata.desktop` names the id only `kpackagetool6` could
+/// read; with no readable id against an installed component that has one, the
+/// package is refused before the slot: no backup is taken, the widget is
+/// untouched, and the tool never runs.
+#[test]
+fn an_over_cap_desktop_package_takes_no_backup_and_restores_nothing() {
+    if let Some(child) = common::child() {
+        assert_one_failure(
+            child,
+            FailureKind::Install,
+            Some("is larger than the 1048576-byte metadata cap"),
+        );
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let inode = install_widget(&sandbox);
+    let tool_marker = sandbox.tmp_dir().join("kpackagetool-ran");
+    sandbox.fake_tool(
+        "kpackagetool6",
+        &format!("printf 'ran\\n' > '{}'\nexit 2\n", tool_marker.display()),
+    );
+    let desktop = format!(
+        "[Desktop Entry]\nX-KDE-PluginInfo-Name={WIDGET_DIR}\n#{}",
+        "p".repeat(1024 * 1024)
+    );
+    let archive = common::files_archive(&[("org.fake.widget/metadata.desktop", &desktop)]);
+    let download: &'static [u8] = Box::leak(archive.into_boxed_slice());
+    let store = FakeStore::start(Listing {
+        widget: Some(store_widget()),
+        widget_download: Some(download),
+        ..Listing::default()
+    });
+    sandbox.run_child(
+        "an_over_cap_desktop_package_takes_no_backup_and_restores_nothing",
+        store.url(),
+    );
+    assert_untouched(&sandbox, inode);
+    assert!(
+        !tool_marker.exists(),
+        "kpackagetool6 ran for a package it cannot address"
+    );
+}
+
 /// A PlasmaStyle (a type with a direct fallback) whose package holds no
 /// package root but whose archive holds a `colors/` directory: the package
 /// route refuses and the direct fallback installs the theme.
