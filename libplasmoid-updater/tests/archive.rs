@@ -153,6 +153,29 @@ fn a_download_with_no_md5_is_capped_at_its_advertised_size() {
 }
 
 #[test]
+fn a_store_entry_with_no_md5_sized_at_zero_installs() {
+    if let Some(child) = common::child() {
+        let result = update(&config(&child.store_url), &Quiet).unwrap();
+        assert!(result.failed.is_empty(), "{result:?}");
+        child.done();
+        return;
+    }
+    let sandbox = Sandbox::new();
+    sandbox.install_old_scheme();
+    let store = FakeStore::start(Listing {
+        no_md5: true,
+        size_kb_override: Some(0),
+        download_padding: 2 * 1024 * 1024,
+        ..Listing::default()
+    });
+    sandbox.run_child(
+        "a_store_entry_with_no_md5_sized_at_zero_installs",
+        store.url(),
+    );
+    assert_content(&sandbox.scheme_path(), NEW_CONTENT);
+}
+
+#[test]
 fn an_empty_install_restores_a_component_stranded_by_a_killed_run() {
     if let Some(child) = common::child() {
         let result = install(&[], &config(&child.store_url), &Quiet).unwrap();

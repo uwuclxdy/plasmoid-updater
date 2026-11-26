@@ -896,7 +896,7 @@ fn final_screen(bytes: &[u8]) -> Vec<String> {
     rows
 }
 
-const NO_CHECKSUM_WARNING: &str = "warn: Fake Scheme: the store advertises no checksum, \
+const NO_CHECKSUM_WARNING: &str = "warn: \"Fake Scheme\": the store advertises no checksum, \
      so the download is unverified and capped at ";
 
 #[test]

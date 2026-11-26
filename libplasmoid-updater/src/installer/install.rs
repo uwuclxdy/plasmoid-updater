@@ -1138,8 +1138,7 @@ pub(super) fn reap_within(
 ///
 /// A child still there [`REAP_BOUND`] after the `SIGKILL` is left unreaped and
 /// the run goes on: until it is reaped its pid, which is also the group's id,
-/// cannot be reused, so the probe that follows never meets a stranger's group;
-/// once it exits it stays a zombie until this process ends and init reaps it.
+/// cannot be reused, so the probe that follows never meets a stranger's group.
 fn terminate_group(child: &mut std::process::Child, group: Pid) -> Reaped {
     let _ = killpg(group, Signal::SIGTERM);
     match reap_within(child, KILL_GRACE) {
@@ -2309,6 +2308,15 @@ pub(in crate::installer) mod tests {
         bin: &Path,
         envs: &[(&str, &str)],
     ) -> std::process::Output {
+        child_command(test_name, bin, envs).output().unwrap()
+    }
+
+    /// The command [`run_child`] runs, for a caller that sets more on it.
+    pub(in crate::installer) fn child_command(
+        test_name: &str,
+        bin: &Path,
+        envs: &[(&str, &str)],
+    ) -> std::process::Command {
         let path = OsString::from(format!(
             "{}:{}",
             bin.display(),
@@ -2322,7 +2330,7 @@ pub(in crate::installer) mod tests {
         for (key, value) in envs {
             command.env(key, value);
         }
-        command.output().unwrap()
+        command
     }
 
     /// The fake `sudo`'s argv blocks, one `Vec` per invocation.
@@ -3600,13 +3608,25 @@ exit 0
     }
 
     /// Kills the process whose pid `pid_file` holds, waits for it to go, and
-    /// returns whether it was still running.
-    fn stop_recorded(pid_file: &Path) -> bool {
-        let pid: i32 = std::fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+    /// returns whether it was still running. A fake writes that file when it
+    /// starts, so a file that is not there yet is waited for up to five seconds
+    /// rather than read at once.
+    pub(in crate::installer) fn stop_recorded(pid_file: &Path) -> bool {
+        let written_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let pid: i32 = loop {
+            let problem = match std::fs::read_to_string(pid_file) {
+                Ok(recorded) => match recorded.trim().parse() {
+                    Ok(pid) => break pid,
+                    Err(e) => format!("{}: {e}", pid_file.display()),
+                },
+                Err(e) => format!("{}: {e}", pid_file.display()),
+            };
+            assert!(
+                std::time::Instant::now() < written_by,
+                "the fake never recorded a usable pid at {problem}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         let running = process_running(pid);
         let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4311,6 +4331,163 @@ exec sleep 30
             std::fs::read_to_string(backup.join("marker")).unwrap(),
             "old",
             "the kept backup changed"
+        );
+    }
+
+    const RELAYED_TERM_CHILD: &str =
+        "installer::install::tests::an_elevated_tool_that_exits_on_the_relayed_sigterm_is_restored";
+
+    /// A fake `sudo` that passes `SIGTERM` on to its command and exits once
+    /// the command has, as sudo does. It takes the same `-n` the real one is
+    /// given, and records the command's pid right after forking it, so the
+    /// fixture's control does not depend on how soon the command reaches its
+    /// own first line. Its `SIGTERM` handling is armed before anything else, so
+    /// a `SIGTERM` that lands before the pid is written still leaves the pid
+    /// recorded and the command killed.
+    const RELAYING_SUDO: &str = "#!/bin/sh\ntrap 'term=1' TERM\nif [ \"$1\" = -n ]; then shift; fi\n\"$@\" &\nkid=$!\necho $kid > \"$PU_TEST_TOOL_PID\"\ntrap 'kill -TERM $kid' TERM\nif [ -n \"$term\" ]; then kill -TERM $kid; fi\nwait $kid\nwait $kid\n";
+
+    /// A fake `kpackagetool6` that only outlives the timeout; the relaying
+    /// sudo records its pid.
+    const SLEEPING_KPACKAGETOOL: &str = "#!/bin/sh\nexec sleep 30\n";
+
+    /// A `sudo` that exits on the relayed `SIGTERM` before any `SIGKILL` means
+    /// its command did too, so the timeout restores the backup rather than
+    /// keeping it for a tool that may still run.
+    #[test]
+    fn an_elevated_tool_that_exits_on_the_relayed_sigterm_is_restored() {
+        if std::env::var_os("PU_TEST_RELAYED_TERM").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let backup = root.join("backup");
+            let component = widget_at(&root.join("component"), "org.test.widget");
+            let slot = super::super::InstallSlot::new();
+
+            let failure =
+                install_via_kpackagetool(&root.join("package"), &component, true).unwrap_err();
+            assert_eq!(failure.message, "kpackagetool6 timed out after 1 s");
+            assert!(
+                !failure.process_may_still_run,
+                "a sudo that exited with its command on SIGTERM was read as possibly running"
+            );
+            super::super::handle_installation_failure(
+                &backup,
+                &component,
+                &failure,
+                &slot.acquire(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(component.path.join("marker")).unwrap(),
+                "old"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+        if privilege::is_root() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("sudo"), RELAYING_SUDO);
+        write_script(&bin.join("kpackagetool6"), SLEEPING_KPACKAGETOOL);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("package")).unwrap();
+        std::fs::write(
+            root.join("package").join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("component")).unwrap();
+        std::fs::write(root.join("component").join("marker"), b"being written").unwrap();
+        std::fs::create_dir_all(root.join("backup")).unwrap();
+        std::fs::write(root.join("backup").join("marker"), b"old").unwrap();
+        let tool_pid = dir.path().join("tool-pid");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            RELAYED_TERM_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_RELAYED_TERM", "1"),
+                ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "1000"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_TOOL_PID", tool_pid.to_str().unwrap()),
+            ],
+        );
+
+        let survived = stop_recorded(&tool_pid);
+        assert_child_done(&output, &done);
+        assert!(!survived, "the fake tool outlived the relayed SIGTERM");
+    }
+
+    const REAPED_LATE_CHILD: &str =
+        "installer::install::tests::a_group_member_reaped_late_does_not_read_as_a_survivor";
+
+    /// A fake `kpackagetool6` whose helper forks a process into the tool's
+    /// group, leaves the group itself, and reaps that process only 1.5 s after
+    /// it dies, so the group holds a zombie when the timeout first probes it.
+    const LATE_REAPING_KPACKAGETOOL: &str = r#"#!/bin/sh
+perl -e 'my $kid = fork // die; if (!$kid) { exec "sleep", "30" or die } setpgrp(0, 0) or die; open(my $f, ">", $ENV{PU_TEST_TOOL_PID}) or die; print $f "$$\n"; close($f); until (do { my $s; open($s, "<", "/proc/$kid/stat") and scalar(<$s>) =~ /\) Z / }) { select(undef, undef, undef, 0.02) } open(my $h, ">", $ENV{PU_TEST_HELD}) or die; close($h); select(undef, undef, undef, 1.5); waitpid($kid, 0)' >/dev/null 2>&1 &
+while [ ! -s "$PU_TEST_TOOL_PID" ]; do sleep 0.05; done
+exec sleep 30
+"#;
+
+    /// A zombie its parent has not reaped yet keeps answering the group probe,
+    /// so one probe reads a killed group as still running; the bounded re-poll
+    /// is what lets the timeout find it gone.
+    #[test]
+    fn a_group_member_reaped_late_does_not_read_as_a_survivor() {
+        if std::env::var_os("PU_TEST_REAPED_LATE").is_some() {
+            let root = PathBuf::from(std::env::var("PU_TEST_ROOT").unwrap());
+            let component = widget_at(&root.join("component"), "org.test.widget");
+
+            let failure =
+                install_via_kpackagetool(&root.join("package"), &component, false).unwrap_err();
+            assert_eq!(failure.message, "kpackagetool6 timed out after 2 s");
+            assert!(
+                !failure.process_may_still_run,
+                "a killed process its parent had not reaped yet was read as a survivor"
+            );
+            std::fs::write(std::env::var_os("PU_TEST_CHILD_DONE").unwrap(), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("kpackagetool6"), LATE_REAPING_KPACKAGETOOL);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("package")).unwrap();
+        std::fs::write(
+            root.join("package").join("metadata.json"),
+            r#"{"KPlugin": {"Id": "org.test.widget"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("component")).unwrap();
+        let tool_pid = dir.path().join("tool-pid");
+        let held = dir.path().join("held");
+        let done = dir.path().join("child-done");
+
+        let output = run_child(
+            REAPED_LATE_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_REAPED_LATE", "1"),
+                ("PU_TEST_KPACKAGETOOL_TIMEOUT_MS", "2000"),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_TOOL_PID", tool_pid.to_str().unwrap()),
+                ("PU_TEST_HELD", held.to_str().unwrap()),
+            ],
+        );
+
+        stop_recorded(&tool_pid);
+        assert_child_done(&output, &done);
+        assert!(
+            held.exists(),
+            "the helper never held a zombie in the group, so the fixture tests nothing"
         );
     }
 

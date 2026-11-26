@@ -263,7 +263,7 @@ pub(crate) fn download_package(
     if update.checksum.is_none() {
         log::warn!(
             target: "download",
-            "{}: the store advertises no checksum, so the download is unverified and capped at {limit} bytes",
+            "{:?}: the store advertises no checksum, so the download is unverified and capped at {limit} bytes",
             component.name,
         );
     }
@@ -462,8 +462,8 @@ fn list_archive(archive_path: &Path, timeout: Duration) -> Result<(), ComponentF
     let stderr_reader = child.stderr.take().map(spawn_reader);
 
     // A listing line carries an untrusted member path, and a pax path of 1 MiB
-    // lists as one line, so the reader may run only a line or two ahead of the
-    // budget that judges them.
+    // lists as one line, so the reader may hold only three lines (two queued,
+    // one waiting to be sent) beyond the one the budget is judging.
     let (sender, lines) = mpsc::sync_channel(2);
     std::thread::spawn(move || {
         let mut listing = std::io::BufReader::new(stdout);
@@ -607,7 +607,9 @@ pub(crate) fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), Co
 
 #[cfg(test)]
 mod tests {
-    use super::super::install::tests::{process_running, run_child, write_script};
+    use super::super::install::tests::{
+        child_command, process_running, run_child, stop_recorded, write_script,
+    };
     use super::*;
     use crate::types::{ComponentType, InstalledComponent};
 
@@ -760,14 +762,13 @@ mod tests {
         let payload = "c".repeat(2 * 1024 * 1024);
         let archive = dir.path().join("FakeScheme.colors.tar");
         write_archive(&archive, &[("FakeScheme.colors", payload.as_str())]);
-        let body = String::from_utf8(std::fs::read(&archive).unwrap()).unwrap();
+        let body = std::fs::read(&archive).unwrap();
         assert!(
             body.len() > 1024 * 1024,
             "the fixture is {} bytes, not past the 1 MiB cap a 0 would give it",
             body.len()
         );
-        let (base, _) = crate::testutil::serve(move |_| crate::testutil::ok(body.clone()));
-        let url = format!("{base}/dl/fake-scheme.tar.gz");
+        let url = serve_once(body);
 
         capture_logs();
         let client = reqwest::blocking::Client::new();
@@ -799,6 +800,41 @@ mod tests {
             "the unverified warning did not name the no-size cap ({MAX_DOWNLOAD_BYTES} bytes): \
              {lines:?}"
         );
+    }
+
+    /// A store entry's name holding a newline prints in its debug form, so the
+    /// warning stays one log line instead of forging a second.
+    #[test]
+    fn a_component_name_holding_a_newline_prints_in_its_debug_form() {
+        use crate::testutil::logs::captured_logs_while;
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = serve_once(b"not read".to_vec());
+        let mut update = update_fixture(&url, None, None);
+        update.installed.name = "Fake\nScheme".to_string();
+        let client = reqwest::blocking::Client::new();
+        let lines = captured_logs_while(|| {
+            let _downloaded = download_package(&update, &client, dir.path(), &());
+        });
+
+        let named: Vec<&String> = lines
+            .iter()
+            .filter(|line| {
+                line.contains("advertises no checksum")
+                    && (line.contains("Fake\nScheme") || line.contains("Fake\\nScheme"))
+            })
+            .collect();
+        assert_eq!(
+            named.len(),
+            1,
+            "the warning did not print exactly once: {lines:?}"
+        );
+        let expected = format!(
+            "download: {:?}: the store advertises no checksum, so the download is \
+             unverified and capped at {MAX_DOWNLOAD_BYTES} bytes",
+            "Fake\nScheme"
+        );
+        assert_eq!(named[0], &expected, "the warning's line changed");
     }
 
     #[test]
@@ -950,7 +986,7 @@ mod tests {
     #[test]
     fn an_unverified_download_advertising_the_largest_size_is_capped_at_the_extraction_cap() {
         assert_eq!(download_limit(None, Some(u64::MAX)), MAX_EXTRACTED_BYTES);
-        // Twice this size wraps to 0, so only a saturating doubling keeps the cap.
+        // Twice this size wraps to 0: a doubling that wraps would cap it at the 1 MiB slack.
         assert_eq!(download_limit(None, Some(1 << 63)), MAX_EXTRACTED_BYTES);
     }
 
@@ -1042,6 +1078,9 @@ mod tests {
         assert!(!stale.exists(), "the fixture itself is not sweepable");
     }
 
+    const BSDTAR_EXIT_STATUS_CHILD: &str =
+        "installer::download::tests::a_bsdtar_failure_with_empty_stderr_names_the_exit_status";
+
     /// A bsdtar that dies with empty stderr names its exit status the way every
     /// other command does, not `bsdtar exited with status exit status: 1`.
     #[test]
@@ -1075,24 +1114,14 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake_bsdtar, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let path = std::ffi::OsString::from(format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        ));
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "installer::download::tests::a_bsdtar_failure_with_empty_stderr_names_the_exit_status",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env_clear()
-            .env("PATH", path)
-            .env("PU_TEST_BSDTAR_CHILD", "1")
-            .env("PU_TEST_BSDTAR_ROOT", &root)
-            .output()
-            .unwrap();
+        let output = run_child(
+            BSDTAR_EXIT_STATUS_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_BSDTAR_CHILD", "1"),
+                ("PU_TEST_BSDTAR_ROOT", root.to_str().unwrap()),
+            ],
+        );
         assert!(
             output.status.success(),
             "child failed: {}\n--- stdout\n{}\n--- stderr\n{}",
@@ -1241,8 +1270,7 @@ exec "$PU_TEST_REAL_BSDTAR" "$@"
             ],
         );
 
-        let survived = recorded_still_running(&helper_pid);
-        stop_recorded(&helper_pid);
+        let survived = stop_recorded(&helper_pid);
         assert!(
             output.status.success() && done.exists(),
             "child run failed ({}; body completed: {})\n--- stderr\n{}",
@@ -1300,24 +1328,24 @@ exec "$PU_TEST_REAL_BSDTAR" "$@"
         let listing_seen = root.join("listing-stdin");
         let extraction_seen = root.join("extraction-stdin");
         let done = root.join("child-done");
-        let path = std::ffi::OsString::from(format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        ));
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", STDIN_CHILD, "--nocapture", "--test-threads=1"])
-            .env_clear()
-            .env("PATH", path)
-            .env("PU_TEST_STDIN", "1")
-            .env("PU_TEST_REAL_BSDTAR", real_bsdtar())
-            .env("PU_TEST_ROOT", &root)
-            .env("PU_TEST_LISTING_STDIN_SEEN", &listing_seen)
-            .env("PU_TEST_EXTRACTION_STDIN_SEEN", &extraction_seen)
-            .env("PU_TEST_CHILD_DONE", &done)
-            .stdin(std::fs::File::open(&stdin_file).unwrap())
-            .output()
-            .unwrap();
+        let output = child_command(
+            STDIN_CHILD,
+            &bin,
+            &[
+                ("PU_TEST_STDIN", "1"),
+                ("PU_TEST_REAL_BSDTAR", real_bsdtar().to_str().unwrap()),
+                ("PU_TEST_ROOT", root.to_str().unwrap()),
+                ("PU_TEST_LISTING_STDIN_SEEN", listing_seen.to_str().unwrap()),
+                (
+                    "PU_TEST_EXTRACTION_STDIN_SEEN",
+                    extraction_seen.to_str().unwrap(),
+                ),
+                ("PU_TEST_CHILD_DONE", done.to_str().unwrap()),
+            ],
+        )
+        .stdin(std::fs::File::open(&stdin_file).unwrap())
+        .output()
+        .unwrap();
         assert!(
             output.status.success() && done.exists(),
             "child run failed ({}; body completed: {})\n--- stderr\n{}",
@@ -1665,24 +1693,6 @@ fi
 exec "$PU_TEST_REAL_BSDTAR" "$@"
 "#;
 
-    /// Stops the process the fake recorded, and fails when it outlives the
-    /// test.
-    fn stop_recorded(pid_file: &Path) {
-        let pid: i32 = std::fs::read_to_string(pid_file)
-            .unwrap_or_else(|e| panic!("no pid recorded at {}: {e}", pid_file.display()))
-            .trim()
-            .parse()
-            .unwrap();
-        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-        for _ in 0..100 {
-            if !process_running(pid) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("a fake helper outlived the test");
-    }
-
     #[test]
     fn a_stderr_reader_that_outlives_the_listing_does_not_hold_the_call() {
         if std::env::var_os("PU_TEST_STALE_STDERR").is_some() {
@@ -1731,8 +1741,7 @@ exec "$PU_TEST_REAL_BSDTAR" "$@"
             ],
         );
 
-        let survived = recorded_still_running(&helper_pid);
-        stop_recorded(&helper_pid);
+        let survived = stop_recorded(&helper_pid);
         assert!(
             output.status.success() && done.exists(),
             "child run failed ({}; body completed: {})\n--- stderr\n{}",
@@ -1805,8 +1814,7 @@ exec "$PU_TEST_REAL_BSDTAR" "$@"
             ],
         );
 
-        let survived = recorded_still_running(&tool_pid);
-        stop_recorded(&tool_pid);
+        let survived = stop_recorded(&tool_pid);
         assert!(
             output.status.success() && done.exists(),
             "child run failed ({}; body completed: {})\n--- stderr\n{}",
