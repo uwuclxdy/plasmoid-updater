@@ -52,6 +52,10 @@ pub(crate) struct ComponentFailure {
     /// A process the failed step started may still be writing the component's
     /// tree, so restoring the backup would race it.
     pub process_may_still_run: bool,
+    /// The step was given up at its time bound rather than failing on its own,
+    /// so what it was doing when the run ended it is unknown: a write may have
+    /// landed or may never land.
+    pub gave_up_at_bound: bool,
     /// `bsdtar` named no archive format for the file it was asked to list; a
     /// single-file component's download can be the component file itself only
     /// when this answer holds and the file carries no archive signature.
@@ -68,6 +72,7 @@ impl ComponentFailure {
             kind,
             message: message.into(),
             process_may_still_run: false,
+            gave_up_at_bound: false,
             unrecognized_format: false,
             source: None,
         }
@@ -78,6 +83,7 @@ impl ComponentFailure {
             kind,
             message: format!("{}: {source}", path.display()),
             process_may_still_run: false,
+            gave_up_at_bound: false,
             unrecognized_format: false,
             source: Some(source),
         }

@@ -179,20 +179,29 @@ fn reap_by(
 ///
 /// The line keeps the installer's existing `{tool} timed out after {} s` form.
 /// It counts as possibly running: the give-up has no positive check that sudo
-/// and what it started are gone.
+/// and what it started are gone. It is also the one failure marked as a
+/// give-up at a bound, which a caller keys on to tell it from a step that
+/// failed on its own while a process may still run.
 fn timed_out(tool: &str, bound: Duration) -> ComponentFailure {
     let mut failure = ComponentFailure::new(
         FailureKind::Install,
         format!("{tool} timed out after {} s", bound.as_secs()),
     );
     failure.process_may_still_run = true;
+    failure.gave_up_at_bound = true;
     failure
 }
 
 /// Ends sudo's group and gives up a command still running at `bound`.
 ///
-/// The line names the bound alone, not sudo's partial words. The abandoned pipe
-/// readers hold their buffers until their pipes close.
+/// The group gets `SIGTERM` first, because sudo relays it to the root command
+/// it started, which may run in a session of its own that no signal to the
+/// group reaches, and a `SIGKILL` of sudo relays nothing. A sudo that exits on
+/// the relayed signal leaves behind any member that ignored it, so the group
+/// still goes. A command in a session of its own that ignores the relayed
+/// `SIGTERM` outlives the give-up, so the failure is flagged as possibly
+/// running. The line names the bound alone, not sudo's partial words. The
+/// abandoned pipe readers hold their buffers until their pipes close.
 fn give_up(
     child: &mut std::process::Child,
     group: nix::unistd::Pid,
@@ -200,7 +209,13 @@ fn give_up(
     tool: &str,
     bound: Duration,
 ) -> ComponentFailure {
-    let _ = super::install::end_leftover_group(child, group);
+    use super::install::Reaped;
+    if matches!(
+        super::install::terminate_group(child, group),
+        Reaped::BeforeKill | Reaped::WaitFailed
+    ) {
+        let _ = super::install::end_leftover_group(child, group);
+    }
     drop(super::install::join_readers_bounded(
         readers,
         Instant::now() + super::install::KILL_GRACE,
@@ -480,10 +495,12 @@ pub(crate) fn write_file_as_root(path: &Path, content: &[u8]) -> Result<(), Comp
 /// [`give_up`] does. After sudo's exit, the content's thread and the stderr
 /// reader each get [`super::install::KILL_GRACE`], because a process sudo left
 /// running can hold either pipe open; a write still blocked then fails with
-/// sudo's failed exit or, after an exit of 0, as timed out after that grace. A
-/// give-up on either pipe ends sudo's group through
-/// [`super::install::end_leftover_group`], which names the members it cannot
-/// reach.
+/// sudo's failed exit or, after an exit of 0, as timed out after that grace,
+/// both counted as possibly running: sudo's exit proves its `tee` gone only
+/// when sudo waited for it, which a sudo ended by a signal did not, and a
+/// `tee` that outlived it holds stdin until it ends. A give-up on either pipe
+/// ends sudo's group through [`super::install::end_leftover_group`], which
+/// names the members it cannot reach.
 fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailure> {
     use std::io::Write as _;
     let bound = privileged_timeout();
@@ -559,7 +576,9 @@ fn write_via_sudo_tee(path: &Path, content: &[u8]) -> Result<(), ComponentFailur
         } else {
             format!("sudo tee failed: {detail}")
         };
-        return Err(ComponentFailure::new(FailureKind::Install, message));
+        let mut failure = ComponentFailure::new(FailureKind::Install, message);
+        failure.process_may_still_run = !write_finished;
+        return Err(failure);
     }
     if !write_finished {
         return Err(timed_out("sudo tee", super::install::KILL_GRACE));
@@ -1616,7 +1635,8 @@ mod tests {
     /// A fake `sudo` that leaves a background process holding its stdin,
     /// without reading it, does not keep a write larger than the pipe buffer
     /// waiting: the content goes in from a thread joined within the bound, and
-    /// the give-up ends sudo's group, so the holder goes with it.
+    /// the give-up ends sudo's group, so the holder goes with it. The failed
+    /// exit counts as possibly running, since a holder was still there.
     #[test]
     fn a_sudo_tee_stdin_holder_does_not_hold_the_write() {
         if is_root() {
@@ -1637,7 +1657,7 @@ mod tests {
             .unwrap();
             std::fs::write(
                 std::env::var_os("PU_TEST_TEE_STDIN_RESULT").unwrap(),
-                failed.message,
+                format!("{}|{}", failed.message, failed.process_may_still_run),
             )
             .unwrap();
             return;
@@ -1737,8 +1757,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&result).unwrap(),
-            "sudo tee failed",
-            "the failure did not name sudo's failed exit"
+            "sudo tee failed|true",
+            "the failure did not name sudo's failed exit, possibly running"
         );
         assert!(
             holder_gone,
@@ -2123,6 +2143,154 @@ mod tests {
                 "a give-up took {took:.3} s past a 1 s bound"
             );
         }
+    }
+
+    /// A give-up sends sudo's group `SIGTERM` before any `SIGKILL`, so sudo
+    /// relays it to its command. A command in a session of its own, as sudo
+    /// runs it on a pty, is reached only through that relay and is gone after
+    /// the give-up, and a group member that ignored the `SIGTERM` still goes
+    /// once sudo exits on it. A command in sudo's group that ignores the
+    /// `SIGTERM` is killed with the group once [`KILL_GRACE`] passes. Both
+    /// fail as the run bound, possibly running.
+    ///
+    /// [`KILL_GRACE`]: crate::installer::install::KILL_GRACE
+    #[test]
+    fn a_give_up_lets_sudo_relay_term_before_the_kill() {
+        if is_root() {
+            return; // root runs the command directly and never runs sudo
+        }
+
+        if std::env::var_os("PU_TEST_RELAY_CHILD").is_some() {
+            let dir = PathBuf::from(std::env::var("PU_TEST_RELAY_DIR").unwrap());
+            let mut lines = Vec::new();
+            let mut elapsed = Vec::new();
+            for command in ["relayed", "ignoring"] {
+                let started = std::time::Instant::now();
+                lines.push(outcome(run_sudo_reading_os(&[OsStr::new(command)])));
+                elapsed.push(started.elapsed().as_secs_f64().to_string());
+            }
+            std::fs::write(dir.join("result"), lines.join("\n")).unwrap();
+            std::fs::write(dir.join("elapsed"), elapsed.join("\n")).unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_sudo = bin.join("sudo");
+        // Waits for its command and relays a SIGTERM to it, as sudo does.
+        // `relayed` runs the command in a session of its own beside a group
+        // member that ignores SIGTERM; `ignoring` runs a command in the group
+        // that ignores it. The trap is set after the fork, so a command never
+        // runs with it and cannot lose the relayed signal to it on dash.
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\n\
+             echo $$ > \"$PU_TEST_RELAY_DIR/sudo-$1.pid\"\n\
+             case \"$1\" in\n\
+             relayed)\n\
+             env --ignore-signal=TERM sleep 30 </dev/null >/dev/null 2>&1 &\n\
+             echo $! > \"$PU_TEST_RELAY_DIR/member-$1.pid\"\n\
+             setsid sleep 30 </dev/null >/dev/null 2>&1 &\n\
+             ;;\n\
+             *)\n\
+             env --ignore-signal=TERM sleep 30 </dev/null >/dev/null 2>&1 &\n\
+             ;;\n\
+             esac\n\
+             command=$!\n\
+             echo $command > \"$PU_TEST_RELAY_DIR/command-$1.pid\"\n\
+             trap 'kill -TERM \"$command\" 2>/dev/null' TERM\n\
+             while kill -0 \"$command\" 2>/dev/null; do wait \"$command\"; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = OsString::from(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::privilege::tests::a_give_up_lets_sudo_relay_term_before_the_kill",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("PU_TEST_PRIVILEGED_TIMEOUT_MS", "1000")
+            .env("PU_TEST_RELAY_CHILD", "1")
+            .env("PU_TEST_RELAY_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let (finished, status) = wait_child(&mut child, std::time::Duration::from_secs(30));
+        let mut child_stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            drop(pipe.read_to_string(&mut child_stderr));
+        }
+        let pid_files = [
+            "sudo-relayed",
+            "command-relayed",
+            "member-relayed",
+            "sudo-ignoring",
+            "command-ignoring",
+        ]
+        .map(|name| (name, dir.path().join(format!("{name}.pid"))));
+        let recorded: Vec<(&str, Option<i32>)> = pid_files
+            .iter()
+            .map(|(name, pid_file)| (*name, recorded_pid(pid_file)))
+            .collect();
+        let left: Vec<&str> = recorded
+            .iter()
+            .filter(|(_, pid)| {
+                pid.is_some_and(|pid| !gone_within(pid, std::time::Duration::from_secs(3)))
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        for (_, pid_file) in &pid_files {
+            kill_recorded_pid(pid_file);
+        }
+        assert!(
+            finished && status.success(),
+            "child run failed ({status}, finished: {finished})\n--- child stderr\n{child_stderr}"
+        );
+        assert!(
+            recorded.iter().all(|(_, pid)| pid.is_some()),
+            "the fake never recorded a pid: {recorded:?}"
+        );
+        let elapsed: Vec<f64> = std::fs::read_to_string(dir.path().join("elapsed"))
+            .unwrap()
+            .lines()
+            .map(|took| took.parse().unwrap())
+            .collect();
+        let bound = 1.0;
+        let grace = crate::installer::install::KILL_GRACE.as_secs_f64();
+        let [relayed, ignoring] = elapsed[..] else {
+            panic!("the child timed {elapsed:?}, not two give-ups");
+        };
+        // One comparison, so a red names every leg that failed.
+        assert_eq!(
+            (
+                left,
+                relayed < bound + grace,
+                (bound + grace..bound + grace + grace).contains(&ignoring)
+            ),
+            (Vec::<&str>::new(), true, true),
+            "(processes that outlived the give-up, a sudo that exited on the relayed \
+             SIGTERM returned within the kill grace, a command that ignores SIGTERM was \
+             killed once the grace passed and within the pipe grace after it); the \
+             give-ups took {elapsed:?} s"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("result")).unwrap(),
+            "error: sudo timed out after 1 s|true\n\
+             error: sudo timed out after 1 s|true",
+            "a command past the run bound was not reported as the bound"
+        );
     }
 
     /// A failed wait for `sudo` ends sudo's group and counts the command as

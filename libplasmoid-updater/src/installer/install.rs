@@ -968,7 +968,7 @@ pub(super) enum Route {
 
 /// When the timed-out child was reaped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Reaped {
+pub(super) enum Reaped {
     /// On its own or within the `SIGTERM` grace, before any `SIGKILL`.
     BeforeKill,
     /// Only after the `SIGKILL`.
@@ -1133,13 +1133,17 @@ pub(super) fn reap_within(
     }
 }
 
-/// Ends the child and every process it forked, giving the group a grace on
-/// `SIGTERM` before `SIGKILL`, and returns when the child was reaped.
+/// Signals the child's process group, `SIGTERM` first and `SIGKILL` only when
+/// the child is not reaped within [`KILL_GRACE`], and reports how the reaping
+/// went.
 ///
-/// A child still there [`REAP_BOUND`] after the `SIGKILL` is left unreaped and
-/// the run goes on: until it is reaped its pid, which is also the group's id,
-/// cannot be reused, so the probe that follows never meets a stranger's group.
-fn terminate_group(child: &mut std::process::Child, group: Pid) -> Reaped {
+/// A child reaped on the `SIGTERM` ends the function before the `SIGKILL`, so
+/// a member that ignored the signal outlives it: a caller that needs the whole
+/// group gone follows with [`end_leftover_group`]. A child still there
+/// [`REAP_BOUND`] after the `SIGKILL` is left unreaped and the run goes on:
+/// until it is reaped its pid, which is also the group's id, cannot be reused,
+/// so the probe that follows never meets a stranger's group.
+pub(super) fn terminate_group(child: &mut std::process::Child, group: Pid) -> Reaped {
     let _ = killpg(group, Signal::SIGTERM);
     match reap_within(child, KILL_GRACE) {
         Ok(true) => return Reaped::BeforeKill,

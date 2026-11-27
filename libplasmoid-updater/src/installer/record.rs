@@ -926,9 +926,12 @@ fn settle_record(sites: &RecordSites, record: &Path) -> std::io::Result<Option<R
 pub(super) enum Open {
     /// No record: nothing to back up, or none could be written.
     None,
-    /// The record this install wrote, or one a write that gave up while its
-    /// process may still run can land after the give-up.
+    /// The record this install wrote, or may still write when its write failed
+    /// with a process possibly running.
     Written(PathBuf),
+    /// The record a write given up at its time bound may have left: it may be
+    /// there or land after the give-up, or never be written at all.
+    Unconfirmed(PathBuf),
     /// A lost record the install runs over, left as it is.
     Lost(PathBuf),
 }
@@ -937,8 +940,9 @@ impl Open {
     /// Opens the component's record for the install about to run, after
     /// `backup` was taken and before any install step; a record that cannot
     /// be written leaves the install unprotected, with one warning. A write
-    /// that gave up while its process may still run keeps the record tracked,
-    /// so the landed install removes whatever that process writes.
+    /// that failed while its process may still run keeps the record tracked,
+    /// so the landed install removes whatever that process writes; only a
+    /// write given up at its time bound cannot be confirmed written.
     pub(super) fn write(
         sites: &RecordSites,
         component: &InstalledComponent,
@@ -955,12 +959,21 @@ impl Open {
         };
         match write_record(sites, &record, &component.path, backup) {
             Ok(()) => Self::Written(record),
-            Err(failure) => {
-                let err = &failure.message;
+            Err(failure) if failure.gave_up_at_bound => {
                 log::warn!(
                     target: "record",
-                    "{:?}: installing it unprotected: no install record could be written ({err}), so if this run is killed mid-install, no later run can restore it",
-                    component.name
+                    "{:?}: installing it unprotected: its install record could not be confirmed written ({}), so if this run is killed mid-install, a later run may not be able to restore it",
+                    component.name,
+                    failure.message
+                );
+                Self::Unconfirmed(record)
+            }
+            Err(failure) => {
+                log::warn!(
+                    target: "record",
+                    "{:?}: installing it unprotected: no install record could be written ({}), so if this run is killed mid-install, no later run can restore it",
+                    component.name,
+                    failure.message
                 );
                 if failure.process_may_still_run {
                     Self::Written(record)
@@ -975,14 +988,16 @@ impl Open {
     /// record that cannot be removed refuses the update, because a later run's
     /// repair would restore the backup it names over the files this run landed;
     /// a lost record names no backup that could be restored, so its removal
-    /// only warns.
+    /// only warns. An unconfirmed record may never have been written, so its
+    /// line asks for the hand removal only if it exists.
     pub(super) fn landed(
         self,
         sites: &RecordSites,
         _slot: &InstallSlotGuard<'_>,
     ) -> Result<(), ComponentFailure> {
-        let record = match self {
-            Self::Written(record) => record,
+        let (record, unconfirmed) = match self {
+            Self::Written(record) => (record, false),
+            Self::Unconfirmed(record) => (record, true),
             Self::Lost(record) => {
                 sites.remove(&record);
                 return Ok(());
@@ -990,21 +1005,27 @@ impl Open {
             Self::None => return Ok(()),
         };
         sites.remove_or_err(&record).map_err(|e| {
-            ComponentFailure::new(
-                FailureKind::Registry,
+            let message = if unconfirmed {
+                format!(
+                    "updated, but its install record {}, if the timed-out write left one, could not be removed ({e}), so the KNewStuff registry was not updated; delete that record by hand if it exists, or the next update that can read and write its directory first puts the old version back from its backup",
+                    record.display()
+                )
+            } else {
                 format!(
                     "updated, but its install record {} could not be removed ({e}), so the KNewStuff registry was not updated; delete that record by hand, or the next update that can read and write its directory first puts the old version back from its backup",
                     record.display()
-                ),
-            )
+                )
+            };
+            ComponentFailure::new(FailureKind::Registry, message)
         })
     }
 
     /// The install failed and its backup is back in place: the record this
-    /// install wrote goes, and a lost record it ran over stays.
+    /// install wrote, or may still have written, goes, and a lost record it
+    /// ran over stays.
     pub(super) fn restored(self, sites: &RecordSites, _slot: &InstallSlotGuard<'_>) {
         match self {
-            Self::Written(record) => {
+            Self::Written(record) | Self::Unconfirmed(record) => {
                 sites.remove(&record);
             }
             Self::Lost(_) | Self::None => {}
@@ -1014,7 +1035,8 @@ impl Open {
 
 /// Writes `record` naming `backup`, only where a reader looks and only bytes
 /// [`judge`] accepts; the error's message is the one the unprotected warning
-/// names, and its `process_may_still_run` says the record may still appear.
+/// names, its `gave_up_at_bound` says the record may still appear, and its
+/// `process_may_still_run` says a process the write started may still run.
 fn write_record(
     sites: &RecordSites,
     record: &Path,
@@ -2022,7 +2044,7 @@ mod tests {
 
     /// A record write that fails after the elevation wrote the file removes
     /// what it wrote, so no record is left naming a backup the install will
-    /// never be repaired from.
+    /// never be repaired from, and its warning says no record was written.
     #[test]
     fn a_record_write_that_fails_after_writing_removes_its_file() {
         const TEST: &str = "a_record_write_that_fails_after_writing_removes_its_file";
@@ -2049,11 +2071,11 @@ mod tests {
                     "a failed record write left a record open"
                 );
             });
-            assert!(
-                warnings
-                    .iter()
-                    .any(|line| line.contains("installing it unprotected")),
-                "{warnings:?}"
+            assert_eq!(
+                warnings,
+                [
+                    "record: \"S\": installing it unprotected: no install record could be written (sudo command failed: ), so if this run is killed mid-install, no later run can restore it"
+                ]
             );
             assert!(
                 !record_path(&component).exists(),
@@ -2089,7 +2111,7 @@ mod tests {
     /// tracked: a `tee` that lands the record after the give-up has it removed
     /// once the install's files land, so no later repair restores the backup
     /// it names over them. The install still runs with the one unprotected
-    /// warning.
+    /// warning, which says the record may or may not be there.
     #[test]
     fn a_record_a_given_up_tee_lands_late_goes_when_the_files_land() {
         const TEST: &str = "a_record_a_given_up_tee_lands_late_goes_when_the_files_land";
@@ -2132,7 +2154,7 @@ mod tests {
             assert_eq!(
                 lines,
                 [
-                    "record: \"S\": installing it unprotected: no install record could be written (sudo tee timed out after 1 s), so if this run is killed mid-install, no later run can restore it"
+                    "record: \"S\": installing it unprotected: its install record could not be confirmed written (sudo tee timed out after 1 s), so if this run is killed mid-install, a later run may not be able to restore it"
                 ]
             );
             std::fs::write(root.join("done"), b"ok").unwrap();
@@ -2188,6 +2210,286 @@ mod tests {
         );
         assert!(late_tee.is_some(), "the fake never started its late tee");
         assert!(late_tee_gone, "the late tee {late_tee:?} is still running");
+        let record = record_path(&child.root.join("schemes/S.colors"));
+        assert_eq!(
+            child.log.lines().collect::<Vec<_>>(),
+            [
+                format!("tee {}", record.display()),
+                format!("rm -f {}", record.display()),
+                format!("rm -f {}", record.display()),
+            ]
+        );
+    }
+
+    /// The landed install's removal of a record whose write was given up
+    /// fails: the refusal names the record only as one the write may have
+    /// left, and asks for its hand removal only if it exists.
+    #[test]
+    fn a_given_up_record_that_cannot_be_removed_is_named_only_if_it_exists() {
+        const TEST: &str = "a_given_up_record_that_cannot_be_removed_is_named_only_if_it_exists";
+        if privilege::is_root() {
+            return;
+        }
+        if let Some(root) = super::super::backup::tests::backup_child_root(TEST) {
+            super::super::backup::tests::assert_fake_sudo(&root);
+            let sites = sites(&root, true);
+            let schemes = root.join("schemes");
+            std::fs::create_dir_all(&schemes).unwrap();
+            let backup = root.join("base/2020-01-01T00-00-00/color-schemes/S.colors");
+            let component = schemes.join("S.colors");
+            let slot = super::super::InstallSlot::new();
+            let guard = slot.acquire();
+            let installed =
+                InstalledComponent::new("S", "S.colors", ComponentType::ColorScheme, &component)
+                    .with_system(true);
+
+            let open = Open::write(&sites, &installed, Some(&backup), Prior::None, &guard);
+            let Err(failure) = open.landed(&sites, &guard) else {
+                panic!("the landed install reported success with its record still open");
+            };
+            assert!(matches!(failure.kind, FailureKind::Registry), "{failure:?}");
+            assert_eq!(
+                failure.message,
+                format!(
+                    "updated, but its install record {}, if the timed-out write left one, could not be removed (sudo timed out after 1 s), so the KNewStuff registry was not updated; delete that record by hand if it exists, or the next update that can read and write its directory first puts the old version back from its backup",
+                    record_path(&component).display()
+                )
+            );
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+        // Every call outlives the run bound: the `tee` and each `rm -f`.
+        let child = super::super::backup::tests::run_sudo_child_with_env(
+            "installer::record::tests",
+            TEST,
+            "echo $$ >> \"$PU_BACKUP_ROOT/sudo.pids\"\nexec sleep 30\n",
+            &[("PU_TEST_PRIVILEGED_TIMEOUT_MS", "1000")],
+        );
+        let pids: Vec<i32> = std::fs::read_to_string(child.root.join("sudo.pids"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|pid| pid.parse().ok())
+            .collect();
+        let left: Vec<i32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid), None)
+                    != Err(nix::errno::Errno::ESRCH)
+            })
+            .collect();
+        for pid in &left {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert_eq!(pids.len(), 3, "{pids:?}");
+        assert_eq!(left, Vec::<i32>::new(), "a fake sudo outlived the test");
+        let record = record_path(&child.root.join("schemes/S.colors"));
+        assert_eq!(
+            child.log.lines().collect::<Vec<_>>(),
+            [
+                format!("tee {}", record.display()),
+                format!("rm -f {}", record.display()),
+                format!("rm -f {}", record.display()),
+            ]
+        );
+    }
+
+    /// A record write that fails while a process it started may still run,
+    /// but was not given up at a bound, keeps today's warning and failure
+    /// lines: only a give-up at a bound leaves the record's existence
+    /// unconfirmed. The record stays tracked, so the landed install's removal
+    /// still tries to remove it and names it plainly when that fails.
+    #[test]
+    fn a_flagged_record_write_that_did_not_time_out_keeps_todays_bytes() {
+        const TEST: &str = "a_flagged_record_write_that_did_not_time_out_keeps_todays_bytes";
+        if privilege::is_root() {
+            return;
+        }
+        if let Some(root) = super::super::backup::tests::backup_child_root(TEST) {
+            super::super::backup::tests::assert_fake_sudo(&root);
+            let sites = sites(&root, true);
+            let schemes = root.join("schemes");
+            std::fs::create_dir_all(&schemes).unwrap();
+            let backup = root.join("base/2020-01-01T00-00-00/color-schemes/S.colors");
+            let component = schemes.join("S.colors");
+            let slot = super::super::InstallSlot::new();
+            let guard = slot.acquire();
+            let installed =
+                InstalledComponent::new("S", "S.colors", ComponentType::ColorScheme, &component)
+                    .with_system(true);
+
+            let mut landed = None;
+            let lines = crate::testutil::logs::captured_logs_while(|| {
+                let open = Open::write(&sites, &installed, Some(&backup), Prior::None, &guard);
+                landed = open.landed(&sites, &guard).err();
+            });
+            let record = record_path(&component);
+            assert_eq!(
+                lines,
+                [
+                    "record: \"S\": installing it unprotected: no install record could be written (sudo exited but kept its output pipes open), so if this run is killed mid-install, no later run can restore it".to_string(),
+                    format!(
+                        "record: failed to remove {}: sudo command failed: ",
+                        record.display()
+                    ),
+                ]
+            );
+            assert_eq!(
+                landed.map(|failure| (failure.kind, failure.message)),
+                Some((
+                    FailureKind::Registry,
+                    format!(
+                        "updated, but its install record {} could not be removed (sudo command failed: ), so the KNewStuff registry was not updated; delete that record by hand, or the next update that can read and write its directory first puts the old version back from its backup",
+                        record.display()
+                    )
+                ))
+            );
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+        // The `tee` writes the record; the `chmod`'s background process holds
+        // its output pipes open past the join grace, so that write fails with
+        // a process possibly running, never having timed out. The first
+        // `rm -f` is the failed write's cleanup, which removes the record; the
+        // second is the landed install's removal, which fails.
+        let child = super::super::backup::tests::run_sudo_child_with_env(
+            "installer::record::tests",
+            TEST,
+            "case \"$1\" in\n\
+             tee) exec \"$@\" ;;\n\
+             chmod)\n\
+             sleep 30 &\n\
+             echo $! > \"$PU_BACKUP_ROOT/holder.pid\"\n\
+             exit 0 ;;\n\
+             rm)\n\
+             if [ -e \"$PU_BACKUP_ROOT/rm-once\" ]; then exit 1; fi\n\
+             : > \"$PU_BACKUP_ROOT/rm-once\"\n\
+             exec \"$@\" ;;\n\
+             *) exec \"$@\" ;;\n\
+             esac\n",
+            &[],
+        );
+        let holder = std::fs::read_to_string(child.root.join("holder.pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let holder_gone = holder.is_none_or(|pid| {
+            loop {
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                    == Err(nix::errno::Errno::ESRCH)
+                {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+        if let Some(pid) = holder {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert!(holder.is_some(), "the fake never started its pipe holder");
+        assert!(holder_gone, "the pipe holder {holder:?} is still running");
+        let record = record_path(&child.root.join("schemes/S.colors"));
+        assert_eq!(
+            child.log.lines().collect::<Vec<_>>(),
+            [
+                format!("tee {}", record.display()),
+                format!("chmod 644 {}", record.display()),
+                format!("rm -f {}", record.display()),
+                format!("rm -f {}", record.display()),
+            ]
+        );
+    }
+
+    /// A failed install that restored its backup removes a record whose write
+    /// was given up at its bound: the `tee` may still land it, and a record
+    /// left behind would have the next run restore its backup over the
+    /// restored files. Every call is given up, so the write's record stays
+    /// unconfirmed and each removal fails; what the removal attempts is the
+    /// log's third `rm -f`.
+    #[test]
+    fn a_restore_removes_a_record_a_given_up_write_left_unconfirmed() {
+        const TEST: &str = "a_restore_removes_a_record_a_given_up_write_left_unconfirmed";
+        if privilege::is_root() {
+            return;
+        }
+        if let Some(root) = super::super::backup::tests::backup_child_root(TEST) {
+            super::super::backup::tests::assert_fake_sudo(&root);
+            let sites = sites(&root, true);
+            let schemes = root.join("schemes");
+            std::fs::create_dir_all(&schemes).unwrap();
+            let backup = root.join("base/2020-01-01T00-00-00/color-schemes/S.colors");
+            let component = schemes.join("S.colors");
+            let slot = super::super::InstallSlot::new();
+            let guard = slot.acquire();
+            let installed =
+                InstalledComponent::new("S", "S.colors", ComponentType::ColorScheme, &component)
+                    .with_system(true);
+
+            let open = Open::write(&sites, &installed, Some(&backup), Prior::None, &guard);
+            assert!(
+                matches!(&open, Open::Unconfirmed(_)),
+                "a given-up record write did not stay unconfirmed"
+            );
+            open.restored(&sites, &guard);
+            std::fs::write(root.join("done"), b"ok").unwrap();
+            return;
+        }
+        // Every call outlives the run bound: the `tee`, the failed write's
+        // cleanup and the restore's removal alike.
+        let child = super::super::backup::tests::run_sudo_child_with_env(
+            "installer::record::tests",
+            TEST,
+            "echo $$ >> \"$PU_BACKUP_ROOT/sudo.pids\"\nexec sleep 30\n",
+            &[("PU_TEST_PRIVILEGED_TIMEOUT_MS", "1000")],
+        );
+        let pids: Vec<i32> = std::fs::read_to_string(child.root.join("sudo.pids"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|pid| pid.parse().ok())
+            .collect();
+        let left: Vec<i32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid), None)
+                    != Err(nix::errno::Errno::ESRCH)
+            })
+            .collect();
+        for pid in &left {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(
+            child.output.status.success() && child.root.join("done").exists(),
+            "child failed ({})\n--- stderr\n{}",
+            child.output.status,
+            String::from_utf8_lossy(&child.output.stderr),
+        );
+        assert_eq!(pids.len(), 3, "{pids:?}");
+        assert_eq!(left, Vec::<i32>::new(), "a fake sudo outlived the test");
         let record = record_path(&child.root.join("schemes/S.colors"));
         assert_eq!(
             child.log.lines().collect::<Vec<_>>(),
