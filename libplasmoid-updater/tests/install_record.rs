@@ -1661,7 +1661,7 @@ fn an_unlistable_site_dir_is_reported_and_retention_spares_every_backup() {
         let site = root.join("home/dataA/color-schemes");
         let result = child_call(&child).update();
         assert_eq!(result.succeeded.len(), 1, "{result:?}");
-        // The error the site's listing fails with, measured here so the
+        // The error the site's listing fails with is measured here, so the
         // assertion does not carry a locale's translation of it.
         let error = std::fs::read_dir(&site).expect_err("the site stayed listable in the child");
         assert_eq!(
@@ -2037,13 +2037,13 @@ fn an_unreadable_registry_is_reported_and_retention_spares_every_backup() {
         let registry = PathBuf::from(std::env::var("PU_RECORD_REGISTRY").unwrap());
         let result = child_call(&child).update();
         assert_eq!(result.succeeded.len(), 1, "{result:?}");
-        // The error reading the registry fails with, measured here so the
+        // The error the registry read fails with is measured here, so the
         // assertion does not carry a locale's translation of it.
         let error = std::fs::read(&registry).expect_err("the registry stayed readable");
         let named = format!("{}: {error}", registry.display());
-        // The record scan's line comes from the repair, before the check's
-        // store-id lookup names the same file on its own.
-        assert_eq!(warnings(), [unread_registry_line(&named), named]);
+        // The record scan's line comes from the repair; the check's store-id
+        // lookup reads the same file and keeps quiet about it.
+        assert_eq!(warnings(), [unread_registry_line(&named)]);
         child.done();
         return;
     }

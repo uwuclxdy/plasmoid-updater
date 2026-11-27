@@ -16,6 +16,7 @@ use std::{
     io::Write as _,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
 };
 
 use crate::{
@@ -144,9 +145,29 @@ pub(crate) struct Registered {
     /// The install path of every component a registry that could be read
     /// names.
     pub(crate) paths: Vec<PathBuf>,
-    /// Each registry that is there but could not be read or looked at, with
-    /// why: the components it names are unknown.
-    pub(crate) unread: Vec<(PathBuf, String)>,
+    /// The registry sources that are there but could not be read or looked
+    /// at: the components they name are unknown.
+    pub(crate) unread: Vec<UnreadRegistry>,
+}
+
+/// A KNewStuff registry source a run could not read or look at.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UnreadRegistry {
+    /// A `knewstuff3` directory whose registries a run could not all read or
+    /// look at, however many types it holds.
+    Directory {
+        /// The directory.
+        dir: PathBuf,
+        /// Why it could not be read, as the line names it.
+        why: String,
+    },
+    /// One registry file that could not be read or looked at.
+    File {
+        /// The file.
+        path: PathBuf,
+        /// Why it could not be read, as the line names it.
+        error: String,
+    },
 }
 
 /// The install path of every component the KNewStuff registries this run
@@ -170,12 +191,45 @@ pub(crate) fn registered_paths(system: bool) -> Registered {
             crate::paths::system_path_trust,
         );
     }
-    let knewstuff = crate::paths::knewstuff_dir();
-    let registries: Vec<PathBuf> = files.iter().map(|file| knewstuff.join(file)).collect();
-    registered_in(
-        &registries,
+    user_registered(
+        &crate::paths::knewstuff_dir(),
+        &files,
         &normalized_roots(&crate::paths::user_data_roots()),
     )
+}
+
+/// [`registered_paths`] for a user run: the registries under `knewstuff`, which
+/// itself may not be searchable. The registries are opened by name, so what
+/// decides is whether the directory lets a run reach a file in it, not whether
+/// it can be listed: one that cannot be searched hides every registry in it and
+/// is one unread source, reported once for the directory, never once per type;
+/// under one that can, each registry answers for itself.
+fn user_registered(knewstuff: &Path, files: &[&str], roots: &[PathBuf]) -> Registered {
+    let registries: Vec<PathBuf> = files.iter().map(|file| knewstuff.join(file)).collect();
+    let mut registered = registered_in(&registries, roots);
+    let unsearchable = fs::symlink_metadata(knewstuff.join("."))
+        .err()
+        .filter(|error| crate::paths::absence(error).is_none());
+    if let Some(error) = unsearchable
+        && !registered.unread.is_empty()
+    {
+        registered.unread = vec![UnreadRegistry::Directory {
+            dir: knewstuff.to_path_buf(),
+            why: error.to_string(),
+        }];
+    }
+    registered
+}
+
+/// Why a trust check could not decide a root, as the record scan's directory
+/// line prints it inside that line's own parentheses: `cannot check
+/// "<component>": <error>`.
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the failing component is quoted as data, as the record-scan line prints it"
+)]
+fn unread_root_reason(component: &Path, error: &std::io::Error) -> String {
+    format!("cannot check {component:?}: {error}")
 }
 
 /// [`registered_paths`] for a `--system` run, each candidate root judged by
@@ -183,10 +237,6 @@ pub(crate) fn registered_paths(system: bool) -> Registered {
 /// absent root is no source, and a root whose trust cannot be decided is an
 /// unread source, since a registry under it may name a component a record sits
 /// beside.
-#[expect(
-    clippy::unnecessary_debug_formatting,
-    reason = "the failing component is quoted as data, as the trust warning prints it"
-)]
 fn system_registered(
     candidates: &[PathBuf],
     files: &[&str],
@@ -199,7 +249,10 @@ fn system_registered(
             Trust::Trusted => roots.push(root.clone()),
             Trust::Refused => {}
             Trust::Unreadable { component, error } => {
-                undecided.push((root.join("knewstuff3"), format!("{component:?}: {error}")));
+                undecided.push(UnreadRegistry::Directory {
+                    dir: root.join("knewstuff3"),
+                    why: unread_root_reason(&component, &error),
+                });
             }
         }
     }
@@ -224,7 +277,7 @@ fn system_registries(
     roots: &[PathBuf],
     files: &[&str],
     trust: fn(&Path) -> Trust,
-) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+) -> (Vec<PathBuf>, Vec<UnreadRegistry>) {
     let mut registries = Vec::new();
     let mut unread = Vec::new();
     for root in roots {
@@ -232,7 +285,10 @@ fn system_registries(
         match trust(&dir) {
             Trust::Refused => continue,
             Trust::Unreadable { component, error } => {
-                unread.push((dir, format!("{component:?}: {error}")));
+                unread.push(UnreadRegistry::Directory {
+                    dir,
+                    why: unread_root_reason(&component, &error),
+                });
                 continue;
             }
             Trust::Trusted => {}
@@ -243,7 +299,10 @@ fn system_registries(
                 Trust::Trusted => registries.push(registry),
                 Trust::Refused => {}
                 Trust::Unreadable { component, error } => {
-                    unread.push((registry, format!("{component:?}: {error}")));
+                    unread.push(UnreadRegistry::File {
+                        path: registry,
+                        error: format!("{component:?}: {error}"),
+                    });
                 }
             }
         }
@@ -268,9 +327,10 @@ fn registered_in(registries: &[PathBuf], roots: &[PathBuf]) -> Registered {
                     .map(|(path, _)| path),
             ),
             Err(Error::Io { source, .. }) if crate::paths::absence(&source).is_some() => {}
-            Err(error) => registered
-                .unread
-                .push((registry.clone(), error.to_string())),
+            Err(error) => registered.unread.push(UnreadRegistry::File {
+                path: registry.clone(),
+                error: error.to_string(),
+            }),
         }
     }
     registered
@@ -490,6 +550,35 @@ fn install_key(component_type: ComponentType, installed_path: &Path) -> Registry
     }
 }
 
+/// The registry files this process's record scan has warned about: the
+/// store-id cache reads the same files and would print the same failure again.
+static RECORD_SCAN_WARNED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+
+/// Records that a record scan in this process has warned about `registry`.
+pub(crate) fn note_record_scan_warning(registry: &Path) {
+    RECORD_SCAN_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(registry.to_path_buf());
+}
+
+/// Whether a record scan in this process has warned about `registry`.
+fn record_scan_warned_about(registry: &Path) -> bool {
+    RECORD_SCAN_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(registry)
+}
+
+/// Warns that the store-id cache could not read `registry`, unless a record
+/// scan in this process already named that file: one failure draws one line,
+/// and a registry no record scan read keeps its own.
+fn warn_unread_registry(registry: &Path, error: &dyn std::fmt::Display) {
+    if !record_scan_warned_about(registry) {
+        log::warn!(target: "registry", "{}: {error}", registry.display());
+    }
+}
+
 /// Builds an install -> content_id lookup cache from the registry files that
 /// may name this mode's components.
 ///
@@ -533,7 +622,7 @@ fn build_id_cache_trusting(
                 Ok(content) => content,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    log::warn!(target: "registry", "{}: {e}", path.display());
+                    warn_unread_registry(&path, &e);
                     continue;
                 }
             };
@@ -543,7 +632,7 @@ fn build_id_cache_trusting(
             let entries = match xml::parse_raw_entries(&content) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    log::warn!(target: "registry", "{}: {e}", path.display());
+                    warn_unread_registry(&path, &e);
                     continue;
                 }
             };
@@ -1066,7 +1155,12 @@ mod tests {
         let unread: Vec<&Path> = registered
             .unread
             .iter()
-            .map(|(registry, _)| registry.as_path())
+            .map(|unread| match unread {
+                UnreadRegistry::File { path, .. } => path.as_path(),
+                UnreadRegistry::Directory { dir, .. } => {
+                    panic!("a readable directory was unread: {dir:?}")
+                }
+            })
             .collect();
         let expected: &[&Path] = if privilege::is_root() {
             &[&torn]
@@ -1074,6 +1168,109 @@ mod tests {
             &[&torn, &closed]
         };
         assert_eq!(unread, expected);
+    }
+
+    /// A `knewstuff3` directory that cannot be listed but opens every registry
+    /// a run names holds no unread source: what the run reads there is known,
+    /// and the registry still places its component.
+    #[test]
+    fn an_unlistable_directory_whose_registries_read_names_no_unread_source() {
+        if privilege::is_root() {
+            eprintln!("skipped: root lists a mode-0311 directory");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let knewstuff = dir.path().join("knewstuff3");
+        fs::create_dir_all(&knewstuff).unwrap();
+        let component = dir.path().join("color-schemes/S.colors");
+        fs::create_dir_all(component.parent().unwrap()).unwrap();
+        fs::write(&component, "[General]\n").unwrap();
+        fs::write(
+            knewstuff.join("colorschemes.knsregistry"),
+            format!(
+                "<hotnewstuffregistry><stuff category=\"112\"><name>S</name><installedfile>{}</installedfile></stuff></hotnewstuffregistry>",
+                component.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&knewstuff, fs::Permissions::from_mode(0o311)).unwrap();
+
+        let registered = user_registered(
+            &knewstuff,
+            &["colorschemes.knsregistry"],
+            &[dir.path().to_path_buf()],
+        );
+        fs::set_permissions(&knewstuff, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            registered.paths,
+            [component],
+            "a registry in a directory without the read bit was not read"
+        );
+        assert_eq!(registered.unread, Vec::<UnreadRegistry>::new());
+    }
+
+    /// A registry that cannot be read under a directory that cannot be listed
+    /// but can be searched keeps its own entry: the directory hid nothing.
+    #[test]
+    fn an_unread_registry_under_an_unlistable_directory_keeps_its_own_entry() {
+        if privilege::is_root() {
+            eprintln!("skipped: root lists a mode-0311 directory");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let knewstuff = dir.path().join("knewstuff3");
+        fs::create_dir_all(&knewstuff).unwrap();
+        fs::write(knewstuff.join("comic.knsregistry"), "not a registry\n").unwrap();
+        fs::set_permissions(&knewstuff, fs::Permissions::from_mode(0o311)).unwrap();
+
+        let registered = user_registered(
+            &knewstuff,
+            &["comic.knsregistry"],
+            &[dir.path().to_path_buf()],
+        );
+        fs::set_permissions(&knewstuff, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let registry = knewstuff.join("comic.knsregistry");
+        assert_eq!(
+            registered.unread,
+            [UnreadRegistry::File {
+                error: format!(
+                    "failed to parse knewstuff registry: {}: missing <hotnewstuffregistry> root element",
+                    registry.display()
+                ),
+                path: registry,
+            }]
+        );
+    }
+
+    /// A directory that can be listed but not searched hides every registry
+    /// in it, so it is one source, named with its own failed search.
+    #[test]
+    fn an_unsearchable_directory_is_one_unread_source() {
+        if privilege::is_root() {
+            eprintln!("skipped: root searches a mode-0644 directory");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let knewstuff = dir.path().join("knewstuff3");
+        fs::create_dir_all(&knewstuff).unwrap();
+        fs::set_permissions(&knewstuff, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let registered = user_registered(
+            &knewstuff,
+            &["colorschemes.knsregistry", "comic.knsregistry"],
+            &[dir.path().to_path_buf()],
+        );
+        fs::set_permissions(&knewstuff, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            registered.unread,
+            [UnreadRegistry::Directory {
+                dir: knewstuff,
+                why: "Permission denied (os error 13)".to_string(),
+            }]
+        );
     }
 
     /// A candidate registry whose trust the check could not decide is unread,
@@ -1098,12 +1295,11 @@ mod tests {
             [root.join("knewstuff3/colorschemes.knsregistry")]
         );
         assert_eq!(unread.len(), 1, "{unread:?}");
-        assert_eq!(unread[0].0, root.join("knewstuff3/comic.knsregistry"));
-        assert!(
-            unread[0].1.contains("Permission denied"),
-            "{:?}",
-            unread[0].1
-        );
+        let UnreadRegistry::File { path, error } = &unread[0] else {
+            panic!("a registry file was reported as a directory: {unread:?}");
+        };
+        assert_eq!(path, &root.join("knewstuff3/comic.knsregistry"));
+        assert!(error.contains("Permission denied"), "{error:?}");
 
         // An unreadable directory hides every registry in it, with one entry.
         let (registries, unread) = system_registries(&[root.to_path_buf()], &files, |path| {
@@ -1118,7 +1314,17 @@ mod tests {
         });
         assert!(registries.is_empty(), "{registries:?}");
         assert_eq!(unread.len(), 1, "{unread:?}");
-        assert_eq!(unread[0].0, root.join("knewstuff3"));
+        let UnreadRegistry::Directory { dir, why } = &unread[0] else {
+            panic!("an unreadable directory was reported as a file: {unread:?}");
+        };
+        assert_eq!(dir, &root.join("knewstuff3"));
+        assert_eq!(
+            why,
+            &format!(
+                "cannot check {:?}: Permission denied (os error 13)",
+                root.join("knewstuff3")
+            )
+        );
 
         let (registries, unread) =
             system_registries(&[root.to_path_buf()], &files, |_| Trust::Refused);
@@ -1147,7 +1353,7 @@ mod tests {
                 Trust::Trusted
             }
         });
-        assert_eq!(all_trusted.unread, Vec::<(PathBuf, String)>::new());
+        assert_eq!(all_trusted.unread, Vec::<UnreadRegistry>::new());
 
         let registered = system_registered(&candidates, &files, |path| {
             if path.starts_with("/r/user") {
@@ -1165,10 +1371,21 @@ mod tests {
         let error = std::io::Error::from_raw_os_error(nix::libc::EACCES);
         assert_eq!(
             registered.unread,
-            [(
-                undecided.join("knewstuff3"),
-                format!("\"/r/secret\": {error}")
-            )]
+            [UnreadRegistry::Directory {
+                dir: undecided.join("knewstuff3"),
+                why: format!("cannot check \"/r/secret\": {error}"),
+            }]
+        );
+    }
+
+    /// The record scan's directory line names an undecided root's reason after
+    /// its component, inside that line's own parentheses.
+    #[test]
+    fn an_undecided_roots_reason_names_its_component_before_the_error() {
+        let error = std::io::Error::from_raw_os_error(nix::libc::EACCES);
+        assert_eq!(
+            unread_root_reason(Path::new("/r/secret/share"), &error),
+            "cannot check \"/r/secret/share\": Permission denied (os error 13)"
         );
     }
 
@@ -1185,7 +1402,7 @@ mod tests {
         let registered = registered_in(&[registry], &[dir.path().to_path_buf()]);
 
         assert_eq!(registered.paths, Vec::<PathBuf>::new());
-        assert_eq!(registered.unread, Vec::<(PathBuf, String)>::new());
+        assert_eq!(registered.unread, Vec::<UnreadRegistry>::new());
     }
 
     #[test]
@@ -1299,6 +1516,33 @@ mod tests {
             err.to_string().contains(&path.display().to_string()),
             "{err}"
         );
+    }
+
+    /// A registry no record scan in this process warned about keeps the
+    /// store-id cache's own line: the record scan's word covers the files it
+    /// read, and nothing else.
+    #[test]
+    fn the_store_id_cache_names_a_registry_the_record_scan_did_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let knewstuff = dir.path().join("knewstuff3");
+        fs::create_dir_all(&knewstuff).unwrap();
+        let registry = knewstuff.join("comic.knsregistry");
+        fs::write(&registry, "not a registry\n").unwrap();
+
+        let lines = crate::testutil::logs::captured_logs_while(|| {
+            let cache = build_id_cache_trusting(
+                false,
+                &knewstuff,
+                &[],
+                crate::paths::is_trusted_system_path,
+            );
+            assert!(cache.is_empty(), "{cache:?}");
+        });
+        let expected = format!(
+            "registry: {}: failed to parse knewstuff registry: missing <hotnewstuffregistry> root element",
+            registry.display()
+        );
+        assert!(lines.iter().any(|line| line == &expected), "{lines:?}");
     }
 
     #[test]

@@ -679,13 +679,19 @@ pub(crate) fn copy_dir_as_root(src: &Path, dest: &Path) -> Result<(), ComponentF
 /// is gone, as the non-root arm's `rm -f` has it.
 pub(crate) fn remove_file_as_root(path: &Path) -> Result<(), ComponentFailure> {
     if is_root() {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(ComponentFailure::io(FailureKind::Install, path, e)),
-        }
+        remove_file_direct(path)
     } else {
         run_sudo_os(&[OsStr::new("rm"), OsStr::new("-f"), path.as_os_str()])
+    }
+}
+
+/// [`remove_file_as_root`]'s root arm, split out so a test runs it as the
+/// user it is: a file already gone is gone.
+fn remove_file_direct(path: &Path) -> Result<(), ComponentFailure> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ComponentFailure::io(FailureKind::Install, path, e)),
     }
 }
 
@@ -720,17 +726,26 @@ mod tests {
 
     use super::*;
 
-    /// A root run removes a file already gone without failing: the non-root
-    /// arm's `rm -f` has the same answer.
+    /// A missing file is gone without failing on both removal paths:
+    /// [`remove_file_direct`] as the user the test runs as, and
+    /// [`remove_file_as_root`], whose root arm runs only on a root host; the
+    /// non-root arm's `rm -f` answers the same. Any other failure still
+    /// refuses.
     #[test]
-    fn removing_a_missing_file_as_root_succeeds() {
-        if !is_root() {
-            return;
-        }
+    fn removing_a_missing_file_succeeds_directly_and_as_root() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("gone");
-        let removed = remove_file_as_root(&missing);
+        let removed = remove_file_direct(&missing);
         assert!(removed.is_ok(), "{removed:?}");
+        if is_root() {
+            let removed = remove_file_as_root(&missing);
+            assert!(removed.is_ok(), "{removed:?}");
+        }
+
+        let directory = dir.path().join("a-directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        let refused = remove_file_direct(&directory);
+        assert!(refused.is_err(), "a directory was removed as a file");
     }
 
     /// A refused `sudo tee` neither prints over the terminal its child would

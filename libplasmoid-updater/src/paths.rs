@@ -157,6 +157,16 @@ pub(crate) enum Trust {
     },
 }
 
+/// Why a trust check could not decide a path: the component it could not look
+/// at and that failure, as the trust warning names them.
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the failing component is quoted as data, as the trust warning prints it"
+)]
+pub(crate) fn cannot_check(component: &Path, error: &std::io::Error) -> String {
+    format!("cannot check {component:?} ({error})")
+}
+
 /// Returns what the trust check says about `path`: an absolute path whose
 /// every component is a real, root-owned file or directory that group or
 /// others cannot write, or why it is not.
@@ -209,7 +219,8 @@ pub(crate) fn system_path_trust(path: &Path) -> Trust {
         }
     }
     if let Some((component, error)) = unseen {
-        warn_untrusted_once(path, format_args!("{component:?}: {error}"));
+        let why = cannot_check(&component, &error);
+        warn_untrusted_once(path, format_args!("{why}"));
         return Trust::Unreadable { component, error };
     }
     Trust::Trusted
@@ -456,6 +467,63 @@ mod tests {
             system_path_trust(&dir.path().join("missing")),
             Trust::Refused
         ));
+    }
+
+    /// A path whose every ancestor is trusted and whose own stat fails is
+    /// warned about with what could not be checked, not with the path a second
+    /// time.
+    #[test]
+    fn an_undecidable_path_names_what_could_not_be_checked() {
+        // A trusted ancestor is root's alone, so a non-root run's only
+        // undecidable path lies below one: the kernel keeps process 1's fd
+        // directory for root.
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        // The state exists only where every ancestor is trusted: a user
+        // namespace shows the host's root as an unmapped uid, and the check
+        // then refuses the ancestor instead.
+        if !is_trusted_system_path(Path::new("/proc/1/fd")) {
+            eprintln!("skipped: /proc/1/fd is not a trusted ancestor on this host");
+            return;
+        }
+        let undecidable = Path::new("/proc/1/fd/0");
+        let Err(unseen) = std::fs::symlink_metadata(undecidable) else {
+            eprintln!(
+                "skipped: this host lets the run stat {}",
+                undecidable.display()
+            );
+            return;
+        };
+        if unseen.kind() != std::io::ErrorKind::PermissionDenied {
+            eprintln!(
+                "skipped: {} fails with {unseen}, not a permission denial",
+                undecidable.display()
+            );
+            return;
+        }
+
+        let lines = captured_logs_while(|| {
+            assert!(matches!(
+                system_path_trust(undecidable),
+                Trust::Unreadable { .. }
+            ));
+        });
+        let expected = format!(
+            "paths: ignoring {undecidable:?}: cannot check {undecidable:?} (Permission denied (os error 13))"
+        );
+        assert!(lines.iter().any(|line| line == &expected), "{lines:?}");
+    }
+
+    /// The trust warning's detail names what could not be checked, in
+    /// parentheses after it.
+    #[test]
+    fn the_unreadable_detail_names_the_component_and_error() {
+        let error = std::io::Error::from_raw_os_error(nix::libc::EACCES);
+        assert_eq!(
+            cannot_check(Path::new("/r/secret/share"), &error),
+            "cannot check \"/r/secret/share\" (Permission denied (os error 13))"
+        );
     }
 
     /// A path through a regular file, or one holding a component too long to

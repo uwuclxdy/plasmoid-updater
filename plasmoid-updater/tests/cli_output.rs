@@ -1550,3 +1550,85 @@ fn a_user_run_draws_no_warning_from_an_untrusted_xdg_data_dir() {
         describe(&env, &run)
     );
 }
+
+/// The `XDG_DATA_DIRS` entry a non-root run cannot stat while every ancestor
+/// of it is trusted, or `None` on a host that cannot show that state.
+const UNDECIDABLE: &str = "/proc/1/fd/0";
+
+/// A `--system check` with [`UNDECIDABLE`] as the only system data directory,
+/// or `None` when this host lets the run stat it: a trusted ancestor is root's
+/// alone, so the path below it is the non-root run's only undecided one, and
+/// the kernel keeps process 1's fd directory for root.
+fn undecidable_system_dir_run() -> Option<Run> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if nix::unistd::Uid::effective().is_root() {
+        return None;
+    }
+    // The state exists only where every ancestor is trusted: a user namespace
+    // shows the host's root as an unmapped uid, and the check then refuses the
+    // ancestor instead.
+    let trusted_ancestors = std::path::Path::new(UNDECIDABLE)
+        .ancestors()
+        .skip(1)
+        .all(|ancestor| {
+            std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+                !metadata.file_type().is_symlink()
+                    && metadata.uid() == 0
+                    && metadata.mode() & 0o022 == 0
+            })
+        });
+    if !trusted_ancestors {
+        eprintln!("skipped: an ancestor of {UNDECIDABLE} is not a trusted system path here");
+        return None;
+    }
+    let Err(unseen) = std::fs::symlink_metadata(UNDECIDABLE) else {
+        eprintln!("skipped: this host lets the run stat {UNDECIDABLE}");
+        return None;
+    };
+    if unseen.kind() != std::io::ErrorKind::PermissionDenied {
+        eprintln!("skipped: {UNDECIDABLE} fails with {unseen}, not a permission denial");
+        return None;
+    }
+    let sandbox = Sandbox::new();
+    let store = FakeStore::start(Listing::default());
+    let mut probe = command(&sandbox, &store, &["--system", "check"]);
+    probe.env("XDG_DATA_DIRS", UNDECIDABLE);
+    Some(output(probe))
+}
+
+/// A `--system` data directory the trust check cannot look at is named with
+/// what could not be checked, not with the path twice.
+#[test]
+fn an_undecidable_system_dir_is_named_with_what_could_not_be_checked() {
+    let Some(run) = undecidable_system_dir_run() else {
+        return;
+    };
+    let expected = format!(
+        "warn: ignoring {UNDECIDABLE:?}: cannot check {UNDECIDABLE:?} (Permission denied (os error 13))"
+    );
+    let named: Vec<&str> = run
+        .stderr
+        .lines()
+        .filter(|line| line.contains(&format!("ignoring {UNDECIDABLE:?}")))
+        .collect();
+    assert_eq!(named, [expected.as_str()], "{run}");
+}
+
+/// The record scan names the registries under an undecidable `--system` root
+/// as one unread source, the directory the unknown registries sit in.
+#[test]
+fn an_undecidable_system_dir_is_one_unread_registry_source() {
+    let Some(run) = undecidable_system_dir_run() else {
+        return;
+    };
+    let expected = format!(
+        "warn: cannot read the KNewStuff registries in {UNDECIDABLE}/knewstuff3 (cannot check {UNDECIDABLE:?}: Permission denied (os error 13)); install records beside the components they list may be skipped, so this run deletes no old backup"
+    );
+    let scanning: Vec<&str> = run
+        .stderr
+        .lines()
+        .filter(|line| line.contains("KNewStuff registr"))
+        .collect();
+    assert_eq!(scanning, [expected.as_str()], "{run}");
+}

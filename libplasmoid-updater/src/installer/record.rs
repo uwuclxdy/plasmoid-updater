@@ -40,7 +40,7 @@ use super::{
 use crate::{
     FailureKind,
     paths::{Absent, absence},
-    registry::normalize_path,
+    registry::{UnreadRegistry, normalize_path},
     types::{ComponentType, Diagnostic, INTERRUPTED_INSTALL_REASON, InstalledComponent},
 };
 
@@ -94,10 +94,10 @@ fn absolute_normalized(path: &Path) -> PathBuf {
 /// writer installs it unprotected.
 pub(crate) struct RecordSites {
     dirs: Vec<PathBuf>,
-    /// The registries this run could not read or look at, with why: a record
-    /// may sit beside a component one of them names, at a site missing from
+    /// The registry sources this run could not read or look at: a record may
+    /// sit beside a component one of them names, at a site missing from
     /// `dirs`.
-    unread_registries: Vec<(PathBuf, String)>,
+    unread_registries: Vec<UnreadRegistry>,
     /// The backup base a record of this run's mode names, absolute and
     /// folded.
     base: PathBuf,
@@ -155,15 +155,28 @@ impl RecordSites {
     /// absence as proof. A site read in part gives none of its records.
     fn records(&self) -> Found {
         let mut found = Found::default();
-        for (registry, error) in &self.unread_registries {
+        for unread in &self.unread_registries {
             found.partial = true;
-            warn_once(
-                "record",
-                registry,
-                format_args!(
-                    "cannot read a KNewStuff registry ({error}); install records beside the components it lists may be skipped, so this run deletes no old backup"
+            match unread {
+                UnreadRegistry::Directory { dir, why } => warn_once(
+                    "record",
+                    dir,
+                    format_args!(
+                        "cannot read the KNewStuff registries in {} ({why}); install records beside the components they list may be skipped, so this run deletes no old backup",
+                        dir.display()
+                    ),
                 ),
-            );
+                UnreadRegistry::File { path, error } => {
+                    crate::registry::note_record_scan_warning(path);
+                    warn_once(
+                        "record",
+                        path,
+                        format_args!(
+                            "cannot read a KNewStuff registry ({error}); install records beside the components it lists may be skipped, so this run deletes no old backup"
+                        ),
+                    );
+                }
+            }
         }
         for dir in &self.dirs {
             let entries = match fs::read_dir(dir) {
@@ -176,13 +189,13 @@ impl RecordSites {
             };
             let mut paths = found.paths(dir, entries);
             paths.sort();
-            let read: std::io::Result<Vec<Record>> = paths
+            let read: Result<Vec<Record>, (PathBuf, std::io::Error)> = paths
                 .iter()
                 .filter_map(|path| self.read_listed(path).transpose())
                 .collect();
             match read {
                 Ok(mut records) => found.records.append(&mut records),
-                Err(e) => found.unreadable(dir, &e),
+                Err((path, e)) => found.unreadable_record(dir, &path, &e),
             }
         }
         if found.partial {
@@ -192,15 +205,15 @@ impl RecordSites {
     }
 
     /// The record at `path`, a name its site lists, or `None` when it is gone.
-    /// The listing proves it is there, so one that cannot be opened is kept;
-    /// the error is a path too long to open, which hides what the record names
-    /// from every reader.
-    fn read_listed(&self, path: &Path) -> std::io::Result<Option<Record>> {
+    /// The listing proves it is there, so one that cannot be opened is kept,
+    /// with the path the warning names; the error is a path too long to open,
+    /// which hides what the record names from every reader.
+    fn read_listed(&self, path: &Path) -> Result<Option<Record>, (PathBuf, std::io::Error)> {
         let state = match read_state(path, &self.base) {
             Ok(state) => state,
             Err(e) => match absence(&e) {
                 Some(Absent::Gone) => return Ok(None),
-                Some(Absent::Unreachable) => return Err(e),
+                Some(Absent::Unreachable) => return Err((path.to_path_buf(), e)),
                 None => unreadable(&e),
             },
         };
@@ -293,12 +306,35 @@ impl Found {
             ),
         );
     }
+
+    /// Records a listed record that could not be opened, and reports it once
+    /// per process, naming the record beside the site whose listing proved it
+    /// there: the walk is partial for the same reason as a whole unread site.
+    fn unreadable_record(&mut self, dir: &Path, record: &Path, error: &std::io::Error) {
+        self.partial = true;
+        let name = record.file_name().unwrap_or(record.as_os_str());
+        warn_once(
+            "record",
+            record,
+            format_args!(
+                "cannot read the install record {} in {} ({}), so this run deletes no old backup",
+                name.to_string_lossy(),
+                dir.display(),
+                error
+            ),
+        );
+    }
 }
 
 /// Whether a walk in this process has met a site or registry it could not read
 /// whole. Its warning says the run deletes no old backup, and a later walk in
 /// the same process (a host's `check`, then its `install`) may find the site
 /// readable, so retention keeps every backup once this is set.
+///
+/// A relaxed order is enough: the flag only ever goes false to true, and a
+/// retention read follows every walk it must see, on the caller's thread or
+/// after the host's own hand-off between threads (no walk runs on an install
+/// worker), so a stronger order would publish nothing more.
 static PARTIAL_WALK_SEEN: AtomicBool = AtomicBool::new(false);
 
 /// One record a site holds.
@@ -753,7 +789,7 @@ impl Spared {
 pub(crate) fn spared_backups(sites: &RecordSites) -> Spared {
     let found = sites.records();
     let mut spared = Spared {
-        all: found.partial || PARTIAL_WALK_SEEN.load(Ordering::Relaxed),
+        all: PARTIAL_WALK_SEEN.load(Ordering::Relaxed),
         ..Spared::default()
     };
     for record in found.records {
@@ -1114,6 +1150,25 @@ mod tests {
         );
     }
 
+    /// A registry source the run could not look at draws one line naming the
+    /// directory and why the trust check could not decide it.
+    #[test]
+    fn an_undecided_directory_is_one_record_line() {
+        let sites = RecordSites {
+            unread_registries: vec![UnreadRegistry::Directory {
+                dir: PathBuf::from("/r/secret/share/knewstuff3"),
+                why: "cannot check \"/r/secret/share\": Permission denied (os error 13)"
+                    .to_string(),
+            }],
+            ..sites(Path::new("/r"), false)
+        };
+        let lines = crate::testutil::logs::captured_logs_while(|| {
+            assert!(sites.records().partial);
+        });
+        let expected = "record: cannot read the KNewStuff registries in /r/secret/share/knewstuff3 (cannot check \"/r/secret/share\": Permission denied (os error 13)); install records beside the components they list may be skipped, so this run deletes no old backup";
+        assert!(lines.iter().any(|line| line == expected), "{lines:?}");
+    }
+
     /// A site the run cannot list may hold records, but the repair cannot list
     /// it either, so nothing there is a write the repair would make: the walk
     /// is partial, and the probe still finds no repair work.
@@ -1221,12 +1276,26 @@ mod tests {
         assert_eq!(std::fs::read_dir(&site).unwrap().count(), 1);
 
         let sites = RecordSites {
-            dirs: vec![site],
+            dirs: vec![site.clone()],
             ..sites(root, false)
         };
-        assert!(
-            sites.records().partial,
-            "a record too long to open read as no record"
+        let lines = crate::testutil::logs::captured_logs_while(|| {
+            assert!(
+                sites.records().partial,
+                "a record too long to open read as no record"
+            );
+        });
+        let expected = format!(
+            "record: cannot read the install record .S.colors.plasmoid-updater-backup in {} (File name too long (os error 36)), so this run deletes no old backup",
+            site.display()
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains(&site.display().to_string()))
+                .collect::<Vec<_>>(),
+            [&expected],
+            "{lines:?}"
         );
         assert!(
             spared_backups(&sites).spares(&root.join("base/2020-01-01T00-00-00"), "color-schemes"),

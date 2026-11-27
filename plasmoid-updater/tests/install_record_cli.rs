@@ -11,6 +11,7 @@
 #[path = "../../libplasmoid-updater/tests/common/mod.rs"]
 mod common;
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -159,4 +160,35 @@ fn check_json_keeps_its_top_level_keys_beside_a_record_row() {
         reason.starts_with("interrupted install, its install record "),
         "{run}"
     );
+}
+
+/// An unreadable `knewstuff3` directory hides every type's registry in it, so
+/// the record scan names the directory once; one line per type would say the
+/// same thing fifteen times.
+#[test]
+fn an_unreadable_registry_dir_is_one_record_scan_line_naming_it() {
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!("skipped: root reads a mode-000 directory");
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let knewstuff = sandbox.data_home().join("knewstuff3");
+    std::fs::create_dir_all(&knewstuff).unwrap();
+    std::fs::set_permissions(&knewstuff, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let store = FakeStore::start(Listing::default());
+
+    let run = run(&sandbox, store.url(), None, &["update", "-y"]);
+    std::fs::set_permissions(&knewstuff, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let expected = format!(
+        "warn: cannot read the KNewStuff registries in {} (Permission denied (os error 13)); install records beside the components they list may be skipped, so this run deletes no old backup",
+        knewstuff.display()
+    );
+    let lines: Vec<&str> = run
+        .stderr
+        .lines()
+        .filter(|line| line.contains("KNewStuff registr"))
+        .collect();
+    assert_eq!(lines, [expected.as_str()], "{run}");
+    assert_eq!(run.code, 3, "{run}");
 }
